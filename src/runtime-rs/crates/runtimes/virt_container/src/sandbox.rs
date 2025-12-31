@@ -990,6 +990,22 @@ impl Sandbox for VirtSandbox {
 
         Ok(())
     }
+
+    async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()> {
+        info!(sl!(), "sb: snapshot_vm invoked, path: {}", snapshot_path);
+        self.hypervisor
+            .snapshot_vm(snapshot_path)
+            .await
+            .context("sandbox: failed to snapshot VM")
+    }
+
+    async fn restore_vm(&self, snapshot_path: &str) -> Result<()> {
+        info!(sl!(), "sb: restore_vm invoked, path: {}", snapshot_path);
+        self.hypervisor
+            .restore_vm(snapshot_path)
+            .await
+            .context("sandbox: failed to restore VM")
+    }
 }
 
 #[async_trait]

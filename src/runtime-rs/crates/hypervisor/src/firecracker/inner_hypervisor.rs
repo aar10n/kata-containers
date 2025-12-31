@@ -125,17 +125,113 @@ impl FcInner {
         }
     }
 
-    pub(crate) fn pause_vm(&self) -> Result<()> {
-        warn!(sl(), "Pause VM: Not implemented");
+    /// Pause the VM by calling Firecracker's PATCH /vm API
+    pub(crate) async fn pause_vm(&self) -> Result<()> {
+        info!(sl(), "Pausing VM");
+        if self.state != VmmState::VmRunning {
+            return Err(anyhow!("Cannot pause VM: VM is not running"));
+        }
+        let body = serde_json::json!({
+            "state": "Paused"
+        })
+        .to_string();
+        self.request_with_retry(hyper::Method::PATCH, "/vm", body)
+            .await
+            .context("failed to pause VM")?;
+        info!(sl(), "VM paused successfully");
         Ok(())
     }
 
     pub(crate) async fn save_vm(&self) -> Result<()> {
-        warn!(sl(), "Save VM: Not implemented");
+        warn!(sl(), "Save VM: Use snapshot_vm() with a path instead");
         Ok(())
     }
-    pub(crate) fn resume_vm(&self) -> Result<()> {
-        warn!(sl(), "Resume VM: Not implemented");
+
+    /// Resume a paused VM by calling Firecracker's PATCH /vm API
+    pub(crate) async fn resume_vm(&self) -> Result<()> {
+        info!(sl(), "Resuming VM");
+        let body = serde_json::json!({
+            "state": "Resumed"
+        })
+        .to_string();
+        self.request_with_retry(hyper::Method::PATCH, "/vm", body)
+            .await
+            .context("failed to resume VM")?;
+        info!(sl(), "VM resumed successfully");
+        Ok(())
+    }
+
+    /// Snapshot the VM to the specified path.
+    /// Creates two files: {snapshot_path}/vmstate and {snapshot_path}/memory
+    /// The VM will be paused before snapshot and left paused after.
+    pub(crate) async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()> {
+        info!(sl(), "Creating VM snapshot at: {}", snapshot_path);
+
+        if self.state != VmmState::VmRunning {
+            return Err(anyhow!("Cannot snapshot VM: VM is not running"));
+        }
+
+        // Create the snapshot directory if it doesn't exist
+        tokio::fs::create_dir_all(snapshot_path)
+            .await
+            .context(format!("failed to create snapshot directory: {}", snapshot_path))?;
+
+        // Pause the VM first
+        self.pause_vm().await.context("failed to pause VM before snapshot")?;
+
+        // Create the snapshot using Firecracker's PUT /snapshot/create API
+        let vmstate_path = format!("{}/vmstate", snapshot_path);
+        let memory_path = format!("{}/memory", snapshot_path);
+
+        let body = serde_json::json!({
+            "snapshot_type": "Full",
+            "snapshot_path": vmstate_path,
+            "mem_file_path": memory_path
+        })
+        .to_string();
+
+        self.request_with_retry(hyper::Method::PUT, "/snapshot/create", body)
+            .await
+            .context("failed to create snapshot")?;
+
+        info!(sl(), "VM snapshot created successfully at: {}", snapshot_path);
+        Ok(())
+    }
+
+    /// Restore a VM from a snapshot at the specified path.
+    /// NOTE: For POC, this only works on a freshly started Firecracker instance
+    /// that hasn't been booted yet. Full restore requires spawning a new FC process.
+    pub(crate) async fn restore_vm(&self, snapshot_path: &str) -> Result<()> {
+        info!(sl(), "Restoring VM from snapshot at: {}", snapshot_path);
+
+        let vmstate_path = format!("{}/vmstate", snapshot_path);
+        let memory_path = format!("{}/memory", snapshot_path);
+
+        // Verify snapshot files exist
+        if !std::path::Path::new(&vmstate_path).exists() {
+            return Err(anyhow!("Snapshot vmstate file not found: {}", vmstate_path));
+        }
+        if !std::path::Path::new(&memory_path).exists() {
+            return Err(anyhow!("Snapshot memory file not found: {}", memory_path));
+        }
+
+        // Load the snapshot using Firecracker's PUT /snapshot/load API
+        let body = serde_json::json!({
+            "snapshot_path": vmstate_path,
+            "mem_backend": {
+                "backend_type": "File",
+                "backend_path": memory_path
+            },
+            "enable_diff_snapshots": false,
+            "resume_vm": true
+        })
+        .to_string();
+
+        self.request_with_retry(hyper::Method::PUT, "/snapshot/load", body)
+            .await
+            .context("failed to load snapshot")?;
+
+        info!(sl(), "VM restored successfully from: {}", snapshot_path);
         Ok(())
     }
 

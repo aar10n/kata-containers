@@ -86,6 +86,14 @@ impl Hypervisor for Remote {
         inner.save_vm().await
     }
 
+    async fn snapshot_vm(&self, _snapshot_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!("snapshot_vm not supported for remote hypervisor"))
+    }
+
+    async fn restore_vm(&self, _snapshot_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!("restore_vm not supported for remote hypervisor"))
+    }
+
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
         let inner = self.inner.write().await;
         inner.add_device(device).await

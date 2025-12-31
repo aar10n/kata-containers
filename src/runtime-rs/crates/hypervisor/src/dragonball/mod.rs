@@ -136,6 +136,14 @@ impl Hypervisor for Dragonball {
         inner.save_vm().await
     }
 
+    async fn snapshot_vm(&self, _snapshot_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!("snapshot_vm not supported for dragonball"))
+    }
+
+    async fn restore_vm(&self, _snapshot_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!("restore_vm not supported for dragonball"))
+    }
+
     // returns Result<(old_vcpus, new_vcpus)>
     async fn resize_vcpu(&self, old_vcpus: u32, new_vcpus: u32) -> Result<(u32, u32)> {
         let inner = self.inner.read().await;

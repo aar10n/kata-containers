@@ -111,6 +111,13 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn pause_vm(&self) -> Result<()>;
     async fn save_vm(&self) -> Result<()>;
     async fn resume_vm(&self) -> Result<()>;
+    /// Snapshot the VM state to the specified path.
+    /// Creates vmstate and memory files in the given directory.
+    /// The VM will be paused during snapshot and left paused after completion.
+    async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()>;
+    /// Restore a VM from a snapshot at the specified path.
+    /// Expects vmstate and memory files in the given directory.
+    async fn restore_vm(&self, snapshot_path: &str) -> Result<()>;
     async fn resize_vcpu(&self, old_vcpus: u32, new_vcpus: u32) -> Result<(u32, u32)>; // returns (old_vcpus, new_vcpus)
     async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)>;
 

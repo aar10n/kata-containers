@@ -57,4 +57,11 @@ pub trait Sandbox: Send + Sync {
 
     // set agent policy
     async fn set_policy(&self, policy: &str) -> Result<()>;
+
+    // VM snapshot/restore (Firecracker only for now)
+    /// Snapshot the VM to the specified path.
+    /// Creates vmstate and memory files in the given directory.
+    async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()>;
+    /// Restore the VM from a snapshot at the specified path.
+    async fn restore_vm(&self, snapshot_path: &str) -> Result<()>;
 }

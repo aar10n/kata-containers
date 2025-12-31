@@ -17,7 +17,8 @@ use url::Url;
 
 use shim_interface::shim_mgmt::{
     AGENT_POLICY_URL, AGENT_URL, DIRECT_VOLUME_PATH_KEY, DIRECT_VOLUME_RESIZE_URL,
-    DIRECT_VOLUME_STATS_URL, IP6_TABLE_URL, IP_TABLE_URL, METRICS_URL,
+    DIRECT_VOLUME_STATS_URL, IP6_TABLE_URL, IP_TABLE_URL, METRICS_URL, RESTORE_URL,
+    SNAPSHOT_PATH_KEY, SNAPSHOT_URL,
 };
 
 // main router for response, this works as a multiplexer on
@@ -46,6 +47,8 @@ pub(crate) async fn handler_mux(
         }
         (&Method::GET, METRICS_URL) => metrics_url_handler(sandbox, req).await,
         (&Method::PUT, AGENT_POLICY_URL) => set_agent_policy_handler(sandbox, req).await,
+        (&Method::POST, SNAPSHOT_URL) => snapshot_handler(sandbox, req).await,
+        (&Method::POST, RESTORE_URL) => restore_handler(sandbox, req).await,
         _ => Ok(not_found(req).await),
     }
 }
@@ -181,5 +184,83 @@ async fn set_agent_policy_handler(
             Ok(Response::new(Body::from("")))
         }
         _ => Err(anyhow!("Set agent policy only takes PUT method")),
+    }
+}
+
+/// Handler for VM snapshot requests
+/// POST /snapshot?path=/path/to/snapshot
+async fn snapshot_handler(
+    sandbox: Arc<dyn Sandbox>,
+    req: Request<Body>,
+) -> Result<Response<Body>> {
+    info!(sl!(), "handler: snapshot");
+
+    // Parse the snapshot path from query parameters
+    let uri_string = format!("http://localhost{}", req.uri());
+    let params = Url::parse(&uri_string)
+        .map_err(|e| anyhow!("failed to parse URI: {}", e))?
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::HashMap<String, String>>();
+
+    let snapshot_path = params
+        .get(SNAPSHOT_PATH_KEY)
+        .context("shim-mgmt: snapshot path not found in request params (use ?path=/path/to/snapshot)")?;
+
+    match sandbox.snapshot_vm(snapshot_path).await {
+        Ok(_) => {
+            info!(sl!(), "handler: snapshot created successfully at {}", snapshot_path);
+            Ok(Response::new(Body::from(format!(
+                "{{\"status\": \"success\", \"path\": \"{}\"}}",
+                snapshot_path
+            ))))
+        }
+        Err(e) => {
+            let error_msg = format!("failed to create snapshot: {:?}", e);
+            error!(sl!(), "handler: {}", error_msg);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("{{\"status\": \"error\", \"message\": \"{}\"}}", error_msg)))
+                .map_err(|e| anyhow!(e))
+        }
+    }
+}
+
+/// Handler for VM restore requests
+/// POST /restore?path=/path/to/snapshot
+async fn restore_handler(
+    sandbox: Arc<dyn Sandbox>,
+    req: Request<Body>,
+) -> Result<Response<Body>> {
+    info!(sl!(), "handler: restore");
+
+    // Parse the snapshot path from query parameters
+    let uri_string = format!("http://localhost{}", req.uri());
+    let params = Url::parse(&uri_string)
+        .map_err(|e| anyhow!("failed to parse URI: {}", e))?
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::HashMap<String, String>>();
+
+    let snapshot_path = params
+        .get(SNAPSHOT_PATH_KEY)
+        .context("shim-mgmt: snapshot path not found in request params (use ?path=/path/to/snapshot)")?;
+
+    match sandbox.restore_vm(snapshot_path).await {
+        Ok(_) => {
+            info!(sl!(), "handler: VM restored successfully from {}", snapshot_path);
+            Ok(Response::new(Body::from(format!(
+                "{{\"status\": \"success\", \"path\": \"{}\"}}",
+                snapshot_path
+            ))))
+        }
+        Err(e) => {
+            let error_msg = format!("failed to restore VM: {:?}", e);
+            error!(sl!(), "handler: {}", error_msg);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("{{\"status\": \"error\", \"message\": \"{}\"}}", error_msg)))
+                .map_err(|e| anyhow!(e))
+        }
     }
 }

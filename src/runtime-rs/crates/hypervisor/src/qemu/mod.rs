@@ -105,6 +105,14 @@ impl Hypervisor for Qemu {
         inner.save_vm().await
     }
 
+    async fn snapshot_vm(&self, _snapshot_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!("snapshot_vm not supported for qemu"))
+    }
+
+    async fn restore_vm(&self, _snapshot_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!("restore_vm not supported for qemu"))
+    }
+
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
         let mut inner = self.inner.write().await;
         inner.add_device(device).await

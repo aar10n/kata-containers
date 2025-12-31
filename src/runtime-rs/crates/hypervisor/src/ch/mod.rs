@@ -92,26 +92,28 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn pause_vm(&self) -> Result<()> {
-        let inner = self.inner.write().await;
-        inner.pause_vm()
+        let inner = self.inner.read().await;
+        inner.pause_vm().await
     }
 
     async fn resume_vm(&self) -> Result<()> {
-        let inner = self.inner.write().await;
-        inner.resume_vm()
+        let inner = self.inner.read().await;
+        inner.resume_vm().await
     }
 
     async fn save_vm(&self) -> Result<()> {
-        let inner = self.inner.write().await;
+        let inner = self.inner.read().await;
         inner.save_vm().await
     }
 
-    async fn snapshot_vm(&self, _snapshot_path: &str) -> Result<()> {
-        Err(anyhow::anyhow!("snapshot_vm not supported for cloud-hypervisor"))
+    async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()> {
+        let inner = self.inner.read().await;
+        inner.snapshot_vm(snapshot_path).await
     }
 
-    async fn restore_vm(&self, _snapshot_path: &str) -> Result<()> {
-        Err(anyhow::anyhow!("restore_vm not supported for cloud-hypervisor"))
+    async fn restore_vm(&self, snapshot_path: &str) -> Result<()> {
+        let inner = self.inner.read().await;
+        inner.restore_vm(snapshot_path).await
     }
 
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {

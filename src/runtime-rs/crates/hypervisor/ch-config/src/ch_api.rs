@@ -247,3 +247,71 @@ pub async fn cloud_hypervisor_vm_resize(
     })
     .await?
 }
+
+pub async fn cloud_hypervisor_vm_pause(mut socket: UnixStream) -> Result<Option<String>> {
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let response = simple_api_full_command_and_response(&mut socket, "PUT", "vm.pause", None)
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(response)
+    })
+    .await?
+}
+
+pub async fn cloud_hypervisor_vm_resume(mut socket: UnixStream) -> Result<Option<String>> {
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let response = simple_api_full_command_and_response(&mut socket, "PUT", "vm.resume", None)
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(response)
+    })
+    .await?
+}
+
+#[derive(Clone, Serialize, Default, Debug)]
+pub struct VmSnapshotConfig {
+    pub destination_url: String,
+}
+
+pub async fn cloud_hypervisor_vm_snapshot(
+    mut socket: UnixStream,
+    config: VmSnapshotConfig,
+) -> Result<Option<String>> {
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let response = simple_api_full_command_and_response(
+            &mut socket,
+            "PUT",
+            "vm.snapshot",
+            Some(&serde_json::to_string(&config)?),
+        )
+        .map_err(|e| anyhow!(e))?;
+
+        Ok(response)
+    })
+    .await?
+}
+
+#[derive(Clone, Serialize, Default, Debug)]
+pub struct VmRestoreConfig {
+    pub source_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefault: Option<bool>,
+}
+
+pub async fn cloud_hypervisor_vm_restore(
+    mut socket: UnixStream,
+    config: VmRestoreConfig,
+) -> Result<Option<String>> {
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let response = simple_api_full_command_and_response(
+            &mut socket,
+            "PUT",
+            "vm.restore",
+            Some(&serde_json::to_string(&config)?),
+        )
+        .map_err(|e| anyhow!(e))?;
+
+        Ok(response)
+    })
+    .await?
+}

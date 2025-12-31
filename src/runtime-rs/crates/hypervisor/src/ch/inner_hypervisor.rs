@@ -21,8 +21,10 @@ use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
 use ch_config::{
     ch_api::{
-        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_resize,
-        cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping, cloud_hypervisor_vmm_shutdown,
+        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_pause,
+        cloud_hypervisor_vm_resize, cloud_hypervisor_vm_restore, cloud_hypervisor_vm_resume,
+        cloud_hypervisor_vm_snapshot, cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping,
+        cloud_hypervisor_vmm_shutdown, VmRestoreConfig, VmSnapshotConfig,
     },
     VmResize,
 };
@@ -713,15 +715,115 @@ impl CloudHypervisorInner {
         Ok(0)
     }
 
-    pub(crate) fn pause_vm(&self) -> Result<()> {
+    pub(crate) async fn pause_vm(&self) -> Result<()> {
+        info!(sl!(), "Pausing Cloud Hypervisor VM");
+
+        let socket = self
+            .api_socket
+            .as_ref()
+            .ok_or("missing socket")
+            .map_err(|e| anyhow!(e))?;
+
+        cloud_hypervisor_vm_pause(socket.try_clone().context("failed to clone socket")?)
+            .await
+            .context("failed to pause VM")?;
+
+        info!(sl!(), "Cloud Hypervisor VM paused successfully");
         Ok(())
     }
 
-    pub(crate) fn resume_vm(&self) -> Result<()> {
+    pub(crate) async fn resume_vm(&self) -> Result<()> {
+        info!(sl!(), "Resuming Cloud Hypervisor VM");
+
+        let socket = self
+            .api_socket
+            .as_ref()
+            .ok_or("missing socket")
+            .map_err(|e| anyhow!(e))?;
+
+        cloud_hypervisor_vm_resume(socket.try_clone().context("failed to clone socket")?)
+            .await
+            .context("failed to resume VM")?;
+
+        info!(sl!(), "Cloud Hypervisor VM resumed successfully");
         Ok(())
     }
 
     pub(crate) async fn save_vm(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub(crate) async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()> {
+        info!(sl!(), "Creating Cloud Hypervisor VM snapshot at: {}", snapshot_path);
+
+        if self.state != VmmState::VmRunning {
+            return Err(anyhow!("Cannot snapshot VM: VM is not running (state: {:?})", self.state));
+        }
+
+        // Create the snapshot directory if it doesn't exist
+        tokio::fs::create_dir_all(snapshot_path)
+            .await
+            .context(format!("failed to create snapshot directory: {}", snapshot_path))?;
+
+        // Pause the VM before taking the snapshot
+        self.pause_vm().await.context("failed to pause VM before snapshot")?;
+
+        let socket = self
+            .api_socket
+            .as_ref()
+            .ok_or("missing socket")
+            .map_err(|e| anyhow!(e))?;
+
+        // Cloud Hypervisor expects a file:// URL for the snapshot destination
+        let config = VmSnapshotConfig {
+            destination_url: format!("file://{}", snapshot_path),
+        };
+
+        let result = cloud_hypervisor_vm_snapshot(
+            socket.try_clone().context("failed to clone socket")?,
+            config,
+        )
+        .await;
+
+        if let Err(e) = &result {
+            // Try to resume the VM if snapshot failed
+            error!(sl!(), "Snapshot failed, attempting to resume VM: {:?}", e);
+            let _ = self.resume_vm().await;
+            return Err(anyhow!("failed to create snapshot: {:?}", e));
+        }
+
+        info!(sl!(), "Cloud Hypervisor VM snapshot created successfully at: {}", snapshot_path);
+        Ok(())
+    }
+
+    pub(crate) async fn restore_vm(&self, snapshot_path: &str) -> Result<()> {
+        info!(sl!(), "Restoring Cloud Hypervisor VM from snapshot at: {}", snapshot_path);
+
+        // Check that the snapshot directory exists
+        if !std::path::Path::new(snapshot_path).exists() {
+            return Err(anyhow!("Snapshot path does not exist: {}", snapshot_path));
+        }
+
+        let socket = self
+            .api_socket
+            .as_ref()
+            .ok_or("missing socket")
+            .map_err(|e| anyhow!(e))?;
+
+        // Cloud Hypervisor expects a file:// URL for the snapshot source
+        let config = VmRestoreConfig {
+            source_url: format!("file://{}", snapshot_path),
+            prefault: Some(false),
+        };
+
+        cloud_hypervisor_vm_restore(
+            socket.try_clone().context("failed to clone socket")?,
+            config,
+        )
+        .await
+        .context("failed to restore VM from snapshot")?;
+
+        info!(sl!(), "Cloud Hypervisor VM restored successfully from: {}", snapshot_path);
         Ok(())
     }
 

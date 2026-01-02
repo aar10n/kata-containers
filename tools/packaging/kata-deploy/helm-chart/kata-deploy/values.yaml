@@ -6,6 +6,12 @@ image:
   reference: quay.io/kata-containers/kata-deploy
   tag: ""
 
+sandboxAgent:
+  enabled: true
+  image:
+    reference: gcr.io/cohere-artifacts/sandbox-agent
+    tag: ""
+
 k8sDistribution: "k8s"  # k8s, k3s, rke2, k0s, microk8s
 
 # Node selector and tolerations to control which nodes the kata-deploy daemonset runs on

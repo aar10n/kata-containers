@@ -86,12 +86,16 @@ impl Hypervisor for Remote {
         inner.save_vm().await
     }
 
-    async fn snapshot_vm(&self, _snapshot_path: &str) -> Result<()> {
-        Err(anyhow::anyhow!("snapshot_vm not supported for remote hypervisor"))
+    async fn save_vm_state(&self, _state_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "save_vm_state not supported for remote hypervisor"
+        ))
     }
 
-    async fn restore_vm(&self, _snapshot_path: &str) -> Result<()> {
-        Err(anyhow::anyhow!("restore_vm not supported for remote hypervisor"))
+    async fn restore_vm_state(&self, _state_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "restore_vm_state not supported for remote hypervisor"
+        ))
     }
 
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {

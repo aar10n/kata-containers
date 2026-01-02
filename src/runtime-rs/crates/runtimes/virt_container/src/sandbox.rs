@@ -991,20 +991,20 @@ impl Sandbox for VirtSandbox {
         Ok(())
     }
 
-    async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()> {
-        info!(sl!(), "sb: snapshot_vm invoked, path: {}", snapshot_path);
+    async fn save_vm_state(&self, state_path: &str) -> Result<()> {
+        info!(sl!(), "sb: save_vm_state invoked, path: {}", state_path);
         self.hypervisor
-            .snapshot_vm(snapshot_path)
+            .save_vm_state(state_path)
             .await
-            .context("sandbox: failed to snapshot VM")
+            .context("sandbox: failed to save VM state")
     }
 
-    async fn restore_vm(&self, snapshot_path: &str) -> Result<()> {
-        info!(sl!(), "sb: restore_vm invoked, path: {}", snapshot_path);
+    async fn restore_vm_state(&self, state_path: &str) -> Result<()> {
+        info!(sl!(), "sb: restore_vm_state invoked, path: {}", state_path);
         self.hypervisor
-            .restore_vm(snapshot_path)
+            .restore_vm_state(state_path)
             .await
-            .context("sandbox: failed to restore VM")
+            .context("sandbox: failed to restore VM state")
     }
 }
 

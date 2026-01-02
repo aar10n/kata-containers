@@ -22,11 +22,11 @@ pub const IP6_TABLE_URL: &str = "/ip6tables";
 pub const METRICS_URL: &str = "/metrics";
 /// URL for setting agent policy
 pub const AGENT_POLICY_URL: &str = "/policy";
-/// URL for creating VM snapshot
-pub const SNAPSHOT_URL: &str = "/snapshot";
-/// URL for restoring VM from snapshot
-pub const RESTORE_URL: &str = "/restore";
-/// The key for snapshot path query parameter
-pub const SNAPSHOT_PATH_KEY: &str = "path";
+/// URL for saving VM state
+pub const SAVE_VM_STATE_URL: &str = "/vm-state/save";
+/// URL for restoring VM state
+pub const RESTORE_VM_STATE_URL: &str = "/vm-state/restore";
+/// The key for VM state path query parameter
+pub const VM_STATE_PATH_KEY: &str = "path";
 
 pub const ERR_NO_SHIM_SERVER: &str = "Failed to create shim management server";

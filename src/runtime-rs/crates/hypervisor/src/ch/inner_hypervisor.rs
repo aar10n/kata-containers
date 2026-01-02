@@ -753,20 +753,25 @@ impl CloudHypervisorInner {
         Ok(())
     }
 
-    pub(crate) async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()> {
-        info!(sl!(), "Creating Cloud Hypervisor VM snapshot at: {}", snapshot_path);
+    pub(crate) async fn save_vm_state(&self, state_path: &str) -> Result<()> {
+        info!(sl!(), "Saving Cloud Hypervisor VM state at: {}", state_path);
 
         if self.state != VmmState::VmRunning {
-            return Err(anyhow!("Cannot snapshot VM: VM is not running (state: {:?})", self.state));
+            return Err(anyhow!(
+                "Cannot save VM state: VM is not running (state: {:?})",
+                self.state
+            ));
         }
 
-        // Create the snapshot directory if it doesn't exist
-        tokio::fs::create_dir_all(snapshot_path)
+        // Create the state directory if it doesn't exist
+        tokio::fs::create_dir_all(state_path)
             .await
-            .context(format!("failed to create snapshot directory: {}", snapshot_path))?;
+            .context(format!("failed to create state directory: {}", state_path))?;
 
-        // Pause the VM before taking the snapshot
-        self.pause_vm().await.context("failed to pause VM before snapshot")?;
+        // Pause the VM before saving state
+        self.pause_vm()
+            .await
+            .context("failed to pause VM before saving state")?;
 
         let socket = self
             .api_socket
@@ -776,7 +781,7 @@ impl CloudHypervisorInner {
 
         // Cloud Hypervisor expects a file:// URL for the snapshot destination
         let config = VmSnapshotConfig {
-            destination_url: format!("file://{}", snapshot_path),
+            destination_url: format!("file://{}", state_path),
         };
 
         let result = cloud_hypervisor_vm_snapshot(
@@ -786,22 +791,22 @@ impl CloudHypervisorInner {
         .await;
 
         if let Err(e) = &result {
-            // Try to resume the VM if snapshot failed
-            error!(sl!(), "Snapshot failed, attempting to resume VM: {:?}", e);
+            // Try to resume the VM if save failed
+            error!(sl!(), "State save failed, attempting to resume VM: {:?}", e);
             let _ = self.resume_vm().await;
-            return Err(anyhow!("failed to create snapshot: {:?}", e));
+            return Err(anyhow!("failed to save VM state: {:?}", e));
         }
 
-        info!(sl!(), "Cloud Hypervisor VM snapshot created successfully at: {}", snapshot_path);
+        info!(sl!(), "Cloud Hypervisor VM state saved successfully at: {}", state_path);
         Ok(())
     }
 
-    pub(crate) async fn restore_vm(&self, snapshot_path: &str) -> Result<()> {
-        info!(sl!(), "Restoring Cloud Hypervisor VM from snapshot at: {}", snapshot_path);
+    pub(crate) async fn restore_vm_state(&self, state_path: &str) -> Result<()> {
+        info!(sl!(), "Restoring Cloud Hypervisor VM from state at: {}", state_path);
 
-        // Check that the snapshot directory exists
-        if !std::path::Path::new(snapshot_path).exists() {
-            return Err(anyhow!("Snapshot path does not exist: {}", snapshot_path));
+        // Check that the state directory exists
+        if !std::path::Path::new(state_path).exists() {
+            return Err(anyhow!("State path does not exist: {}", state_path));
         }
 
         let socket = self
@@ -812,7 +817,7 @@ impl CloudHypervisorInner {
 
         // Cloud Hypervisor expects a file:// URL for the snapshot source
         let config = VmRestoreConfig {
-            source_url: format!("file://{}", snapshot_path),
+            source_url: format!("file://{}", state_path),
             prefault: Some(false),
         };
 
@@ -821,9 +826,9 @@ impl CloudHypervisorInner {
             config,
         )
         .await
-        .context("failed to restore VM from snapshot")?;
+        .context("failed to restore VM from state")?;
 
-        info!(sl!(), "Cloud Hypervisor VM restored successfully from: {}", snapshot_path);
+        info!(sl!(), "Cloud Hypervisor VM restored successfully from: {}", state_path);
         Ok(())
     }
 

@@ -136,12 +136,12 @@ impl Hypervisor for Dragonball {
         inner.save_vm().await
     }
 
-    async fn snapshot_vm(&self, _snapshot_path: &str) -> Result<()> {
-        Err(anyhow::anyhow!("snapshot_vm not supported for dragonball"))
+    async fn save_vm_state(&self, _state_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!("save_vm_state not supported for dragonball"))
     }
 
-    async fn restore_vm(&self, _snapshot_path: &str) -> Result<()> {
-        Err(anyhow::anyhow!("restore_vm not supported for dragonball"))
+    async fn restore_vm_state(&self, _state_path: &str) -> Result<()> {
+        Err(anyhow::anyhow!("restore_vm_state not supported for dragonball"))
     }
 
     // returns Result<(old_vcpus, new_vcpus)>

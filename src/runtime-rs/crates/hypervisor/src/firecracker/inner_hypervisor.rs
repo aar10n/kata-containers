@@ -143,7 +143,7 @@ impl FcInner {
     }
 
     pub(crate) async fn save_vm(&self) -> Result<()> {
-        warn!(sl(), "Save VM: Use snapshot_vm() with a path instead");
+        warn!(sl(), "Save VM: Use save_vm_state() with a path instead");
         Ok(())
     }
 
@@ -161,27 +161,29 @@ impl FcInner {
         Ok(())
     }
 
-    /// Snapshot the VM to the specified path.
-    /// Creates two files: {snapshot_path}/vmstate and {snapshot_path}/memory
-    /// The VM will be paused before snapshot and left paused after.
-    pub(crate) async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()> {
-        info!(sl(), "Creating VM snapshot at: {}", snapshot_path);
+    /// Save the VM state to the specified path.
+    /// Creates two files: {state_path}/vmstate and {state_path}/memory
+    /// The VM will be paused before saving and left paused after.
+    pub(crate) async fn save_vm_state(&self, state_path: &str) -> Result<()> {
+        info!(sl(), "Saving VM state at: {}", state_path);
 
         if self.state != VmmState::VmRunning {
-            return Err(anyhow!("Cannot snapshot VM: VM is not running"));
+            return Err(anyhow!("Cannot save VM state: VM is not running"));
         }
 
-        // Create the snapshot directory if it doesn't exist
-        tokio::fs::create_dir_all(snapshot_path)
+        // Create the state directory if it doesn't exist
+        tokio::fs::create_dir_all(state_path)
             .await
-            .context(format!("failed to create snapshot directory: {}", snapshot_path))?;
+            .context(format!("failed to create state directory: {}", state_path))?;
 
         // Pause the VM first
-        self.pause_vm().await.context("failed to pause VM before snapshot")?;
+        self.pause_vm()
+            .await
+            .context("failed to pause VM before saving state")?;
 
         // Create the snapshot using Firecracker's PUT /snapshot/create API
-        let vmstate_path = format!("{}/vmstate", snapshot_path);
-        let memory_path = format!("{}/memory", snapshot_path);
+        let vmstate_path = format!("{}/vmstate", state_path);
+        let memory_path = format!("{}/memory", state_path);
 
         let body = serde_json::json!({
             "snapshot_type": "Full",
@@ -192,27 +194,27 @@ impl FcInner {
 
         self.request_with_retry(hyper::Method::PUT, "/snapshot/create", body)
             .await
-            .context("failed to create snapshot")?;
+            .context("failed to save VM state")?;
 
-        info!(sl(), "VM snapshot created successfully at: {}", snapshot_path);
+        info!(sl(), "VM state saved successfully at: {}", state_path);
         Ok(())
     }
 
-    /// Restore a VM from a snapshot at the specified path.
+    /// Restore a VM from a saved state at the specified path.
     /// NOTE: For POC, this only works on a freshly started Firecracker instance
     /// that hasn't been booted yet. Full restore requires spawning a new FC process.
-    pub(crate) async fn restore_vm(&self, snapshot_path: &str) -> Result<()> {
-        info!(sl(), "Restoring VM from snapshot at: {}", snapshot_path);
+    pub(crate) async fn restore_vm_state(&self, state_path: &str) -> Result<()> {
+        info!(sl(), "Restoring VM from saved state at: {}", state_path);
 
-        let vmstate_path = format!("{}/vmstate", snapshot_path);
-        let memory_path = format!("{}/memory", snapshot_path);
+        let vmstate_path = format!("{}/vmstate", state_path);
+        let memory_path = format!("{}/memory", state_path);
 
-        // Verify snapshot files exist
+        // Verify state files exist
         if !std::path::Path::new(&vmstate_path).exists() {
-            return Err(anyhow!("Snapshot vmstate file not found: {}", vmstate_path));
+            return Err(anyhow!("VM state vmstate file not found: {}", vmstate_path));
         }
         if !std::path::Path::new(&memory_path).exists() {
-            return Err(anyhow!("Snapshot memory file not found: {}", memory_path));
+            return Err(anyhow!("VM state memory file not found: {}", memory_path));
         }
 
         // Load the snapshot using Firecracker's PUT /snapshot/load API
@@ -229,9 +231,9 @@ impl FcInner {
 
         self.request_with_retry(hyper::Method::PUT, "/snapshot/load", body)
             .await
-            .context("failed to load snapshot")?;
+            .context("failed to restore VM state")?;
 
-        info!(sl(), "VM restored successfully from: {}", snapshot_path);
+        info!(sl(), "VM state restored successfully from: {}", state_path);
         Ok(())
     }
 

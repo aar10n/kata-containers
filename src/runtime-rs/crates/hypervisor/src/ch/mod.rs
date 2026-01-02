@@ -106,14 +106,14 @@ impl Hypervisor for CloudHypervisor {
         inner.save_vm().await
     }
 
-    async fn snapshot_vm(&self, snapshot_path: &str) -> Result<()> {
+    async fn save_vm_state(&self, state_path: &str) -> Result<()> {
         let inner = self.inner.read().await;
-        inner.snapshot_vm(snapshot_path).await
+        inner.save_vm_state(state_path).await
     }
 
-    async fn restore_vm(&self, snapshot_path: &str) -> Result<()> {
+    async fn restore_vm_state(&self, state_path: &str) -> Result<()> {
         let inner = self.inner.read().await;
-        inner.restore_vm(snapshot_path).await
+        inner.restore_vm_state(state_path).await
     }
 
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {

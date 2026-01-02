@@ -17,8 +17,8 @@ use url::Url;
 
 use shim_interface::shim_mgmt::{
     AGENT_POLICY_URL, AGENT_URL, DIRECT_VOLUME_PATH_KEY, DIRECT_VOLUME_RESIZE_URL,
-    DIRECT_VOLUME_STATS_URL, IP6_TABLE_URL, IP_TABLE_URL, METRICS_URL, RESTORE_URL,
-    SNAPSHOT_PATH_KEY, SNAPSHOT_URL,
+    DIRECT_VOLUME_STATS_URL, IP6_TABLE_URL, IP_TABLE_URL, METRICS_URL, RESTORE_VM_STATE_URL,
+    SAVE_VM_STATE_URL, VM_STATE_PATH_KEY,
 };
 
 // main router for response, this works as a multiplexer on
@@ -47,8 +47,8 @@ pub(crate) async fn handler_mux(
         }
         (&Method::GET, METRICS_URL) => metrics_url_handler(sandbox, req).await,
         (&Method::PUT, AGENT_POLICY_URL) => set_agent_policy_handler(sandbox, req).await,
-        (&Method::POST, SNAPSHOT_URL) => snapshot_handler(sandbox, req).await,
-        (&Method::POST, RESTORE_URL) => restore_handler(sandbox, req).await,
+        (&Method::POST, SAVE_VM_STATE_URL) => save_vm_state_handler(sandbox, req).await,
+        (&Method::POST, RESTORE_VM_STATE_URL) => restore_vm_state_handler(sandbox, req).await,
         _ => Ok(not_found(req).await),
     }
 }
@@ -187,15 +187,15 @@ async fn set_agent_policy_handler(
     }
 }
 
-/// Handler for VM snapshot requests
-/// POST /snapshot?path=/path/to/snapshot
-async fn snapshot_handler(
+/// Handler for VM state save requests
+/// POST /vm-state/save?path=/path/to/state
+async fn save_vm_state_handler(
     sandbox: Arc<dyn Sandbox>,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    info!(sl!(), "handler: snapshot");
+    info!(sl!(), "handler: save_vm_state");
 
-    // Parse the snapshot path from query parameters
+    // Parse the state path from query parameters
     let uri_string = format!("http://localhost{}", req.uri());
     let params = Url::parse(&uri_string)
         .map_err(|e| anyhow!("failed to parse URI: {}", e))?
@@ -203,20 +203,20 @@ async fn snapshot_handler(
         .into_owned()
         .collect::<std::collections::HashMap<String, String>>();
 
-    let snapshot_path = params
-        .get(SNAPSHOT_PATH_KEY)
-        .context("shim-mgmt: snapshot path not found in request params (use ?path=/path/to/snapshot)")?;
+    let state_path = params
+        .get(VM_STATE_PATH_KEY)
+        .context("shim-mgmt: state path not found in request params (use ?path=/path/to/state)")?;
 
-    match sandbox.snapshot_vm(snapshot_path).await {
+    match sandbox.save_vm_state(state_path).await {
         Ok(_) => {
-            info!(sl!(), "handler: snapshot created successfully at {}", snapshot_path);
+            info!(sl!(), "handler: VM state saved successfully at {}", state_path);
             Ok(Response::new(Body::from(format!(
                 "{{\"status\": \"success\", \"path\": \"{}\"}}",
-                snapshot_path
+                state_path
             ))))
         }
         Err(e) => {
-            let error_msg = format!("failed to create snapshot: {:?}", e);
+            let error_msg = format!("failed to save VM state: {:?}", e);
             error!(sl!(), "handler: {}", error_msg);
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -226,15 +226,15 @@ async fn snapshot_handler(
     }
 }
 
-/// Handler for VM restore requests
-/// POST /restore?path=/path/to/snapshot
-async fn restore_handler(
+/// Handler for VM state restore requests
+/// POST /vm-state/restore?path=/path/to/state
+async fn restore_vm_state_handler(
     sandbox: Arc<dyn Sandbox>,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    info!(sl!(), "handler: restore");
+    info!(sl!(), "handler: restore_vm_state");
 
-    // Parse the snapshot path from query parameters
+    // Parse the state path from query parameters
     let uri_string = format!("http://localhost{}", req.uri());
     let params = Url::parse(&uri_string)
         .map_err(|e| anyhow!("failed to parse URI: {}", e))?
@@ -242,20 +242,20 @@ async fn restore_handler(
         .into_owned()
         .collect::<std::collections::HashMap<String, String>>();
 
-    let snapshot_path = params
-        .get(SNAPSHOT_PATH_KEY)
-        .context("shim-mgmt: snapshot path not found in request params (use ?path=/path/to/snapshot)")?;
+    let state_path = params
+        .get(VM_STATE_PATH_KEY)
+        .context("shim-mgmt: state path not found in request params (use ?path=/path/to/state)")?;
 
-    match sandbox.restore_vm(snapshot_path).await {
+    match sandbox.restore_vm_state(state_path).await {
         Ok(_) => {
-            info!(sl!(), "handler: VM restored successfully from {}", snapshot_path);
+            info!(sl!(), "handler: VM state restored successfully from {}", state_path);
             Ok(Response::new(Body::from(format!(
                 "{{\"status\": \"success\", \"path\": \"{}\"}}",
-                snapshot_path
+                state_path
             ))))
         }
         Err(e) => {
-            let error_msg = format!("failed to restore VM: {:?}", e);
+            let error_msg = format!("failed to restore VM state: {:?}", e);
             error!(sl!(), "handler: {}", error_msg);
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)

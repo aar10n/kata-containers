@@ -1,0 +1,173 @@
+{{- if .Values.sandboxService.enabled }}
+{{- $name := printf "%s-sandbox-service" .Chart.Name -}}
+{{- $sandboxAgentName := printf "%s-sandbox-agent" .Chart.Name -}}
+{{- if .Values.env.multiInstallSuffix }}
+{{- $name = printf "%s-%s" $name .Values.env.multiInstallSuffix -}}
+{{- $sandboxAgentName = printf "%s-%s" $sandboxAgentName .Values.env.multiInstallSuffix -}}
+{{- end }}
+
+# ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: sandbox-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+
+# ClusterRole - needs to create/delete/watch pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: sandbox-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: sandbox-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+
+# Namespace for sandbox pods (if different from release namespace)
+{{- if ne .Values.sandboxService.sandboxNamespace .Release.Namespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.sandboxService.sandboxNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ $name }}
+{{- end }}
+---
+
+# ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: sandbox-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  config.yaml: |
+    http:
+      addr: ":8080"
+    platform: kata
+    kata:
+      namespace: {{ .Values.sandboxService.sandboxNamespace }}
+      runtime_class: {{ .Values.sandboxService.runtimeClass }}
+      node_selector:
+        {{- toYaml .Values.sandboxService.sandboxNodeSelector | nindent 8 }}
+      default_image: {{ .Values.sandboxService.defaultImage | quote }}
+      default_command: ["sleep", "infinity"]
+      sandbox_agent_addr: "http://{{ $sandboxAgentName }}.{{ .Release.Namespace }}:8080"
+    exec:
+      default_timeout: 30s
+      max_output_bytes: 1048576
+    sandbox:
+      default_ttl: {{ .Values.sandboxService.defaultTTL | default "10m" | quote }}
+      cleanup_interval: {{ .Values.sandboxService.cleanupInterval | default "30s" | quote }}
+---
+
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: sandbox-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sandbox-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: http
+---
+
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: sandbox-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.sandboxService.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sandbox-service
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sandbox-service
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s" .Values.sandboxService.sandboxNamespace .Values.sandboxService.runtimeClass (toYaml .Values.sandboxService.sandboxNodeSelector) .Values.sandboxService.defaultImage .Values.sandboxService.defaultTTL .Values.sandboxService.cleanupInterval | sha256sum }}
+    spec:
+      serviceAccountName: {{ $name }}
+      containers:
+        - name: sandbox-service
+          image: {{ .Values.sandboxService.image.reference }}:{{ default .Chart.AppVersion .Values.sandboxService.image.tag }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          args:
+            - --config=/etc/sandbox-service/config.yaml
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.sandboxService.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sandbox-service
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+{{- end }}

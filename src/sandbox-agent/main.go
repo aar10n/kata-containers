@@ -81,12 +81,13 @@ func main() {
 	}, watcher.Store(), agentClient, shimClient)
 
 	grpcServer := grpc.NewServer()
-	apiServer := api.NewServer(api.Config{
+	apiCfg := api.Config{
 		HTTPAddr:    httpAddr,
 		GRPCAddr:    grpcAddr,
 		NodeName:    nodeName,
 		DialTimeout: grpcDialTimeout,
-	}, svc)
+	}
+	apiServer := api.NewServer(apiCfg, svc)
 	apiServer.Register(grpcServer)
 
 	grpcListener, err := net.Listen("tcp", grpcAddr)
@@ -111,9 +112,13 @@ func main() {
 		log.Fatalf("failed to register grpc-gateway: %v", err)
 	}
 
+	rootMux := http.NewServeMux()
+	rootMux.HandleFunc("/v1/resolve", api.ResolveHandler(apiCfg, svc))
+	rootMux.Handle("/", gatewayMux)
+
 	httpServer := &http.Server{
 		Addr:              httpAddr,
-		Handler:           gatewayMux,
+		Handler:           rootMux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

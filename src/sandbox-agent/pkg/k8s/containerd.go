@@ -61,3 +61,9 @@ func resolveSandboxIDFromContainerID(containerID string) string {
 
 	return normalizeID(cfg.Annotations[sandboxAnnotationKey])
 }
+
+// ResolveSandboxIDFromContainerID exposes sandbox ID resolution for callers that
+// only have a container ID available.
+func ResolveSandboxIDFromContainerID(containerID string) string {
+	return resolveSandboxIDFromContainerID(containerID)
+}

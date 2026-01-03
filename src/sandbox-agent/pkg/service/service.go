@@ -22,6 +22,7 @@ type Config struct {
 type Service interface {
 	NodeForVM(vmID string) (string, bool)
 	SandboxAgentAddressForNode(nodeName string) (string, bool)
+	ResolveSandboxID(ctx context.Context, containerID string) (string, error)
 	Exec(ctx context.Context, req ExecRequest) (ExecResponse, error)
 	ListVMs(nodeName string) []VMInfo
 	SaveVMState(ctx context.Context, vmID, statePath string) error
@@ -103,6 +104,17 @@ func (s *service) NodeForVM(vmID string) (string, bool) {
 
 func (s *service) SandboxAgentAddressForNode(nodeName string) (string, bool) {
 	return s.store.SandboxAgentAddressForNode(nodeName)
+}
+
+func (s *service) ResolveSandboxID(ctx context.Context, containerID string) (string, error) {
+	if strings.TrimSpace(containerID) == "" {
+		return "", errors.New("container id is required")
+	}
+	sandboxID := k8s.ResolveSandboxIDFromContainerID(containerID)
+	if sandboxID == "" {
+		return "", errors.New("sandbox id not found")
+	}
+	return sandboxID, nil
 }
 
 func (s *service) Exec(ctx context.Context, req ExecRequest) (ExecResponse, error) {

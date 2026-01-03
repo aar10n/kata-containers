@@ -6,12 +6,6 @@ image:
   reference: quay.io/kata-containers/kata-deploy
   tag: ""
 
-sandboxAgent:
-  enabled: true
-  image:
-    reference: gcr.io/cohere-artifacts/sandbox-agent
-    tag: ""
-
 k8sDistribution: "k8s"  # k8s, k3s, rke2, k0s, microk8s
 
 # Node selector and tolerations to control which nodes the kata-deploy daemonset runs on
@@ -279,3 +273,36 @@ env:
 #            deployment, use nodeSelector manually.
 node-feature-discovery:
   enabled: false
+
+sandboxAgent:
+  enabled: true
+  image:
+    reference: gcr.io/cohere-artifacts/sandbox-agent
+    tag: ""
+
+sandboxService:
+  enabled: true
+  replicas: 1
+
+  image:
+    reference: gcr.io/cohere-artifacts/sandbox-service
+    tag: ""
+
+  sandboxNamespace: kata-sandboxes
+
+  runtimeClass: kata-qemu
+
+  sandboxNodeSelector:
+    katacontainers.io/kata-runtime: "true"
+
+  defaultImage: "python:3.11-slim"
+  defaultTTL: "10m"
+  cleanupInterval: "30s"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

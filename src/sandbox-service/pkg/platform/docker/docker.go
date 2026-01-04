@@ -4,13 +4,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
@@ -33,6 +38,17 @@ type Platform struct {
 	docker         *client.Client
 	defaultImage   string
 	defaultCommand []string
+	mu             sync.RWMutex
+	processes      map[string]*dockerProcess
+}
+
+type dockerProcess struct {
+	execID      string
+	containerID string
+	conn        types.HijackedResponse
+	buffer      []byte
+	terminal    bool
+	mu          sync.Mutex
 }
 
 func New(defaultImage string, defaultCommand []string) (*Platform, error) {
@@ -44,6 +60,7 @@ func New(defaultImage string, defaultCommand []string) (*Platform, error) {
 		docker:         cli,
 		defaultImage:   defaultImage,
 		defaultCommand: append([]string{}, defaultCommand...),
+		processes:      make(map[string]*dockerProcess),
 	}, nil
 }
 
@@ -90,7 +107,7 @@ func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandbox
 		return nil, fmt.Errorf("start container: %w", err)
 	}
 	if err := p.writeLastActivity(resp.ID, now); err != nil {
-		log.Printf("persist last activity failed for session %s: %v", req.SessionID, err)
+		slog.Warn("persist last activity failed", "session_id", req.SessionID, "error", err)
 	}
 
 	return &platform.Sandbox{
@@ -211,7 +228,7 @@ func (p *Platform) Exec(ctx context.Context, req platform.ExecRequest) (*platfor
 		return nil, fmt.Errorf("create exec: %w", err)
 	}
 
-	attach, err := p.docker.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{})
+	attach, err := p.docker.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{Tty: false})
 	if err != nil {
 		return nil, fmt.Errorf("attach exec: %w", err)
 	}
@@ -237,9 +254,199 @@ func (p *Platform) Exec(ctx context.Context, req platform.ExecRequest) (*platfor
 		containerID = name
 	}
 	if err := p.writeLastActivity(containerID, time.Now().UTC()); err != nil {
-		log.Printf("persist last activity failed for session %s: %v", req.SessionID, err)
+		slog.Warn("persist last activity failed", "session_id", req.SessionID, "error", err)
 	}
 	return result, nil
+}
+
+func (p *Platform) StartProcess(ctx context.Context, req platform.StartProcessRequest) (*platform.Process, error) {
+	name := containerName(req.SessionID)
+	execResp, err := p.docker.ContainerExecCreate(ctx, name, types.ExecConfig{
+		Cmd:          req.Command,
+		Env:          req.Env,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          req.Terminal,
+	})
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, platform.ErrNotFound
+		}
+		return nil, fmt.Errorf("create exec: %w", err)
+	}
+
+	attach, err := p.docker.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{})
+	if err != nil {
+		return nil, fmt.Errorf("attach exec: %w", err)
+	}
+
+	proc := &dockerProcess{
+		execID:      execResp.ID,
+		containerID: name,
+		conn:        attach,
+		terminal:    req.Terminal,
+	}
+
+	p.mu.Lock()
+	p.processes[req.ExecID] = proc
+	p.mu.Unlock()
+
+	now := time.Now().UTC()
+	if err := p.writeLastActivity(name, now); err != nil {
+		slog.Warn("persist last activity failed", "session_id", req.SessionID, "error", err)
+	}
+
+	return &platform.Process{
+		ExecID:    req.ExecID,
+		StartedAt: now,
+		Alive:     true,
+	}, nil
+}
+
+func (p *Platform) WriteToProcess(ctx context.Context, sessionID, execID string, data []byte) error {
+	proc := p.getProcess(execID)
+	if proc == nil {
+		return fmt.Errorf("process not found: %s", execID)
+	}
+
+	proc.mu.Lock()
+	_, err := proc.conn.Conn.Write(data)
+	proc.mu.Unlock()
+
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			proc.mu.Lock()
+			proc.conn.Close()
+			proc.mu.Unlock()
+			p.mu.Lock()
+			delete(p.processes, execID)
+			p.mu.Unlock()
+		}
+		return err
+	}
+	if err := p.writeLastActivity(proc.containerID, time.Now().UTC()); err != nil {
+		slog.Warn("persist last activity failed", "session_id", sessionID, "error", err)
+	}
+	return nil
+}
+
+func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string) (*platform.ProcessOutput, error) {
+	proc := p.getProcess(execID)
+	if proc == nil {
+		return nil, fmt.Errorf("process not found: %s", execID)
+	}
+
+	buf := make([]byte, 4096)
+
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+
+	if err := proc.conn.Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		return nil, err
+	}
+
+	n, err := proc.conn.Reader.Read(buf)
+	if err != nil && !isTimeout(err) {
+		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			proc.conn.Close()
+			p.mu.Lock()
+			delete(p.processes, execID)
+			p.mu.Unlock()
+		}
+		return nil, err
+	}
+
+	if n <= 0 {
+		return &platform.ProcessOutput{}, nil
+	}
+
+	proc.buffer = append(proc.buffer, buf[:n]...)
+
+	if proc.terminal {
+		if isDockerMuxed(proc.buffer) {
+			stdout, _, remaining, err := demuxDockerStream(proc.buffer)
+			if err != nil {
+				return nil, err
+			}
+			proc.buffer = remaining
+			return &platform.ProcessOutput{Stdout: stdout}, nil
+		}
+		stdout := append([]byte{}, proc.buffer...)
+		proc.buffer = nil
+		return &platform.ProcessOutput{Stdout: stdout}, nil
+	}
+
+	stdout, stderr, remaining, err := demuxDockerStream(proc.buffer)
+	if err != nil {
+		return nil, err
+	}
+	proc.buffer = remaining
+
+	return &platform.ProcessOutput{
+		Stdout: stdout,
+		Stderr: stderr,
+	}, nil
+}
+
+func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) error {
+	proc := p.getProcess(execID)
+	if proc == nil {
+		return platform.ErrNotFound
+	}
+	inspect, err := p.docker.ContainerExecInspect(ctx, proc.execID)
+	if err != nil {
+		return err
+	}
+	if inspect.Pid > 0 {
+		if err := syscall.Kill(inspect.Pid, syscall.SIGKILL); err != nil {
+			return err
+		}
+	}
+
+	proc.mu.Lock()
+	proc.conn.Close()
+	proc.mu.Unlock()
+
+	p.mu.Lock()
+	delete(p.processes, execID)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *Platform) IsProcessAlive(ctx context.Context, sessionID, execID string) (bool, error) {
+	proc := p.getProcess(execID)
+	if proc == nil {
+		return false, nil
+	}
+	inspect, err := p.docker.ContainerExecInspect(ctx, proc.execID)
+	if err != nil {
+		return false, err
+	}
+	if !inspect.Running {
+		proc.mu.Lock()
+		proc.conn.Close()
+		proc.mu.Unlock()
+		p.mu.Lock()
+		delete(p.processes, execID)
+		p.mu.Unlock()
+		return false, nil
+	}
+	return true, nil
+}
+
+func (p *Platform) ResizeProcess(ctx context.Context, sessionID, execID string, rows, columns uint32) error {
+	proc := p.getProcess(execID)
+	if proc == nil {
+		return platform.ErrNotFound
+	}
+	if !proc.terminal {
+		return fmt.Errorf("process does not use a terminal: %s", execID)
+	}
+	return p.docker.ContainerExecResize(ctx, proc.execID, container.ResizeOptions{
+		Height: uint(rows),
+		Width:  uint(columns),
+	})
 }
 
 func applyTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -282,6 +489,13 @@ func mapToEnv(values map[string]string) []string {
 	return result
 }
 
+func (p *Platform) getProcess(execID string) *dockerProcess {
+	p.mu.RLock()
+	proc := p.processes[execID]
+	p.mu.RUnlock()
+	return proc
+}
+
 func (p *Platform) readLastActivity(containerID string, fallback time.Time, labels map[string]string) time.Time {
 	if containerID != "" {
 		if value, err := p.readLastActivityFromFile(containerID); err == nil && !value.IsZero() {
@@ -296,6 +510,54 @@ func (p *Platform) readLastActivity(containerID string, fallback time.Time, labe
 		}
 	}
 	return fallback
+}
+
+func demuxDockerStream(data []byte) ([]byte, []byte, []byte, error) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	for {
+		if len(data) < 8 {
+			break
+		}
+		streamID := data[0]
+		size := binary.BigEndian.Uint32(data[4:8])
+		if len(data) < 8+int(size) {
+			break
+		}
+		payload := data[8 : 8+int(size)]
+		switch streamID {
+		case 1:
+			stdout.Write(payload)
+		case 2:
+			stderr.Write(payload)
+		}
+		data = data[8+int(size):]
+	}
+
+	return stdout.Bytes(), stderr.Bytes(), data, nil
+}
+
+func isDockerMuxed(data []byte) bool {
+	if len(data) < 8 {
+		return false
+	}
+	if data[1] != 0 || data[2] != 0 || data[3] != 0 {
+		return false
+	}
+	size := binary.BigEndian.Uint32(data[4:8])
+	return int(size) <= len(data)-8
+}
+
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (p *Platform) readLastActivityFromFile(containerID string) (time.Time, error) {

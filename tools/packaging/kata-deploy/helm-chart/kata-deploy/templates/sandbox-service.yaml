@@ -6,7 +6,7 @@
 {{- $sandboxAgentName = printf "%s-%s" $sandboxAgentName .Values.env.multiInstallSuffix -}}
 {{- end }}
 
-# ServiceAccount
+# ServiceAccount for leader election
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -17,50 +17,38 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 ---
 
-# ClusterRole - needs to create/delete/watch pods
+# Role for leader election (Lease management)
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: {{ $name }}
+  name: {{ $name }}-leader-election
+  namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: sandbox-service
     app.kubernetes.io/instance: {{ .Release.Name }}
 rules:
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "delete"]
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "create", "update", "patch", "delete"]
 ---
 
-# ClusterRoleBinding
+# RoleBinding for leader election
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: {{ $name }}
+  name: {{ $name }}-leader-election
+  namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: sandbox-service
     app.kubernetes.io/instance: {{ .Release.Name }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ $name }}
 subjects:
   - kind: ServiceAccount
     name: {{ $name }}
     namespace: {{ .Release.Namespace }}
----
-
-# Namespace for sandbox pods (if different from release namespace)
-{{- if ne .Values.sandboxService.sandboxNamespace .Release.Namespace }}
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: {{ .Values.sandboxService.sandboxNamespace }}
-  labels:
-    app.kubernetes.io/managed-by: {{ $name }}
-{{- end }}
+roleRef:
+  kind: Role
+  name: {{ $name }}-leader-election
+  apiGroup: rbac.authorization.k8s.io
 ---
 
 # ConfigMap
@@ -78,12 +66,6 @@ data:
       addr: ":8080"
     platform: kata
     kata:
-      namespace: {{ .Values.sandboxService.sandboxNamespace }}
-      runtime_class: {{ .Values.sandboxService.runtimeClass }}
-      node_selector:
-        {{- toYaml .Values.sandboxService.sandboxNodeSelector | nindent 8 }}
-      default_image: {{ .Values.sandboxService.defaultImage | quote }}
-      default_command: ["sleep", "infinity"]
       sandbox_agent_addr: "http://{{ $sandboxAgentName }}.{{ .Release.Namespace }}:8080"
     exec:
       default_timeout: 30s
@@ -135,7 +117,7 @@ spec:
         app.kubernetes.io/name: sandbox-service
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s" .Values.sandboxService.sandboxNamespace .Values.sandboxService.runtimeClass (toYaml .Values.sandboxService.sandboxNodeSelector) .Values.sandboxService.defaultImage .Values.sandboxService.defaultTTL .Values.sandboxService.cleanupInterval | sha256sum }}
+        checksum/config: {{ printf "%s|%s" .Values.sandboxService.defaultTTL .Values.sandboxService.cleanupInterval | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       containers:
@@ -143,7 +125,7 @@ spec:
           image: {{ .Values.sandboxService.image.reference }}:{{ default .Chart.AppVersion .Values.sandboxService.image.tag }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           args:
-            - --config=/etc/sandbox-service/config.yaml
+            - -c=/etc/sandbox-service/config.yaml
           ports:
             - name: http
               containerPort: 8080

@@ -20,6 +20,12 @@ type Platform interface {
 	DeleteSandbox(ctx context.Context, sessionID string) error
 	ListSandboxes(ctx context.Context) ([]*Sandbox, error)
 	Exec(ctx context.Context, req ExecRequest) (*ExecResult, error)
+	StartProcess(ctx context.Context, req StartProcessRequest) (*Process, error)
+	WriteToProcess(ctx context.Context, sessionID, execID string, data []byte) error
+	ReadFromProcess(ctx context.Context, sessionID, execID string) (*ProcessOutput, error)
+	KillProcess(ctx context.Context, sessionID, execID string) error
+	IsProcessAlive(ctx context.Context, sessionID, execID string) (bool, error)
+	ResizeProcess(ctx context.Context, sessionID, execID string, rows, columns uint32) error
 }
 
 type CreateSandboxRequest struct {
@@ -51,15 +57,36 @@ const (
 )
 
 type ExecRequest struct {
-	SessionID  string
-	Command    []string
-	Env        map[string]string
-	WorkingDir string
-	Timeout    time.Duration
+	SessionID     string
+	ContainerName string
+	Command       []string
+	Env           map[string]string
+	WorkingDir    string
+	Timeout       time.Duration
 }
 
 type ExecResult struct {
 	ExitCode int
 	Stdout   string
 	Stderr   string
+}
+
+type StartProcessRequest struct {
+	SessionID     string
+	ContainerName string
+	ExecID        string
+	Command       []string
+	Env           []string
+	Terminal      bool
+}
+
+type Process struct {
+	ExecID    string
+	StartedAt time.Time
+	Alive     bool
+}
+
+type ProcessOutput struct {
+	Stdout []byte
+	Stderr []byte
 }

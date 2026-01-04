@@ -1,535 +1,566 @@
 package kata
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"os"
+	"log/slog"
+	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/api/pb"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
+	agentgrpc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const (
-	labelSandboxVM      = "sandbox.cohere.com/vm"
-	labelSandboxSession = "sandbox.cohere.com/session-id"
-	sandboxAnnotationID = "io.kubernetes.cri.sandbox-id"
-	lastActivityKey     = "sandbox.cohere.com/last-activity"
+	agentReadTimeout     = 2 * time.Second
+	sandboxPollInitDelay = 100 * time.Millisecond
+	sandboxPollMaxDelay  = 2 * time.Second
+	sandboxReadyTimeout  = 30 * time.Second
+	backoffMultiplier    = 1.5
+	jitterFraction       = 0.2
 )
 
+// cachedSandbox holds cached sandbox info with expiry.
+type cachedSandbox struct {
+	sandbox   *platform.Sandbox
+	expiresAt time.Time
+}
+
+const sandboxCacheTTL = 30 * time.Second
+
+// Platform implements the sandbox platform interface using the sandbox-agent gRPC API.
 type Platform struct {
-	client           kubernetes.Interface
-	namespace        string
-	runtimeClass     string
-	nodeSelector     map[string]string
-	defaultImage     string
-	defaultCommand   []string
-	sandboxAgentAddr string
-	httpClient       *http.Client
+	conn              *grpc.ClientConn
+	client            pb.SandboxAgentClient
+	mu                sync.RWMutex
+	processContainers map[string]string            // execID -> containerID
+	sandboxCache      map[string]*cachedSandbox    // sessionID -> cached sandbox
 }
 
-type ExecRequest struct {
-	VMID        string   `json:"vm_id"`
-	ContainerID string   `json:"container_id"`
-	Args        []string `json:"args"`
-	Env         []string `json:"env,omitempty"`
-	Cwd         string   `json:"cwd,omitempty"`
-	TimeoutMs   int64    `json:"timeout_ms,omitempty"`
+// Config holds configuration for the Kata platform.
+type Config struct {
+	SandboxAgentAddr string
 }
 
-type ExecResponse struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
-}
-
-type ResolveRequest struct {
-	ContainerID string `json:"container_id"`
-	Node        string `json:"node,omitempty"`
-}
-
-type ResolveResponse struct {
-	SandboxID string `json:"sandbox_id"`
-}
-
-func New(namespace, runtimeClass string, nodeSelector map[string]string, defaultImage string, defaultCommand []string, sandboxAgentAddr string) (*Platform, error) {
-	client, err := newClient()
-	if err != nil {
-		return nil, err
+// New creates a new Kata platform.
+func New(cfg Config) (*Platform, error) {
+	if strings.TrimSpace(cfg.SandboxAgentAddr) == "" {
+		return nil, errors.New("sandbox agent address is required")
 	}
+
+	// Remove http:// prefix if present and use gRPC port
+	addr := cfg.SandboxAgentAddr
+	addr = strings.TrimPrefix(addr, "http://")
+	addr = strings.TrimPrefix(addr, "https://")
+
+	// Replace HTTP port 8080 with gRPC port 9090 if needed
+	if strings.HasSuffix(addr, ":8080") {
+		addr = strings.TrimSuffix(addr, ":8080") + ":9090"
+	} else if !strings.Contains(addr, ":") {
+		addr = addr + ":9090"
+	}
+
+	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("dial sandbox-agent: %w", err)
+	}
+
 	return &Platform{
-		client:           client,
-		namespace:        namespace,
-		runtimeClass:     runtimeClass,
-		nodeSelector:     copyMap(nodeSelector),
-		defaultImage:     defaultImage,
-		defaultCommand:   append([]string{}, defaultCommand...),
-		sandboxAgentAddr: strings.TrimRight(sandboxAgentAddr, "/"),
-		httpClient:       &http.Client{Timeout: 30 * time.Second},
+		conn:              conn,
+		client:            pb.NewSandboxAgentClient(conn),
+		processContainers: make(map[string]string),
+		sandboxCache:      make(map[string]*cachedSandbox),
 	}, nil
 }
 
-func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandboxRequest) (*platform.Sandbox, error) {
-	pod, err := p.findPod(ctx, req.SessionID)
-	if err == nil && pod != nil {
-		return nil, platform.ErrAlreadyExists
-	}
-	if err != nil && !errors.Is(err, platform.ErrNotFound) {
-		return nil, err
-	}
-
-	image := req.Image
-	if image == "" {
-		image = p.defaultImage
-	}
-	command := req.Command
-	if len(command) == 0 {
-		command = append([]string{}, p.defaultCommand...)
-	}
-
-	labels := map[string]string{
-		labelSandboxVM:      "true",
-		labelSandboxSession: req.SessionID,
-	}
-	for key, value := range req.Labels {
-		labels[key] = value
-	}
-
-	podName := podNameForSession(req.SessionID)
-	podSpec := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: p.namespace,
-			Labels:    labels,
-			Annotations: map[string]string{
-				lastActivityKey: time.Now().UTC().Format(time.RFC3339),
-			},
-		},
-		Spec: corev1.PodSpec{
-			RuntimeClassName: runtimeClassName(p.runtimeClass),
-			NodeSelector:     copyMap(p.nodeSelector),
-			Containers: []corev1.Container{
-				{
-					Name:    "sandbox",
-					Image:   image,
-					Command: command,
-					Env:     mapToEnvVars(req.Env),
-				},
-			},
-			RestartPolicy: corev1.RestartPolicyNever,
-		},
-	}
-
-	created, err := p.client.CoreV1().Pods(p.namespace).Create(ctx, podSpec, metav1.CreateOptions{})
-	if err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return nil, platform.ErrAlreadyExists
-		}
-		return nil, fmt.Errorf("create pod: %w", err)
-	}
-
-	return sandboxFromPod(created), nil
-}
-
-func (p *Platform) GetSandbox(ctx context.Context, sessionID string) (*platform.Sandbox, error) {
-	pod, err := p.findPod(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	return sandboxFromPod(pod), nil
-}
-
-func (p *Platform) DeleteSandbox(ctx context.Context, sessionID string) error {
-	pod, err := p.findPod(ctx, sessionID)
-	if err != nil {
-		if errors.Is(err, platform.ErrNotFound) {
-			return platform.ErrNotFound
-		}
-		return err
-	}
-
-	policy := metav1.DeletePropagationForeground
-	if err := p.client.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{PropagationPolicy: &policy}); err != nil {
-		if apierrors.IsNotFound(err) {
-			return platform.ErrNotFound
-		}
-		return fmt.Errorf("delete pod: %w", err)
+// Close closes the gRPC connection.
+func (p *Platform) Close() error {
+	if p.conn != nil {
+		return p.conn.Close()
 	}
 	return nil
 }
 
-func (p *Platform) ListSandboxes(ctx context.Context) ([]*platform.Sandbox, error) {
-	selector := labels.Set{labelSandboxVM: "true"}.AsSelector()
-	list, err := p.client.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
+// CreateSandbox creates a new sandbox via the agent.
+func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandboxRequest) (*platform.Sandbox, error) {
+	resp, err := p.client.CreateSandbox(ctx, &pb.CreateSandboxRequest{
+		SessionId: req.SessionID,
+		Image:     req.Image,
+		Command:   req.Command,
+		Env:       req.Env,
+		Labels:    req.Labels,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("list pods: %w", err)
+		if status.Code(err) == codes.AlreadyExists {
+			return nil, platform.ErrAlreadyExists
+		}
+		return nil, fmt.Errorf("create sandbox: %w", err)
 	}
 
-	result := make([]*platform.Sandbox, 0, len(list.Items))
-	for i := range list.Items {
-		pod := &list.Items[i]
-		sessionID := pod.Labels[labelSandboxSession]
-		if sessionID == "" {
-			continue
+	return protoToSandbox(resp), nil
+}
+
+// GetSandbox retrieves sandbox info from the agent.
+func (p *Platform) GetSandbox(ctx context.Context, sessionID string) (*platform.Sandbox, error) {
+	resp, err := p.client.GetSandbox(ctx, &pb.GetSandboxRequest{
+		SessionId: sessionID,
+	})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			p.invalidateCache(sessionID)
+			return nil, platform.ErrNotFound
 		}
-		result = append(result, sandboxFromPod(pod))
+		return nil, fmt.Errorf("get sandbox: %w", err)
+	}
+
+	sandbox := protoToSandbox(resp)
+	p.cacheUpdate(sessionID, sandbox)
+	return sandbox, nil
+}
+
+// getCachedSandbox returns cached sandbox info if available and not expired.
+func (p *Platform) getCachedSandbox(sessionID string) *platform.Sandbox {
+	p.mu.RLock()
+	cached := p.sandboxCache[sessionID]
+	p.mu.RUnlock()
+
+	if cached == nil || time.Now().After(cached.expiresAt) {
+		return nil
+	}
+	return cached.sandbox
+}
+
+// cacheUpdate updates the cache with new sandbox info.
+func (p *Platform) cacheUpdate(sessionID string, sandbox *platform.Sandbox) {
+	if sandbox == nil {
+		return
+	}
+	p.mu.Lock()
+	p.sandboxCache[sessionID] = &cachedSandbox{
+		sandbox:   sandbox,
+		expiresAt: time.Now().Add(sandboxCacheTTL),
+	}
+	p.mu.Unlock()
+}
+
+// invalidateCache removes a session from the cache.
+func (p *Platform) invalidateCache(sessionID string) {
+	p.mu.Lock()
+	delete(p.sandboxCache, sessionID)
+	p.mu.Unlock()
+}
+
+// getSandboxIDCached returns the sandboxID for a session, using cache when possible.
+func (p *Platform) getSandboxIDCached(ctx context.Context, sessionID string) (string, error) {
+	if cached := p.getCachedSandbox(sessionID); cached != nil && cached.SandboxID != "" {
+		return cached.SandboxID, nil
+	}
+
+	sandbox, err := p.GetSandbox(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return sandbox.SandboxID, nil
+}
+
+// DeleteSandbox deletes a sandbox via the agent.
+func (p *Platform) DeleteSandbox(ctx context.Context, sessionID string) error {
+	_, err := p.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
+		SessionId: sessionID,
+	})
+	p.invalidateCache(sessionID)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return platform.ErrNotFound
+		}
+		return fmt.Errorf("delete sandbox: %w", err)
+	}
+	return nil
+}
+
+// ListSandboxes lists all sandboxes from the agent.
+func (p *Platform) ListSandboxes(ctx context.Context) ([]*platform.Sandbox, error) {
+	resp, err := p.client.ListSandboxes(ctx, &pb.ListSandboxesRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("list sandboxes: %w", err)
+	}
+
+	result := make([]*platform.Sandbox, 0, len(resp.GetSandboxes()))
+	for _, info := range resp.GetSandboxes() {
+		result = append(result, protoToSandbox(info))
 	}
 	return result, nil
 }
 
+// Exec executes a command in a sandbox.
 func (p *Platform) Exec(ctx context.Context, req platform.ExecRequest) (*platform.ExecResult, error) {
-	pod, err := p.findPod(ctx, req.SessionID)
+	sandbox, err := p.waitForSandboxReady(ctx, req.SessionID, req.ContainerName)
 	if err != nil {
 		return nil, err
 	}
-	info := sandboxFromPod(pod)
-	if info.Status != platform.StatusRunning {
-		return nil, platform.ErrNotReady
-	}
-	if info.SandboxID == "" && info.ContainerID != "" {
-		sandboxID, err := p.resolveSandboxID(ctx, pod.Spec.NodeName, info.ContainerID)
-		if err != nil {
-			return nil, platform.ErrNotReady
-		}
-		info.SandboxID = sandboxID
-	}
-	if info.SandboxID == "" {
-		return nil, platform.ErrNotReady
+
+	containerID := getContainerID(sandbox, req.ContainerName)
+
+	var timeoutMs int64
+	if req.Timeout > 0 {
+		timeoutMs = req.Timeout.Milliseconds()
 	}
 
-	payload := ExecRequest{
-		VMID:        info.SandboxID,
-		ContainerID: info.ContainerID,
+	resp, err := p.client.Exec(ctx, &pb.ExecRequest{
+		VmId:        sandbox.SandboxID,
+		ContainerId: containerID,
 		Args:        req.Command,
 		Env:         mapToEnv(req.Env),
 		Cwd:         req.WorkingDir,
-	}
-	if req.Timeout > 0 {
-		payload.TimeoutMs = req.Timeout.Milliseconds()
-	}
-
-	body, err := json.Marshal(payload)
+		TimeoutMs:   timeoutMs,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("marshal exec payload: %w", err)
+		return nil, fmt.Errorf("exec: %w", err)
 	}
 
-	url := p.sandboxAgentAddr + "/v1/exec"
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create exec request: %w", err)
-	}
-	request.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.httpClient.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("exec request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read exec response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("sandbox-agent exec error: %s", strings.TrimSpace(string(data)))
-	}
-
-	var execResp ExecResponse
-	if err := json.Unmarshal(data, &execResp); err != nil {
-		return nil, fmt.Errorf("decode exec response: %w", err)
-	}
-	if err := p.updateLastActivity(ctx, pod.Name); err != nil {
-		log.Printf("update last activity failed for session %s: %v", req.SessionID, err)
-	}
+	// Update activity
+	p.updateActivity(ctx, req.SessionID)
 
 	return &platform.ExecResult{
-		ExitCode: execResp.ExitCode,
-		Stdout:   execResp.Stdout,
-		Stderr:   execResp.Stderr,
+		ExitCode: int(resp.GetExitCode()),
+		Stdout:   resp.GetStdout(),
+		Stderr:   resp.GetStderr(),
 	}, nil
 }
 
-func (p *Platform) resolveSandboxID(ctx context.Context, nodeName, containerID string) (string, error) {
-	if p.sandboxAgentAddr == "" || containerID == "" {
-		return "", errors.New("sandbox agent address or container id missing")
-	}
-
-	payload := ResolveRequest{
-		ContainerID: containerID,
-		Node:        nodeName,
-	}
-	body, err := json.Marshal(payload)
+// StartProcess starts a long-running process in a sandbox.
+func (p *Platform) StartProcess(ctx context.Context, req platform.StartProcessRequest) (*platform.Process, error) {
+	sandbox, err := p.waitForSandboxReady(ctx, req.SessionID, req.ContainerName)
 	if err != nil {
-		return "", fmt.Errorf("marshal resolve payload: %w", err)
+		return nil, err
 	}
 
-	url := p.sandboxAgentAddr + "/v1/resolve"
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("create resolve request: %w", err)
-	}
-	request.Header.Set("Content-Type", "application/json")
+	containerID := getContainerID(sandbox, req.ContainerName)
 
-	resp, err := p.httpClient.Do(request)
-	if err != nil {
-		return "", fmt.Errorf("resolve request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read resolve response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("sandbox-agent resolve error: %s", strings.TrimSpace(string(data)))
-	}
-
-	var resolveResp ResolveResponse
-	if err := json.Unmarshal(data, &resolveResp); err != nil {
-		return "", fmt.Errorf("decode resolve response: %w", err)
-	}
-	if resolveResp.SandboxID == "" {
-		return "", errors.New("sandbox id not found")
-	}
-	return resolveResp.SandboxID, nil
-}
-
-func (p *Platform) findPod(ctx context.Context, sessionID string) (*corev1.Pod, error) {
-	selector := labels.Set{labelSandboxSession: sessionID}.AsSelector()
-	list, err := p.client.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
-	if err != nil {
-		return nil, fmt.Errorf("list pods: %w", err)
-	}
-	if len(list.Items) == 0 {
-		return nil, platform.ErrNotFound
-	}
-
-	pod := &list.Items[0]
-	for i := range list.Items {
-		candidate := &list.Items[i]
-		if pod.CreationTimestamp.After(candidate.CreationTimestamp.Time) {
-			pod = candidate
-		}
-	}
-	return pod, nil
-}
-
-func sandboxFromPod(pod *corev1.Pod) *platform.Sandbox {
-	status := podStatus(pod)
-	return &platform.Sandbox{
-		SessionID:   pod.Labels[labelSandboxSession],
-		SandboxID:   sandboxIDFromPod(pod),
-		ContainerID: containerIDFromPod(pod),
-		Status:      status,
-		Host:        pod.Spec.NodeName,
-		CreatedAt:   pod.CreationTimestamp.Time,
-		LastUsedAt:  lastActivityFromPod(pod),
-		Labels:      pod.Labels,
-	}
-}
-
-func podStatus(pod *corev1.Pod) platform.SandboxStatus {
-	if pod.DeletionTimestamp != nil {
-		return platform.StatusTerminated
-	}
-	switch pod.Status.Phase {
-	case corev1.PodPending:
-		return platform.StatusPending
-	case corev1.PodRunning:
-		if isPodReady(pod) {
-			return platform.StatusRunning
-		}
-		return platform.StatusPending
-	case corev1.PodSucceeded:
-		return platform.StatusTerminated
-	case corev1.PodFailed:
-		return platform.StatusFailed
-	default:
-		return platform.StatusPending
-	}
-}
-
-func isPodReady(pod *corev1.Pod) bool {
-	for _, cond := range pod.Status.Conditions {
-		if cond.Type == corev1.PodReady {
-			return cond.Status == corev1.ConditionTrue
-		}
-	}
-	return false
-}
-
-func sandboxIDFromPod(pod *corev1.Pod) string {
-	if pod.Annotations != nil {
-		if id := normalizeID(pod.Annotations[sandboxAnnotationID]); id != "" {
-			return id
-		}
-	}
-	return ""
-}
-
-func lastActivityFromPod(pod *corev1.Pod) time.Time {
-	if pod.Annotations != nil {
-		if value := strings.TrimSpace(pod.Annotations[lastActivityKey]); value != "" {
-			if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-				return parsed
-			}
-		}
-	}
-	return pod.CreationTimestamp.Time
-}
-
-func containerIDFromPod(pod *corev1.Pod) string {
-	for _, status := range pod.Status.ContainerStatuses {
-		if status.ContainerID != "" {
-			return normalizeID(status.ContainerID)
-		}
-	}
-	return ""
-}
-
-func mapToEnvVars(values map[string]string) []corev1.EnvVar {
-	if len(values) == 0 {
-		return nil
-	}
-	result := make([]corev1.EnvVar, 0, len(values))
-	for key, value := range values {
-		result = append(result, corev1.EnvVar{Name: key, Value: value})
-	}
-	return result
-}
-
-func mapToEnv(values map[string]string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	result := make([]string, 0, len(values))
-	for key, value := range values {
-		result = append(result, fmt.Sprintf("%s=%s", key, value))
-	}
-	return result
-}
-
-func podNameForSession(sessionID string) string {
-	base := sanitizeName(sessionID)
-	if base == "" {
-		base = "sandbox"
-	}
-	name := "sandbox-" + base
-	if len(name) <= 63 {
-		return name
-	}
-	suffix := hashSuffix(sessionID)
-	trim := 63 - len("sandbox-") - 1 - len(suffix)
-	if trim < 1 {
-		trim = 1
-	}
-	return "sandbox-" + base[:trim] + "-" + suffix
-}
-
-func sanitizeName(value string) string {
-	value = strings.ToLower(value)
-	var b strings.Builder
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r == '-' || r == '.' || r == '_':
-			b.WriteRune(r)
-		default:
-			b.WriteRune('-')
-		}
-	}
-	return strings.Trim(b.String(), "-._")
-}
-
-func hashSuffix(value string) string {
-	sum := sha1.Sum([]byte(value))
-	return hex.EncodeToString(sum[:4])
-}
-
-func runtimeClassName(value string) *string {
-	if value == "" {
-		return nil
-	}
-	return &value
-}
-
-func copyMap(values map[string]string) map[string]string {
-	if len(values) == 0 {
-		return nil
-	}
-	copy := make(map[string]string, len(values))
-	for key, value := range values {
-		copy[key] = value
-	}
-	return copy
-}
-
-func normalizeID(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	if strings.Contains(value, "://") {
-		parts := strings.SplitN(value, "://", 2)
-		return strings.TrimSpace(parts[1])
-	}
-	return value
-}
-
-func (p *Platform) updateLastActivity(ctx context.Context, podName string) error {
-	patch := map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]string{
-				lastActivityKey: time.Now().UTC().Format(time.RFC3339),
+	_, err = p.client.ExecProcess(ctx, &pb.ExecProcessRequest{
+		VmId: sandbox.SandboxID,
+		Request: &agentgrpc.ExecProcessRequest{
+			ContainerId: containerID,
+			ExecId:      req.ExecID,
+			Process: &agentgrpc.Process{
+				Terminal: req.Terminal,
+				Args:     req.Command,
+				Env:      req.Env,
 			},
 		},
-	}
-	data, err := json.Marshal(patch)
+	})
 	if err != nil {
-		return fmt.Errorf("marshal last activity patch: %w", err)
+		return nil, fmt.Errorf("exec process: %w", err)
 	}
-	_, err = p.client.CoreV1().Pods(p.namespace).Patch(ctx, podName, types.MergePatchType, data, metav1.PatchOptions{})
+
+	p.mu.Lock()
+	p.processContainers[req.ExecID] = containerID
+	p.mu.Unlock()
+
+	return &platform.Process{
+		ExecID:    req.ExecID,
+		StartedAt: time.Now().UTC(),
+		Alive:     true,
+	}, nil
+}
+
+// WriteToProcess writes data to a process stdin.
+func (p *Platform) WriteToProcess(ctx context.Context, sessionID, execID string, data []byte) error {
+	containerID, err := p.getProcessContainer(execID)
 	if err != nil {
-		return fmt.Errorf("patch last activity: %w", err)
+		return err
+	}
+
+	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+
+	_, err = p.client.WriteStdin(ctx, &pb.WriteStdinRequest{
+		VmId: sandboxID,
+		Request: &agentgrpc.WriteStreamRequest{
+			ContainerId: containerID,
+			ExecId:      execID,
+			Data:        data,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("write stdin: %w", err)
+	}
+
+	p.updateActivity(ctx, sessionID)
+	return nil
+}
+
+// ReadFromProcess reads output from a process.
+func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string) (*platform.ProcessOutput, error) {
+	containerID, err := p.getProcessContainer(execID)
+	if err != nil {
+		return nil, err
+	}
+
+	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
+	defer cancel()
+
+	var stdout, stderr []byte
+
+	stdoutResp, err := p.client.ReadStdout(readCtx, &pb.ReadStdoutRequest{
+		VmId: sandboxID,
+		Request: &agentgrpc.ReadStreamRequest{
+			ContainerId: containerID,
+			ExecId:      execID,
+			Len:         4096,
+		},
+	})
+	if err != nil && !isTimeout(err) {
+		return nil, fmt.Errorf("read stdout: %w", err)
+	}
+	if stdoutResp != nil {
+		stdout = stdoutResp.GetData()
+	}
+
+	stderrResp, err := p.client.ReadStderr(readCtx, &pb.ReadStderrRequest{
+		VmId: sandboxID,
+		Request: &agentgrpc.ReadStreamRequest{
+			ContainerId: containerID,
+			ExecId:      execID,
+			Len:         4096,
+		},
+	})
+	if err != nil && !isTimeout(err) {
+		return nil, fmt.Errorf("read stderr: %w", err)
+	}
+	if stderrResp != nil {
+		stderr = stderrResp.GetData()
+	}
+
+	return &platform.ProcessOutput{
+		Stdout: stdout,
+		Stderr: stderr,
+	}, nil
+}
+
+// KillProcess kills a process.
+func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) error {
+	containerID, err := p.getProcessContainer(execID)
+	if err != nil {
+		return err
+	}
+
+	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+
+	// Send SIGKILL
+	_, err = p.client.SignalProcess(ctx, &pb.SignalProcessRequest{
+		VmId: sandboxID,
+		Request: &agentgrpc.SignalProcessRequest{
+			ContainerId: containerID,
+			ExecId:      execID,
+			Signal:      9,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("signal process: %w", err)
+	}
+
+	// Wait for exit
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, _ = p.client.WaitProcess(waitCtx, &pb.WaitProcessRequest{
+		VmId: sandboxID,
+		Request: &agentgrpc.WaitProcessRequest{
+			ContainerId: containerID,
+			ExecId:      execID,
+		},
+	})
+
+	p.mu.Lock()
+	delete(p.processContainers, execID)
+	p.mu.Unlock()
+
+	return nil
+}
+
+// IsProcessAlive checks if a process is still running.
+func (p *Platform) IsProcessAlive(ctx context.Context, sessionID, execID string) (bool, error) {
+	containerID, err := p.getProcessContainer(execID)
+	if err != nil {
+		return false, err
+	}
+
+	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
+	if err != nil {
+		return false, err
+	}
+
+	// Send signal 0 to check if alive
+	_, err = p.client.SignalProcess(ctx, &pb.SignalProcessRequest{
+		VmId: sandboxID,
+		Request: &agentgrpc.SignalProcessRequest{
+			ContainerId: containerID,
+			ExecId:      execID,
+			Signal:      0,
+		},
+	})
+	if err != nil {
+		return false, nil // Process is dead
+	}
+	return true, nil
+}
+
+// ResizeProcess resizes a process TTY.
+func (p *Platform) ResizeProcess(ctx context.Context, sessionID, execID string, rows, columns uint32) error {
+	containerID, err := p.getProcessContainer(execID)
+	if err != nil {
+		return err
+	}
+
+	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+
+	_, err = p.client.TtyWinResize(ctx, &pb.TtyWinResizeRequest{
+		VmId: sandboxID,
+		Request: &agentgrpc.TtyWinResizeRequest{
+			ContainerId: containerID,
+			ExecId:      execID,
+			Row:         rows,
+			Column:      columns,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("tty resize: %w", err)
 	}
 	return nil
 }
 
-func newClient() (*kubernetes.Clientset, error) {
-	config, err := buildConfig()
-	if err != nil {
-		return nil, err
+// waitForSandboxReady waits for a sandbox to be ready using exponential backoff with jitter.
+func (p *Platform) waitForSandboxReady(ctx context.Context, sessionID, containerName string) (*platform.Sandbox, error) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, sandboxReadyTimeout)
+	defer cancel()
+
+	delay := sandboxPollInitDelay
+
+	for {
+		sandbox, err := p.GetSandbox(ctx, sessionID)
+		if err != nil && !errors.Is(err, platform.ErrNotFound) {
+			return nil, err
+		}
+
+		if sandbox != nil && sandbox.Status == platform.StatusRunning && sandbox.SandboxID != "" {
+			if cid := getContainerID(sandbox, containerName); cid != "" {
+				slog.Debug("sandbox ready", "session_id", sessionID, "elapsed", time.Since(start))
+				return sandbox, nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, platform.ErrNotReady
+		case <-time.After(addJitter(delay)):
+		}
+
+		delay = time.Duration(float64(delay) * backoffMultiplier)
+		if delay > sandboxPollMaxDelay {
+			delay = sandboxPollMaxDelay
+		}
 	}
-	return kubernetes.NewForConfig(config)
 }
 
-func buildConfig() (*rest.Config, error) {
-	if kubeconfig := strings.TrimSpace(os.Getenv("KUBECONFIG")); kubeconfig != "" {
-		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+func addJitter(d time.Duration) time.Duration {
+	jitter := time.Duration(float64(d) * jitterFraction * (rand.Float64()*2 - 1))
+	return d + jitter
+}
+
+func (p *Platform) updateActivity(ctx context.Context, sessionID string) {
+	_, err := p.client.UpdateSandboxActivity(ctx, &pb.UpdateSandboxActivityRequest{
+		SessionId: sessionID,
+	})
+	if err != nil {
+		slog.Warn("update activity failed", "session_id", sessionID, "error", err)
+	}
+}
+
+func (p *Platform) getProcessContainer(execID string) (string, error) {
+	p.mu.RLock()
+	containerID, ok := p.processContainers[execID]
+	p.mu.RUnlock()
+	if !ok || strings.TrimSpace(containerID) == "" {
+		return "", platform.ErrNotFound
+	}
+	return containerID, nil
+}
+
+// Helper functions
+
+func protoToSandbox(info *pb.SandboxInfo) *platform.Sandbox {
+	if info == nil {
+		return nil
 	}
 
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, fmt.Errorf("in-cluster config not available: %w", err)
+	// Get the first container ID as the default
+	var containerID string
+	if len(info.GetContainers()) > 0 {
+		containerID = info.GetContainers()[0].GetContainerId()
 	}
-	return config, nil
+
+	return &platform.Sandbox{
+		SessionID:   info.GetSessionId(),
+		SandboxID:   info.GetSandboxId(),
+		ContainerID: containerID,
+		Status:      platform.SandboxStatus(info.GetStatus()),
+		Host:        info.GetNode(),
+		CreatedAt:   time.Unix(info.GetCreatedAtUnix(), 0),
+		LastUsedAt:  time.Unix(info.GetLastUsedAtUnix(), 0),
+		Labels:      info.GetLabels(),
+	}
+}
+
+func getContainerID(sandbox *platform.Sandbox, name string) string {
+	if sandbox == nil {
+		return ""
+	}
+	return sandbox.ContainerID
+}
+
+func mapToEnv(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(m))
+	for k, v := range m {
+		result = append(result, fmt.Sprintf("%s=%s", k, v))
+	}
+	return result
+}
+
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) == codes.DeadlineExceeded {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return false
 }

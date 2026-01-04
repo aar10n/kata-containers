@@ -1,16 +1,23 @@
+# sandbox-service configuration
+#
+# Configuration can be overridden via:
+# - Command-line flags (highest priority)
+# - Environment variables with SANDBOX_SERVICE_ prefix (e.g., SANDBOX_SERVICE_PLATFORM)
+# - This config file
+# - Defaults (lowest priority)
+
 http:
   addr: ":8080"
 
+# Platform: "kata" or "docker"
 platform: kata
 
 kata:
-  namespace: kata-sandboxes
-  runtime_class: kata-qemu
-  node_selector:
-    katacontainers.io/kata-runtime: "true"
-  default_image: "python:3.11-slim"
-  default_command: ["sleep", "infinity"]
+  # Address of the sandbox-agent service (required for kata platform)
   sandbox_agent_addr: "http://kata-deploy-sandbox-agent.kata-system:8080"
+  # Container names for multi-container sandbox support
+  main_container: "sandbox"
+  shell_container: "shell"
 
 docker:
   default_image: "python:3.11-slim"

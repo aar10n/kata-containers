@@ -1,6 +1,7 @@
 REGISTRY ?= gcr.io/cohere-artifacts
 TAG ?= latest
 PUSH ?= false
+DOCKER_BUILDKIT ?= 1
 REMOTE ?= aaron@192.168.1.105:build/
 REPO_ROOT := $(shell cd ../.. && pwd)
 REMOTE_HOST := $(shell printf '%s' "$(REMOTE)" | sed -E 's/:.*$$//')
@@ -17,7 +18,7 @@ test:
 	go test -v ./...
 
 docker-build:
-	docker build --platform linux/amd64 \
+	DOCKER_BUILDKIT=$(DOCKER_BUILDKIT) docker build --platform linux/amd64 \
 		-t $(REGISTRY)/sandbox-service:$(TAG) \
 		-f ../../tools/packaging/sandbox-service/Dockerfile \
 		../../

@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	cdshim "github.com/containerd/containerd/runtime/v2/shim"
@@ -32,10 +34,32 @@ type Config struct {
 	MaxOutputSize int
 }
 
+// cachedURL holds a cached agent URL with expiry.
+type cachedURL struct {
+	url       string
+	expiresAt time.Time
+}
+
+// cachedClient holds a cached agent client with last-used time.
+type cachedClient struct {
+	client     *kataclient.AgentClient
+	lastUsedAt atomic.Int64
+}
+
+const (
+	agentURLCacheTTL    = 60 * time.Second
+	clientIdleTimeout   = 30 * time.Second
+	clientCleanInterval = 10 * time.Second
+)
+
 type Client struct {
-	timeout       time.Duration
-	readChunkSize int
-	maxOutputSize int
+	timeout         time.Duration
+	readChunkSize   int
+	maxOutputSize   int
+	urlCache        sync.Map // sandboxID -> *cachedURL
+	clientCache     sync.Map // sandboxID -> *cachedClient
+	socketPathCache sync.Map // sandboxID -> string
+	cleanerOnce     sync.Once
 }
 
 type ExecResult struct {
@@ -78,19 +102,13 @@ func (c *Client) Exec(ctx context.Context, sandboxID, containerID string, args, 
 		timeout = c.timeout
 	}
 
-	agentURL, err := c.agentURL(sandboxID, timeout)
+	client, err := c.getOrCreateClient(ctx, sandboxID, timeout)
 	if err != nil {
 		return ExecResult{}, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
-	client, err := kataclient.NewAgentClient(ctx, agentURL, uint32(timeout.Seconds()))
-	if err != nil {
-		return ExecResult{}, fmt.Errorf("connect agent: %w", err)
-	}
-	defer client.Close()
 
 	execID := uuid.NewString()
 	req := &agentgrpc.ExecProcessRequest{
@@ -105,6 +123,7 @@ func (c *Client) Exec(ctx context.Context, sandboxID, containerID string, args, 
 	}
 
 	if _, err := client.AgentServiceClient.ExecProcess(ctx, req); err != nil {
+		c.invalidateClient(sandboxID)
 		return ExecResult{}, fmt.Errorf("exec process: %w", err)
 	}
 
@@ -119,23 +138,41 @@ func (c *Client) Exec(ctx context.Context, sandboxID, containerID string, args, 
 		out, err := c.readStream(ctx, func(readCtx context.Context, req *agentgrpc.ReadStreamRequest) (*agentgrpc.ReadStreamResponse, error) {
 			return client.AgentServiceClient.ReadStdout(readCtx, req)
 		}, containerID, execID)
-		stdoutCh <- readResult{data: out, err: err}
+		select {
+		case stdoutCh <- readResult{data: out, err: err}:
+		case <-ctx.Done():
+		}
 	}()
 
 	go func() {
 		out, err := c.readStream(ctx, func(readCtx context.Context, req *agentgrpc.ReadStreamRequest) (*agentgrpc.ReadStreamResponse, error) {
 			return client.AgentServiceClient.ReadStderr(readCtx, req)
 		}, containerID, execID)
-		stderrCh <- readResult{data: out, err: err}
+		select {
+		case stderrCh <- readResult{data: out, err: err}:
+		case <-ctx.Done():
+		}
 	}()
 
-	stdoutRes := <-stdoutCh
-	if stdoutRes.err != nil {
-		return ExecResult{}, fmt.Errorf("read stdout: %w", stdoutRes.err)
+	var stdoutRes, stderrRes readResult
+	for i := 0; i < 2; i++ {
+		select {
+		case res := <-stdoutCh:
+			stdoutRes = res
+		case res := <-stderrCh:
+			stderrRes = res
+		case <-ctx.Done():
+			c.invalidateClient(sandboxID)
+			return ExecResult{}, fmt.Errorf("exec timed out: %w", ctx.Err())
+		}
 	}
 
-	stderrRes := <-stderrCh
+	if stdoutRes.err != nil {
+		c.invalidateClient(sandboxID)
+		return ExecResult{}, fmt.Errorf("read stdout: %w", stdoutRes.err)
+	}
 	if stderrRes.err != nil {
+		c.invalidateClient(sandboxID)
 		return ExecResult{}, fmt.Errorf("read stderr: %w", stderrRes.err)
 	}
 
@@ -144,6 +181,7 @@ func (c *Client) Exec(ctx context.Context, sandboxID, containerID string, args, 
 		ExecId:      execID,
 	})
 	if err != nil {
+		c.invalidateClient(sandboxID)
 		return ExecResult{}, fmt.Errorf("wait process: %w", err)
 	}
 
@@ -352,7 +390,15 @@ func (c *Client) ResizeVolume(ctx context.Context, sandboxID string, req *agentg
 }
 
 func (c *Client) agentURL(sandboxID string, timeout time.Duration) (string, error) {
-	resp, err := shimDoGet(sandboxID, timeout, agentURLPath)
+	if cached, ok := c.urlCache.Load(sandboxID); ok {
+		entry := cached.(*cachedURL)
+		if time.Now().Before(entry.expiresAt) {
+			return entry.url, nil
+		}
+		c.urlCache.Delete(sandboxID)
+	}
+
+	resp, err := c.shimDoGet(sandboxID, timeout, agentURLPath)
 	if err != nil {
 		return "", fmt.Errorf("fetch agent url: %w", err)
 	}
@@ -362,11 +408,21 @@ func (c *Client) agentURL(sandboxID string, timeout time.Duration) (string, erro
 		return "", errors.New("agent url is empty")
 	}
 
+	c.urlCache.Store(sandboxID, &cachedURL{
+		url:       url,
+		expiresAt: time.Now().Add(agentURLCacheTTL),
+	})
+
 	return url, nil
 }
 
-func shimDoGet(sandboxID string, timeout time.Duration, urlPath string) ([]byte, error) {
-	client, err := buildShimClient(sandboxID, timeout)
+// InvalidateURLCache removes a sandbox's cached URL.
+func (c *Client) InvalidateURLCache(sandboxID string) {
+	c.urlCache.Delete(sandboxID)
+}
+
+func (c *Client) shimDoGet(sandboxID string, timeout time.Duration, urlPath string) ([]byte, error) {
+	client, err := c.buildShimClient(sandboxID, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -380,8 +436,8 @@ func shimDoGet(sandboxID string, timeout time.Duration, urlPath string) ([]byte,
 	return io.ReadAll(resp.Body)
 }
 
-func buildShimClient(sandboxID string, timeout time.Duration) (*http.Client, error) {
-	socketAddress, err := shimClientSocketAddress(sandboxID)
+func (c *Client) buildShimClient(sandboxID string, timeout time.Duration) (*http.Client, error) {
+	socketAddress, err := c.shimClientSocketAddress(sandboxID)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +457,11 @@ func buildShimClient(sandboxID string, timeout time.Duration) (*http.Client, err
 	return client, nil
 }
 
-func shimClientSocketAddress(sandboxID string) (string, error) {
+func (c *Client) shimClientSocketAddress(sandboxID string) (string, error) {
+	if cached, ok := c.socketPathCache.Load(sandboxID); ok {
+		return cached.(string), nil
+	}
+
 	socketPath := shimSocketPath(legacyShimStoragePath, sandboxID)
 	if _, err := os.Stat(socketPath); err != nil {
 		fallbackPath, fallbackErr := shimSocketPathWithPrefix(legacyShimStoragePath, sandboxID)
@@ -421,7 +481,9 @@ func shimClientSocketAddress(sandboxID string) (string, error) {
 		}
 	}
 
-	return fmt.Sprintf("unix://%s", socketPath), nil
+	addr := fmt.Sprintf("unix://%s", socketPath)
+	c.socketPathCache.Store(sandboxID, addr)
+	return addr, nil
 }
 
 func shimSocketPath(storagePath, sandboxID string) string {
@@ -468,7 +530,7 @@ func (c *Client) readStream(ctx context.Context, reader readFn, containerID, exe
 			Len:         uint32(chunk),
 		})
 		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "eof") {
+			if errors.Is(err, io.EOF) || isEOFError(err) {
 				break
 			}
 			return builder.String(), err
@@ -483,6 +545,14 @@ func (c *Client) readStream(ctx context.Context, reader readFn, containerID, exe
 	return builder.String(), nil
 }
 
+func isEOFError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "eof") || strings.Contains(errStr, "end of file")
+}
+
 func (c *Client) withClient(ctx context.Context, sandboxID string, timeout time.Duration, fn func(context.Context, *kataclient.AgentClient) error) error {
 	if sandboxID == "" {
 		return errors.New("sandbox id is required")
@@ -491,7 +561,7 @@ func (c *Client) withClient(ctx context.Context, sandboxID string, timeout time.
 		timeout = c.timeout
 	}
 
-	agentURL, err := c.agentURL(sandboxID, timeout)
+	client, err := c.getOrCreateClient(ctx, sandboxID, timeout)
 	if err != nil {
 		return err
 	}
@@ -499,13 +569,75 @@ func (c *Client) withClient(ctx context.Context, sandboxID string, timeout time.
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	err = fn(ctx, client)
+	if err != nil {
+		// On error, invalidate the cached client
+		c.invalidateClient(sandboxID)
+	}
+	return err
+}
+
+// getOrCreateClient gets a cached client or creates a new one.
+func (c *Client) getOrCreateClient(ctx context.Context, sandboxID string, timeout time.Duration) (*kataclient.AgentClient, error) {
+	c.cleanerOnce.Do(func() {
+		go c.cleanupIdleClients()
+	})
+
+	if cached, ok := c.clientCache.Load(sandboxID); ok {
+		entry := cached.(*cachedClient)
+		entry.lastUsedAt.Store(time.Now().UnixNano())
+		return entry.client, nil
+	}
+
+	agentURL, err := c.agentURL(sandboxID, timeout)
+	if err != nil {
+		return nil, err
+	}
+
 	client, err := kataclient.NewAgentClient(ctx, agentURL, uint32(timeout.Seconds()))
 	if err != nil {
-		return fmt.Errorf("connect agent: %w", err)
+		return nil, fmt.Errorf("connect agent: %w", err)
 	}
-	defer client.Close()
 
-	return fn(ctx, client)
+	entry := &cachedClient{client: client}
+	entry.lastUsedAt.Store(time.Now().UnixNano())
+	c.clientCache.Store(sandboxID, entry)
+
+	return client, nil
+}
+
+// invalidateClient removes and closes a cached client.
+func (c *Client) invalidateClient(sandboxID string) {
+	c.socketPathCache.Delete(sandboxID)
+	c.urlCache.Delete(sandboxID)
+	if cached, ok := c.clientCache.LoadAndDelete(sandboxID); ok {
+		if entry, ok := cached.(*cachedClient); ok {
+			entry.client.Close()
+		}
+	}
+}
+
+// cleanupIdleClients periodically removes idle client connections.
+func (c *Client) cleanupIdleClients() {
+	ticker := time.NewTicker(clientCleanInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now().UnixNano()
+		idleThreshold := int64(clientIdleTimeout)
+		c.clientCache.Range(func(key, value any) bool {
+			entry, ok := value.(*cachedClient)
+			if !ok {
+				return true
+			}
+			if now-entry.lastUsedAt.Load() > idleThreshold {
+				if c.clientCache.CompareAndDelete(key, value) {
+					entry.client.Close()
+				}
+			}
+			return true
+		})
+	}
 }
 
 func withClientResp[T any](ctx context.Context, c *Client, sandboxID string, timeout time.Duration, fn func(context.Context, *kataclient.AgentClient) (T, error)) (T, error) {
@@ -517,7 +649,7 @@ func withClientResp[T any](ctx context.Context, c *Client, sandboxID string, tim
 		timeout = c.timeout
 	}
 
-	agentURL, err := c.agentURL(sandboxID, timeout)
+	client, err := c.getOrCreateClient(ctx, sandboxID, timeout)
 	if err != nil {
 		return zero, err
 	}
@@ -525,11 +657,10 @@ func withClientResp[T any](ctx context.Context, c *Client, sandboxID string, tim
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	client, err := kataclient.NewAgentClient(ctx, agentURL, uint32(timeout.Seconds()))
+	result, err := fn(ctx, client)
 	if err != nil {
-		return zero, fmt.Errorf("connect agent: %w", err)
+		// On error, invalidate the cached client
+		c.invalidateClient(sandboxID)
 	}
-	defer client.Close()
-
-	return fn(ctx, client)
+	return result, err
 }

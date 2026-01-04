@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	cdshim "github.com/containerd/containerd/runtime/v2/shim"
@@ -31,7 +32,8 @@ type Config struct {
 }
 
 type Client struct {
-	dialTimeout time.Duration
+	dialTimeout     time.Duration
+	socketPathCache sync.Map
 }
 
 func New(cfg Config) *Client {
@@ -92,7 +94,7 @@ func (c *Client) postVMState(ctx context.Context, sandboxID, endpoint, statePath
 }
 
 func (c *Client) buildShimClient(ctx context.Context, sandboxID string) (*http.Client, error) {
-	socketAddress, err := shimClientSocketAddress(sandboxID)
+	socketAddress, err := c.shimClientSocketAddress(sandboxID)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +117,11 @@ func (c *Client) buildShimClient(ctx context.Context, sandboxID string) (*http.C
 	return &http.Client{Transport: transport}, nil
 }
 
-func shimClientSocketAddress(sandboxID string) (string, error) {
+func (c *Client) shimClientSocketAddress(sandboxID string) (string, error) {
+	if cached, ok := c.socketPathCache.Load(sandboxID); ok {
+		return cached.(string), nil
+	}
+
 	socketPath := shimSocketPath(legacyShimStoragePath, sandboxID)
 	if _, err := os.Stat(socketPath); err != nil {
 		fallbackPath, fallbackErr := shimSocketPathWithPrefix(legacyShimStoragePath, sandboxID)
@@ -135,7 +141,9 @@ func shimClientSocketAddress(sandboxID string) (string, error) {
 		}
 	}
 
-	return fmt.Sprintf("unix://%s", socketPath), nil
+	addr := fmt.Sprintf("unix://%s", socketPath)
+	c.socketPathCache.Store(sandboxID, addr)
+	return addr, nil
 }
 
 func shimSocketPath(storagePath, sandboxID string) string {

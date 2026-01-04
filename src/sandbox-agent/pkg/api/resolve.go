@@ -6,13 +6,28 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	apierrors "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/errors"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/service"
 )
+
+var forwardHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	},
+}
 
 type ResolveRequest struct {
 	ContainerID string `json:"container_id"`
@@ -54,11 +69,12 @@ func ResolveHandler(cfg Config, svc service.Service) http.HandlerFunc {
 		sandboxID, err := svc.ResolveSandboxID(r.Context(), req.ContainerID)
 		if err != nil {
 			status := http.StatusInternalServerError
-			if errors.Is(err, context.DeadlineExceeded) {
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
 				status = http.StatusGatewayTimeout
-			} else if strings.Contains(err.Error(), "not found") {
+			case errors.Is(err, apierrors.ErrNotFound):
 				status = http.StatusNotFound
-			} else if strings.Contains(err.Error(), "required") {
+			case errors.Is(err, apierrors.ErrInvalidArgument):
 				status = http.StatusBadRequest
 			}
 			writeResolveError(w, status, err.Error())
@@ -84,8 +100,7 @@ func forwardResolve(w http.ResponseWriter, ctx context.Context, cfg Config, svc 
 	}
 	request.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(request)
+	resp, err := forwardHTTPClient.Do(request)
 	if err != nil {
 		writeResolveError(w, http.StatusBadGateway, "forward request failed")
 		return

@@ -14,12 +14,30 @@ service SandboxAgent {
   rpc Health(google.protobuf.Empty) returns (HealthResponse) {
     option (google.api.http) = { get: "/healthz" };
   }
-  rpc ListVMs(ListVMsRequest) returns (ListVMsResponse) {
-    option (google.api.http) = { get: "/v1/list" };
+
+  // Sandbox lifecycle management
+  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxInfo) {
+    option (google.api.http) = { post: "/v1/sandboxes" body: "*" };
   }
+  rpc GetSandbox(GetSandboxRequest) returns (SandboxInfo) {
+    option (google.api.http) = { get: "/v1/sandboxes/{session_id}" };
+  }
+  rpc DeleteSandbox(DeleteSandboxRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { delete: "/v1/sandboxes/{session_id}" };
+  }
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse) {
+    option (google.api.http) = { get: "/v1/sandboxes" };
+  }
+  rpc UpdateSandboxActivity(UpdateSandboxActivityRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { post: "/v1/sandboxes/{session_id}/activity" };
+  }
+
+  // Command execution
   rpc Exec(ExecRequest) returns (ExecResponse) {
     option (google.api.http) = { post: "/v1/exec" body: "*" };
   }
+
+  // VM state management
   rpc SaveVMState(SaveVMStateRequest) returns (google.protobuf.Empty) {
     option (google.api.http) = { post: "/v1/vm/save-state" body: "*" };
   }
@@ -128,17 +146,49 @@ message HealthResponse {
   string status = 1;
 }
 
-message ListVMsRequest {
-  string node = 1;
+// Sandbox lifecycle messages
+message CreateSandboxRequest {
+  string session_id = 1;
+  string image = 2;
+  repeated string command = 3;
+  map<string, string> env = 4;
+  map<string, string> labels = 5;
 }
 
-message ListVMsResponse {
-  repeated VMInfo vms = 1;
+message GetSandboxRequest {
+  string session_id = 1;
 }
 
-message VMInfo {
-  string vm_id = 1;
-  string node = 2;
+message DeleteSandboxRequest {
+  string session_id = 1;
+}
+
+message ListSandboxesRequest {
+  string node = 1;  // optional filter by node
+}
+
+message ListSandboxesResponse {
+  repeated SandboxInfo sandboxes = 1;
+}
+
+message UpdateSandboxActivityRequest {
+  string session_id = 1;
+}
+
+message SandboxInfo {
+  string session_id = 1;
+  string sandbox_id = 2;
+  repeated ContainerInfo containers = 3;
+  string status = 4;  // pending, running, failed, terminated
+  string node = 5;
+  int64 created_at_unix = 6;
+  int64 last_used_at_unix = 7;
+  map<string, string> labels = 8;
+}
+
+message ContainerInfo {
+  string name = 1;
+  string container_id = 2;
 }
 
 message SaveVMStateRequest {

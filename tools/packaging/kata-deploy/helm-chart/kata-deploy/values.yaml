@@ -280,6 +280,13 @@ sandboxAgent:
     reference: gcr.io/cohere-artifacts/sandbox-agent
     tag: ""
 
+  # Sandbox pod configuration (managed by sandbox-agent)
+  sandboxNamespace: kata-sandboxes
+  runtimeClass: kata-qemu
+  defaultImage: "python:3.11-slim"
+  sandboxNodeSelector:
+    katacontainers.io/kata-runtime: "true"
+
 sandboxService:
   enabled: true
   replicas: 1
@@ -288,14 +295,7 @@ sandboxService:
     reference: gcr.io/cohere-artifacts/sandbox-service
     tag: ""
 
-  sandboxNamespace: kata-sandboxes
-
-  runtimeClass: kata-qemu
-
-  sandboxNodeSelector:
-    katacontainers.io/kata-runtime: "true"
-
-  defaultImage: "python:3.11-slim"
+  # Session/sandbox lifecycle settings
   defaultTTL: "10m"
   cleanupInterval: "30s"
 

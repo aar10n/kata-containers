@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/api/pb"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/service"
 	agenttypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	agentgrpc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
@@ -50,22 +52,114 @@ func (s *Server) Health(ctx context.Context, _ *emptypb.Empty) (*pb.HealthRespon
 	return &pb.HealthResponse{Status: "ok"}, nil
 }
 
-func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListVMsResponse, error) {
-	node := ""
-	if req != nil {
-		node = strings.TrimSpace(req.Node)
+func (s *Server) CreateSandbox(ctx context.Context, req *pb.CreateSandboxRequest) (*pb.SandboxInfo, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
 
-	vms := s.svc.ListVMs(node)
-	resp := &pb.ListVMsResponse{Vms: make([]*pb.VMInfo, 0, len(vms))}
-	for _, vm := range vms {
-		resp.Vms = append(resp.Vms, &pb.VMInfo{
-			VmId: vm.VMID,
-			Node: vm.NodeName,
-		})
+	info, err := s.svc.CreateSandbox(ctx, service.CreateSandboxRequest{
+		SessionID: req.GetSessionId(),
+		Image:     req.GetImage(),
+		Command:   req.GetCommand(),
+		Env:       req.GetEnv(),
+		Labels:    req.GetLabels(),
+	})
+	if err != nil {
+		if errors.Is(err, k8s.ErrSandboxAlreadyExists) {
+			return nil, status.Error(codes.AlreadyExists, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, "create sandbox: %v", err)
+	}
+
+	return sandboxInfoToProto(info), nil
+}
+
+func (s *Server) GetSandbox(ctx context.Context, req *pb.GetSandboxRequest) (*pb.SandboxInfo, error) {
+	if req == nil || strings.TrimSpace(req.GetSessionId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	info, err := s.svc.GetSandbox(ctx, req.GetSessionId())
+	if err != nil {
+		if errors.Is(err, k8s.ErrSandboxNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, "get sandbox: %v", err)
+	}
+
+	return sandboxInfoToProto(info), nil
+}
+
+func (s *Server) DeleteSandbox(ctx context.Context, req *pb.DeleteSandboxRequest) (*emptypb.Empty, error) {
+	if req == nil || strings.TrimSpace(req.GetSessionId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	if err := s.svc.DeleteSandbox(ctx, req.GetSessionId()); err != nil {
+		if errors.Is(err, k8s.ErrSandboxNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, "delete sandbox: %v", err)
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+func (s *Server) ListSandboxes(ctx context.Context, req *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
+	node := ""
+	if req != nil {
+		node = strings.TrimSpace(req.GetNode())
+	}
+
+	sandboxes := s.svc.ListSandboxes(ctx, node)
+	resp := &pb.ListSandboxesResponse{
+		Sandboxes: make([]*pb.SandboxInfo, 0, len(sandboxes)),
+	}
+	for _, sb := range sandboxes {
+		resp.Sandboxes = append(resp.Sandboxes, sandboxInfoToProto(sb))
 	}
 
 	return resp, nil
+}
+
+func (s *Server) UpdateSandboxActivity(ctx context.Context, req *pb.UpdateSandboxActivityRequest) (*emptypb.Empty, error) {
+	if req == nil || strings.TrimSpace(req.GetSessionId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	if err := s.svc.UpdateSandboxActivity(ctx, req.GetSessionId()); err != nil {
+		if errors.Is(err, k8s.ErrSandboxNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, "update activity: %v", err)
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+func sandboxInfoToProto(info *k8s.SandboxInfo) *pb.SandboxInfo {
+	if info == nil {
+		return nil
+	}
+
+	containers := make([]*pb.ContainerInfo, 0, len(info.Containers))
+	for _, c := range info.Containers {
+		containers = append(containers, &pb.ContainerInfo{
+			Name:        c.Name,
+			ContainerId: c.ContainerID,
+		})
+	}
+
+	return &pb.SandboxInfo{
+		SessionId:     info.SessionID,
+		SandboxId:     info.SandboxID,
+		Containers:    containers,
+		Status:        string(info.Status),
+		Node:          info.Node,
+		CreatedAtUnix: info.CreatedAt.Unix(),
+		LastUsedAtUnix: info.LastUsedAt.Unix(),
+		Labels:        info.Labels,
+	}
 }
 
 func (s *Server) Exec(ctx context.Context, req *pb.ExecRequest) (*pb.ExecResponse, error) {

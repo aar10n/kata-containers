@@ -2,12 +2,13 @@ package service
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/agent"
+	apierrors "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/errors"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/shim_mgmt"
 	agenttypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
@@ -20,11 +21,18 @@ type Config struct {
 }
 
 type Service interface {
+	// Sandbox lifecycle
+	CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*k8s.SandboxInfo, error)
+	GetSandbox(ctx context.Context, sessionID string) (*k8s.SandboxInfo, error)
+	DeleteSandbox(ctx context.Context, sessionID string) error
+	ListSandboxes(ctx context.Context, nodeName string) []*k8s.SandboxInfo
+	UpdateSandboxActivity(ctx context.Context, sessionID string) error
+
+	// VM operations
 	NodeForVM(vmID string) (string, bool)
 	SandboxAgentAddressForNode(nodeName string) (string, bool)
 	ResolveSandboxID(ctx context.Context, containerID string) (string, error)
 	Exec(ctx context.Context, req ExecRequest) (ExecResponse, error)
-	ListVMs(nodeName string) []VMInfo
 	SaveVMState(ctx context.Context, vmID, statePath string) error
 	RestoreVMState(ctx context.Context, vmID, statePath string) error
 	CreateContainer(ctx context.Context, vmID string, req *agentgrpc.CreateContainerRequest) error
@@ -59,25 +67,31 @@ type Service interface {
 	ResizeVolume(ctx context.Context, vmID string, req *agentgrpc.ResizeVolumeRequest) error
 }
 
-type VMInfo struct {
-	VMID     string
-	NodeName string
+// CreateSandboxRequest holds parameters for creating a sandbox.
+type CreateSandboxRequest struct {
+	SessionID string
+	Image     string
+	Command   []string
+	Env       map[string]string
+	Labels    map[string]string
 }
 
 type service struct {
 	config      Config
 	store       *k8s.Store
+	manager     *k8s.Manager
 	agentClient *agent.Client
 	shimClient  *shim_mgmt.Client
 }
 
-func New(cfg Config, store *k8s.Store, agentClient *agent.Client, shimClient *shim_mgmt.Client) Service {
+func New(cfg Config, store *k8s.Store, manager *k8s.Manager, agentClient *agent.Client, shimClient *shim_mgmt.Client) Service {
 	if shimClient == nil {
 		shimClient = shim_mgmt.New(shim_mgmt.Config{})
 	}
 	return &service{
 		config:      cfg,
 		store:       store,
+		manager:     manager,
 		agentClient: agentClient,
 		shimClient:  shimClient,
 	}
@@ -108,18 +122,18 @@ func (s *service) SandboxAgentAddressForNode(nodeName string) (string, bool) {
 
 func (s *service) ResolveSandboxID(ctx context.Context, containerID string) (string, error) {
 	if strings.TrimSpace(containerID) == "" {
-		return "", errors.New("container id is required")
+		return "", fmt.Errorf("%w: container id is required", apierrors.ErrInvalidArgument)
 	}
 	sandboxID := k8s.ResolveSandboxIDFromContainerID(containerID)
 	if sandboxID == "" {
-		return "", errors.New("sandbox id not found")
+		return "", fmt.Errorf("%w: sandbox id not found", apierrors.ErrNotFound)
 	}
 	return sandboxID, nil
 }
 
 func (s *service) Exec(ctx context.Context, req ExecRequest) (ExecResponse, error) {
 	if req.VMID == "" {
-		return ExecResponse{}, errors.New("vm id is required")
+		return ExecResponse{}, fmt.Errorf("%w: vm id is required", apierrors.ErrInvalidArgument)
 	}
 
 	result, err := s.agentClient.Exec(ctx, req.VMID, req.ContainerID, req.Args, req.Env, req.Cwd, s.execTimeout(req.Timeout))
@@ -134,27 +148,42 @@ func (s *service) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 	}, nil
 }
 
-func (s *service) ListVMs(nodeName string) []VMInfo {
-	entries := s.store.ListVMs(nodeName)
-	if len(entries) == 0 {
-		return nil
-	}
-
-	vms := make([]VMInfo, 0, len(entries))
-	for vmID, node := range entries {
-		vms = append(vms, VMInfo{
-			VMID:     vmID,
-			NodeName: node,
-		})
-	}
-	sort.Slice(vms, func(i, j int) bool {
-		if vms[i].NodeName == vms[j].NodeName {
-			return vms[i].VMID < vms[j].VMID
-		}
-		return vms[i].NodeName < vms[j].NodeName
+func (s *service) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*k8s.SandboxInfo, error) {
+	return s.manager.CreateSandbox(ctx, k8s.CreateSandboxRequest{
+		SessionID: req.SessionID,
+		Image:     req.Image,
+		Command:   req.Command,
+		Env:       req.Env,
+		Labels:    req.Labels,
 	})
+}
 
-	return vms
+func (s *service) GetSandbox(ctx context.Context, sessionID string) (*k8s.SandboxInfo, error) {
+	info, ok := s.store.GetSandbox(sessionID)
+	if !ok {
+		return nil, k8s.ErrSandboxNotFound
+	}
+	return info, nil
+}
+
+func (s *service) DeleteSandbox(ctx context.Context, sessionID string) error {
+	return s.manager.DeleteSandbox(ctx, sessionID)
+}
+
+func (s *service) ListSandboxes(ctx context.Context, nodeName string) []*k8s.SandboxInfo {
+	sandboxes := s.store.ListSandboxes(nodeName)
+	// Sort by node then session ID for consistent ordering
+	sort.Slice(sandboxes, func(i, j int) bool {
+		if sandboxes[i].Node == sandboxes[j].Node {
+			return sandboxes[i].SessionID < sandboxes[j].SessionID
+		}
+		return sandboxes[i].Node < sandboxes[j].Node
+	})
+	return sandboxes
+}
+
+func (s *service) UpdateSandboxActivity(ctx context.Context, sessionID string) error {
+	return s.manager.UpdateSandboxActivity(ctx, sessionID)
 }
 
 func (s *service) SaveVMState(ctx context.Context, vmID, statePath string) error {
@@ -162,7 +191,7 @@ func (s *service) SaveVMState(ctx context.Context, vmID, statePath string) error
 		return err
 	}
 	if strings.TrimSpace(statePath) == "" {
-		return errors.New("state path is required")
+		return fmt.Errorf("%w: state path is required", apierrors.ErrInvalidArgument)
 	}
 	return s.shimClient.SaveVMState(ctx, vmID, statePath)
 }
@@ -172,7 +201,7 @@ func (s *service) RestoreVMState(ctx context.Context, vmID, statePath string) er
 		return err
 	}
 	if strings.TrimSpace(statePath) == "" {
-		return errors.New("state path is required")
+		return fmt.Errorf("%w: state path is required", apierrors.ErrInvalidArgument)
 	}
 	return s.shimClient.RestoreVMState(ctx, vmID, statePath)
 }
@@ -379,7 +408,7 @@ func (s *service) callAgent(ctx context.Context, vmID string, fn func(context.Co
 
 func requireVMID(vmID string) error {
 	if vmID == "" {
-		return errors.New("vm id is required")
+		return fmt.Errorf("%w: vm id is required", apierrors.ErrInvalidArgument)
 	}
 	return nil
 }

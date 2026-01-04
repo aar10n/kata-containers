@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log"
 	"net"
 	"net/http"
@@ -14,42 +13,33 @@ import (
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/agent"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/api"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/api/pb"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/config"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/service"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/shim_mgmt"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
-	var httpAddr string
-	var grpcAddr string
-	var kubeconfig string
-	var resyncInterval time.Duration
-	var execTimeout time.Duration
-	var agentTimeout time.Duration
-	var grpcDialTimeout time.Duration
-	var maxOutputBytes int
-	var readChunkSize int
+	// Register and parse flags
+	flags := config.RegisterFlags()
+	pflag.Parse()
 
-	flag.StringVar(&httpAddr, "http-addr", ":8080", "HTTP listen address")
-	flag.StringVar(&grpcAddr, "grpc-addr", ":9090", "gRPC listen address")
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (optional, defaults to in-cluster config)")
-	flag.DurationVar(&resyncInterval, "resync-interval", 5*time.Minute, "Kubernetes informer resync interval")
-	flag.DurationVar(&execTimeout, "exec-timeout", 30*time.Second, "Command execution timeout")
-	flag.DurationVar(&agentTimeout, "agent-timeout", 10*time.Second, "Agent connection timeout")
-	flag.DurationVar(&grpcDialTimeout, "grpc-dial-timeout", 5*time.Second, "Remote sandbox-agent dial timeout")
-	flag.IntVar(&maxOutputBytes, "max-output-bytes", 1024*1024, "Maximum stdout/stderr bytes to return")
-	flag.IntVar(&readChunkSize, "read-chunk-size", 4096, "Per-read byte size from agent streams")
-	flag.Parse()
+	// Load configuration
+	cfg, err := config.Load(flags)
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
 		log.Fatal("NODE_NAME env var is required")
 	}
 
-	clientset, err := k8s.NewClient(kubeconfig)
+	clientset, err := k8s.NewClient(cfg.Kubernetes.Kubeconfig)
 	if err != nil {
 		log.Fatalf("failed to initialize k8s client: %v", err)
 	}
@@ -57,7 +47,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	watcher := k8s.NewWatcher(clientset, resyncInterval)
+	watcher := k8s.NewWatcher(clientset, cfg.Kubernetes.ResyncInterval)
 	go func() {
 		if err := watcher.Start(ctx); err != nil {
 			log.Fatalf("failed to start k8s watchers: %v", err)
@@ -69,30 +59,56 @@ func main() {
 	}
 
 	agentClient := agent.New(agent.Config{
-		Timeout:       agentTimeout,
-		ReadChunkSize: readChunkSize,
-		MaxOutputSize: maxOutputBytes,
+		Timeout:       cfg.Agent.Timeout,
+		ReadChunkSize: cfg.Agent.ReadChunkSize,
+		MaxOutputSize: cfg.Agent.MaxOutputSize,
 	})
-	shimClient := shim_mgmt.New(shim_mgmt.Config{DialTimeout: agentTimeout})
+	shimClient := shim_mgmt.New(shim_mgmt.Config{DialTimeout: cfg.Agent.Timeout})
+
+	manager := k8s.NewManager(clientset, k8s.ManagerConfig{
+		Namespace:        cfg.Sandbox.Namespace,
+		RuntimeClassName: cfg.Sandbox.RuntimeClassName,
+		DefaultImage:     cfg.Sandbox.DefaultImage,
+		DefaultCommand:   cfg.Sandbox.DefaultCommand,
+		NodeSelector:     cfg.Sandbox.NodeSelector,
+	}, watcher.Store())
+
+	watcher.Store().SetSandboxIDCallback(func(sessionID, sandboxID string) {
+		// Immediately update the store so API calls don't fail while waiting for K8s propagation
+		watcher.Store().UpdateSandboxID(sessionID, sandboxID)
+
+		const maxRetries = 3
+		var err error
+		for i := 0; i < maxRetries; i++ {
+			if err = manager.UpdateSandboxIDAnnotation(context.Background(), sessionID, sandboxID); err == nil {
+				log.Printf("persisted sandbox-id annotation for session %s: %s", sessionID, sandboxID)
+				return
+			}
+			if i < maxRetries-1 {
+				time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+			}
+		}
+		log.Printf("failed to update sandbox-id annotation for session %s after %d attempts: %v", sessionID, maxRetries, err)
+	})
 
 	svc := service.New(service.Config{
 		NodeName:    nodeName,
-		ExecTimeout: execTimeout,
-	}, watcher.Store(), agentClient, shimClient)
+		ExecTimeout: cfg.Exec.Timeout,
+	}, watcher.Store(), manager, agentClient, shimClient)
 
 	grpcServer := grpc.NewServer()
 	apiCfg := api.Config{
-		HTTPAddr:    httpAddr,
-		GRPCAddr:    grpcAddr,
+		HTTPAddr:    cfg.HTTP.Addr,
+		GRPCAddr:    cfg.GRPC.Addr,
 		NodeName:    nodeName,
-		DialTimeout: grpcDialTimeout,
+		DialTimeout: cfg.GRPC.DialTimeout,
 	}
 	apiServer := api.NewServer(apiCfg, svc)
 	apiServer.Register(grpcServer)
 
-	grpcListener, err := net.Listen("tcp", grpcAddr)
+	grpcListener, err := net.Listen("tcp", cfg.GRPC.Addr)
 	if err != nil {
-		log.Fatalf("failed to listen on gRPC addr %s: %v", grpcAddr, err)
+		log.Fatalf("failed to listen on gRPC addr %s: %v", cfg.GRPC.Addr, err)
 	}
 
 	go func() {
@@ -105,7 +121,7 @@ func main() {
 		runtime.WithIncomingHeaderMatcher(api.IncomingHeaderMatcher),
 		runtime.WithErrorHandler(api.GatewayErrorHandler),
 	)
-	grpcEndpoint := grpcEndpoint(grpcAddr)
+	grpcEndpoint := grpcEndpoint(cfg.GRPC.Addr)
 	if err := pb.RegisterSandboxAgentHandlerFromEndpoint(ctx, gatewayMux, grpcEndpoint, []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}); err != nil {
@@ -117,7 +133,7 @@ func main() {
 	rootMux.Handle("/", gatewayMux)
 
 	httpServer := &http.Server{
-		Addr:              httpAddr,
+		Addr:              cfg.HTTP.Addr,
 		Handler:           rootMux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -135,7 +151,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("sandbox-agent listening on %s (http) and %s (grpc)", httpAddr, grpcAddr)
+	log.Printf("sandbox-agent listening on %s (http) and %s (grpc)", cfg.HTTP.Addr, cfg.GRPC.Addr)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http server error: %v", err)
 	}

@@ -3,9 +3,10 @@ TAG ?= latest
 PUSH ?= false
 REMOTE ?= aaron@192.168.1.105:build/
 PROTOC ?= protoc
+DOCKER_BUILDKIT ?= 1
 
 REPO_ROOT := $(shell cd ../.. && pwd)
-DOCKER_BUILD_CMD = docker build --platform linux/amd64 -t $(REGISTRY)/sandbox-agent:$(TAG) -f ../../tools/packaging/sandbox-agent/Dockerfile ../../
+DOCKER_BUILD_CMD = DOCKER_BUILDKIT=$(DOCKER_BUILDKIT) docker build --platform linux/amd64 -t $(REGISTRY)/sandbox-agent:$(TAG) -f ../../tools/packaging/sandbox-agent/Dockerfile ../../
 REMOTE_HOST := $(shell printf '%s' "$(REMOTE)" | sed -E 's/:.*$$//')
 REMOTE_PATH := $(shell printf '%s' "$(REMOTE)" | sed -E 's/^[^:]+://')
 REMOTE_REPO := $(REMOTE_PATH)kata-containers

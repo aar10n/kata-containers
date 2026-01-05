@@ -1,0 +1,37 @@
+# sandbox-agent configuration
+#
+# Configuration can be overridden via:
+# - Command-line flags (highest priority)
+# - Environment variables with SANDBOX_AGENT_ prefix (e.g., SANDBOX_AGENT_HTTP_ADDR)
+# - This config file
+# - Defaults (lowest priority)
+
+http:
+  addr: ":8080"
+
+grpc:
+  addr: ":9090"
+  dial_timeout: 5s
+
+kubernetes:
+  # Path to kubeconfig file (leave empty for in-cluster config)
+  kubeconfig: ""
+  resync_interval: 5m
+
+agent:
+  # kata-agent client configuration
+  timeout: 10s
+  read_chunk_size: 4096
+  max_output_size: 1048576
+
+exec:
+  timeout: 30s
+
+sandbox:
+  # Kubernetes namespace for sandbox pods
+  namespace: kata-sandboxes
+  # RuntimeClass for sandbox pods (e.g., kata-qemu)
+  runtime_class: kata-qemu
+  # Node selector for sandbox pods (optional)
+  # node_selector:
+  #   katacontainers.io/kata-runtime: "true"

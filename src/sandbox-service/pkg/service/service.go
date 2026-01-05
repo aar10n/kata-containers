@@ -26,7 +26,7 @@ import (
 
 const (
 	defaultReadyTimeout = 30 * time.Second
-	readyPollInterval   = 500 * time.Millisecond
+	readyPollInterval   = 200 * time.Millisecond // Faster polling for quicker response
 	defaultProcTimeout  = 30 * time.Second
 	maxCompletedJobs    = 50
 )
@@ -36,9 +36,7 @@ bind 'set enable-bracketed-paste off'
 stty -echo
 export PS1=
 unset PROMPT_COMMAND
-trap '[[ $_LOG_COMMANDS ]] && echo "[CMD] $BASH_COMMAND" >&2' DEBUG
 printf '%s'
-export _LOG_COMMANDS=1
 `
 
 const pythonREPLWrapper = `#!/usr/bin/env python3
@@ -288,29 +286,24 @@ func (s *Service) ExecShell(ctx context.Context, sessionID, command string, time
 		timeout = defaultProcTimeout
 	}
 
-	totalStart := time.Now()
 	readyCtx, readyCancel := context.WithTimeout(ctx, s.readyTimeout)
 	defer readyCancel()
 
-	readyStart := time.Now()
 	if err := s.ensureReady(readyCtx, sessionID, ""); err != nil {
 		return nil, err
 	}
-	readyDur := time.Since(readyStart)
 
-	shellStart := time.Now()
 	proc, err := s.ensureShell(readyCtx, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	shellDur := time.Since(shellStart)
 
 	cmdCtx, cmdCancel := context.WithTimeout(ctx, timeout)
 	defer cmdCancel()
 
-	execStart := time.Now()
 	marker := fmt.Sprintf("__MARKER_%d_%s__", time.Now().UnixNano(), randomString(8))
 	cmdWithMarker := fmt.Sprintf("%s\nprintf '<<<EXIT:%%d:%s>>>\\n' $?\n", command, marker)
+
 	if err := s.platform.WriteToProcess(cmdCtx, sessionID, proc.ExecID, []byte(cmdWithMarker)); err != nil {
 		return nil, err
 	}
@@ -318,8 +311,6 @@ func (s *Service) ExecShell(ctx context.Context, sessionID, command string, time
 	output, exitCode, err := s.readUntilMarker(cmdCtx, sessionID, proc.ExecID, marker)
 	s.updateProcessLastUsed(sessionID, "shell")
 	output = normalizeShellOutput(output)
-	execDur := time.Since(execStart)
-	slog.Debug("shell exec timing", "session_id", sessionID, "ready", readyDur, "shell", shellDur, "exec", execDur, "total", time.Since(totalStart))
 	if err != nil {
 		if isTimeoutErr(err) {
 			return &ShellResult{
@@ -361,7 +352,7 @@ func (s *Service) ResetShell(ctx context.Context, sessionID string) error {
 		_, _ = s.platform.Exec(ctx, platform.ExecRequest{
 			SessionID:     sessionID,
 			ContainerName: s.shellContainer,
-			Command:       []string{"sh", "-c", "rm -rf /tmp/jobs 2>/dev/null || true"},
+			Command:       []string{"/bin/sh", "-c", "rm -rf /tmp/jobs 2>/dev/null || true"},
 			Timeout:       5 * time.Second,
 		})
 	}
@@ -779,7 +770,7 @@ func (s *Service) ensurePythonREPL(ctx context.Context, sessionID string) (*Proc
 	_, err := s.platform.Exec(ctx, platform.ExecRequest{
 		SessionID:     sessionID,
 		ContainerName: s.mainContainer,
-		Command:       []string{"sh", "-c", fmt.Sprintf("cat > %s << 'WRAPPER_EOF'\n%s\nWRAPPER_EOF", wrapperPath, pythonREPLWrapper)},
+		Command:       []string{"/bin/sh", "-c", fmt.Sprintf("cat > %s << 'WRAPPER_EOF'\n%s\nWRAPPER_EOF", wrapperPath, pythonREPLWrapper)},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to inject REPL wrapper: %w", err)
@@ -789,7 +780,7 @@ func (s *Service) ensurePythonREPL(ctx context.Context, sessionID string) (*Proc
 		SessionID:     sessionID,
 		ContainerName: s.mainContainer,
 		ExecID:        fmt.Sprintf("%s-python", sessionID),
-		Command:       []string{"python3", wrapperPath},
+		Command:       []string{"/usr/local/bin/python3", wrapperPath},
 		Terminal:      false,
 	})
 	if err != nil {
@@ -832,56 +823,82 @@ func (s *Service) updateProcessLastUsed(sessionID, process string) {
 }
 
 func (s *Service) readUntilMarker(ctx context.Context, sessionID, execID, marker string) (string, int, error) {
-	var buffer bytes.Buffer
-	pattern := regexp.MustCompile(`<<<EXIT:(\d+):` + regexp.QuoteMeta(marker) + `>>>\n?`)
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	pattern := regexp.MustCompile(`<<<EXIT:(\d+):` + regexp.QuoteMeta(marker) + `>>>\r?\n?`)
 
+	// Read stdout and stderr separately with early exit when marker is found.
+	// The marker appears in stdout, so we prioritize reading stdout.
+	// Stderr is read opportunistically without blocking.
 	for {
 		if ctx.Err() != nil {
-			return buffer.String(), -1, ctx.Err()
-		}
-		out, err := s.platform.ReadFromProcess(ctx, sessionID, execID)
-		if err != nil {
-			return buffer.String(), -1, err
-		}
-		if out != nil {
-			buffer.Write(out.Stdout)
-			buffer.Write(out.Stderr)
+			return stdoutBuf.String() + stderrBuf.String(), -1, ctx.Err()
 		}
 
-		content := buffer.String()
+		// Read stdout (this is where the marker will be)
+		stdout, err := s.platform.ReadStdout(ctx, sessionID, execID)
+		if err != nil {
+			return stdoutBuf.String() + stderrBuf.String(), -1, err
+		}
+		if len(stdout) > 0 {
+			stdoutBuf.Write(stdout)
+		}
+
+		// Check for marker in stdout - if found, return immediately
+		content := stdoutBuf.String()
 		if matches := pattern.FindStringSubmatch(content); matches != nil {
 			exitCode, _ := strconv.Atoi(matches[1])
 			output := pattern.ReplaceAllString(content, "")
+			// Include any stderr we've collected
+			if stderrBuf.Len() > 0 {
+				output = output + stderrBuf.String()
+			}
 			return output, exitCode, nil
 		}
+
+		// Read stderr opportunistically (non-blocking due to short timeout)
+		stderr, _ := s.platform.ReadStderr(ctx, sessionID, execID)
+		if len(stderr) > 0 {
+			stderrBuf.Write(stderr)
+		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func (s *Service) readUntilDone(ctx context.Context, sessionID, execID string) (*platform.ProcessOutput, error) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
 
 	for {
 		if ctx.Err() != nil {
-			return &platform.ProcessOutput{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
-		}
-		out, err := s.platform.ReadFromProcess(ctx, sessionID, execID)
-		if err != nil {
-			return &platform.ProcessOutput{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, err
-		}
-		if out != nil {
-			stdout.Write(out.Stdout)
-			stderr.Write(out.Stderr)
+			return &platform.ProcessOutput{Stdout: stdoutBuf.Bytes(), Stderr: stderrBuf.Bytes()}, ctx.Err()
 		}
 
-		if bytes.Contains(stdout.Bytes(), []byte("<<<DONE>>>")) {
-			result := bytes.Replace(stdout.Bytes(), []byte("<<<DONE>>>\n"), []byte(""), 1)
+		// Read stdout (this is where the DONE marker will be)
+		stdout, err := s.platform.ReadStdout(ctx, sessionID, execID)
+		if err != nil {
+			return &platform.ProcessOutput{Stdout: stdoutBuf.Bytes(), Stderr: stderrBuf.Bytes()}, err
+		}
+		if len(stdout) > 0 {
+			stdoutBuf.Write(stdout)
+		}
+
+		// Check for marker in stdout - if found, return immediately
+		if bytes.Contains(stdoutBuf.Bytes(), []byte("<<<DONE>>>")) {
+			result := bytes.Replace(stdoutBuf.Bytes(), []byte("<<<DONE>>>\n"), []byte(""), 1)
 			return &platform.ProcessOutput{
 				Stdout: result,
-				Stderr: stderr.Bytes(),
+				Stderr: stderrBuf.Bytes(),
 			}, nil
 		}
+
+		// Read stderr opportunistically
+		stderr, _ := s.platform.ReadStderr(ctx, sessionID, execID)
+		if len(stderr) > 0 {
+			stderrBuf.Write(stderr)
+		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -899,11 +916,12 @@ func (s *Service) initShell(ctx context.Context, sessionID, execID string) error
 func (s *Service) drainProcessOutput(ctx context.Context, sessionID, execID string, max time.Duration) {
 	deadline := time.Now().Add(max)
 	for time.Now().Before(deadline) {
-		out, err := s.platform.ReadFromProcess(ctx, sessionID, execID)
+		stdout, err := s.platform.ReadStdout(ctx, sessionID, execID)
 		if err != nil {
 			return
 		}
-		if out == nil || (len(out.Stdout) == 0 && len(out.Stderr) == 0) {
+		// For shell (TTY), all output is on stdout, so we only need to drain that
+		if len(stdout) == 0 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -911,21 +929,22 @@ func (s *Service) drainProcessOutput(ctx context.Context, sessionID, execID stri
 }
 
 func (s *Service) readUntilToken(ctx context.Context, sessionID, execID, token string) (string, error) {
-	var buffer bytes.Buffer
+	var stdoutBuf bytes.Buffer
 	for {
 		if ctx.Err() != nil {
-			return buffer.String(), ctx.Err()
-		}
-		out, err := s.platform.ReadFromProcess(ctx, sessionID, execID)
-		if err != nil {
-			return buffer.String(), err
-		}
-		if out != nil {
-			buffer.Write(out.Stdout)
-			buffer.Write(out.Stderr)
+			return stdoutBuf.String(), ctx.Err()
 		}
 
-		content := buffer.String()
+		// Read stdout (this is where the token will be for shell)
+		stdout, err := s.platform.ReadStdout(ctx, sessionID, execID)
+		if err != nil {
+			return stdoutBuf.String(), err
+		}
+		if len(stdout) > 0 {
+			stdoutBuf.Write(stdout)
+		}
+
+		content := stdoutBuf.String()
 		if strings.Contains(content, token) {
 			content = strings.Replace(content, token, "", 1)
 			return content, nil
@@ -969,8 +988,8 @@ func isTimeoutErr(err error) bool {
 }
 
 func normalizeNewlines(value string) string {
-	value = strings.ReplaceAll(value, "\r\n", "\n")
-	value = strings.ReplaceAll(value, "\r", "\n")
+	value = strings.ReplaceAll(value, "\r\n", "\n") // Windows CRLF → Unix LF
+	value = strings.ReplaceAll(value, "\r", "")     // Strip standalone CR (TTY cursor movement)
 	return value
 }
 
@@ -1220,7 +1239,7 @@ func (s *Service) GetJobLogs(ctx context.Context, sessionID, jobID string, tail 
 	stdoutResult, err := s.platform.Exec(ctx, platform.ExecRequest{
 		SessionID:     sessionID,
 		ContainerName: s.shellContainer,
-		Command:       []string{"sh", "-c", stdoutCmd},
+		Command:       []string{"/bin/sh", "-c", stdoutCmd},
 		Timeout:       10 * time.Second,
 	})
 	if err != nil {
@@ -1236,7 +1255,7 @@ func (s *Service) GetJobLogs(ctx context.Context, sessionID, jobID string, tail 
 	stderrResult, err := s.platform.Exec(ctx, platform.ExecRequest{
 		SessionID:     sessionID,
 		ContainerName: s.shellContainer,
-		Command:       []string{"sh", "-c", stderrCmd},
+		Command:       []string{"/bin/sh", "-c", stderrCmd},
 		Timeout:       10 * time.Second,
 	})
 	if err != nil {
@@ -1276,7 +1295,7 @@ func (s *Service) KillJob(ctx context.Context, sessionID, jobID string) error {
 	_, err := s.platform.Exec(ctx, platform.ExecRequest{
 		SessionID:     sessionID,
 		ContainerName: s.shellContainer,
-		Command:       []string{"sh", "-c", killCmd},
+		Command:       []string{"/bin/sh", "-c", killCmd},
 		Timeout:       5 * time.Second,
 	})
 	if err != nil {
@@ -1303,7 +1322,7 @@ func (s *Service) refreshJobStatus(ctx context.Context, sessionID string, job *J
 	result, err := s.platform.Exec(ctx, platform.ExecRequest{
 		SessionID:     sessionID,
 		ContainerName: s.shellContainer,
-		Command:       []string{"sh", "-c", checkCmd},
+		Command:       []string{"/bin/sh", "-c", checkCmd},
 		Timeout:       5 * time.Second,
 	})
 	if err != nil {
@@ -1328,7 +1347,7 @@ func (s *Service) refreshJobStatus(ctx context.Context, sessionID string, job *J
 	stderrResult, err := s.platform.Exec(ctx, platform.ExecRequest{
 		SessionID:     sessionID,
 		ContainerName: s.shellContainer,
-		Command:       []string{"sh", "-c", stderrCmd},
+		Command:       []string{"/bin/sh", "-c", stderrCmd},
 		Timeout:       5 * time.Second,
 	})
 
@@ -1386,7 +1405,7 @@ func (s *Service) cleanupOldJobs(ctx context.Context, session *Session) {
 			_, _ = s.platform.Exec(context.Background(), platform.ExecRequest{
 				SessionID:     sessionID,
 				ContainerName: s.shellContainer,
-				Command:       []string{"sh", "-c", cleanupCmd},
+				Command:       []string{"/bin/sh", "-c", cleanupCmd},
 				Timeout:       10 * time.Second,
 			})
 		}()

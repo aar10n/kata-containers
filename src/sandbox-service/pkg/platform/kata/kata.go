@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	agentReadTimeout     = 2 * time.Second
+	agentReadTimeout     = 100 * time.Millisecond // Short timeout for non-blocking reads
 	sandboxPollInitDelay = 100 * time.Millisecond
 	sandboxPollMaxDelay  = 2 * time.Second
 	sandboxReadyTimeout  = 30 * time.Second
@@ -301,6 +301,7 @@ func (p *Platform) WriteToProcess(ctx context.Context, sessionID, execID string,
 }
 
 // ReadFromProcess reads output from a process.
+// Reads stdout and stderr in parallel to avoid blocking on one while the other has data.
 func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string) (*platform.ProcessOutput, error) {
 	containerID, err := p.getProcessContainer(execID)
 	if err != nil {
@@ -315,9 +316,80 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
 	defer cancel()
 
-	var stdout, stderr []byte
+	// Read stdout and stderr in parallel to avoid blocking
+	type readResult struct {
+		data []byte
+		err  error
+	}
 
-	stdoutResp, err := p.client.ReadStdout(readCtx, &pb.ReadStdoutRequest{
+	stdoutCh := make(chan readResult, 1)
+	stderrCh := make(chan readResult, 1)
+
+	go func() {
+		resp, err := p.client.ReadStdout(readCtx, &pb.ReadStdoutRequest{
+			VmId: sandboxID,
+			Request: &agentgrpc.ReadStreamRequest{
+				ContainerId: containerID,
+				ExecId:      execID,
+				Len:         4096,
+			},
+		})
+		var data []byte
+		if resp != nil {
+			data = resp.GetData()
+		}
+		stdoutCh <- readResult{data: data, err: err}
+	}()
+
+	go func() {
+		resp, err := p.client.ReadStderr(readCtx, &pb.ReadStderrRequest{
+			VmId: sandboxID,
+			Request: &agentgrpc.ReadStreamRequest{
+				ContainerId: containerID,
+				ExecId:      execID,
+				Len:         4096,
+			},
+		})
+		var data []byte
+		if resp != nil {
+			data = resp.GetData()
+		}
+		stderrCh <- readResult{data: data, err: err}
+	}()
+
+	stdoutRes := <-stdoutCh
+	stderrRes := <-stderrCh
+
+	// Only return errors for non-timeout failures
+	if stdoutRes.err != nil && !isTimeout(stdoutRes.err) {
+		return nil, fmt.Errorf("read stdout: %w", stdoutRes.err)
+	}
+	if stderrRes.err != nil && !isTimeout(stderrRes.err) {
+		return nil, fmt.Errorf("read stderr: %w", stderrRes.err)
+	}
+
+	return &platform.ProcessOutput{
+		Stdout: stdoutRes.data,
+		Stderr: stderrRes.data,
+	}, nil
+}
+
+// ReadStdout reads only stdout from a process with a short timeout for non-blocking behavior.
+func (p *Platform) ReadStdout(ctx context.Context, sessionID, execID string) ([]byte, error) {
+	containerID, err := p.getProcessContainer(execID)
+	if err != nil {
+		return nil, err
+	}
+
+	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
+	defer cancel()
+
+	resp, err := p.client.ReadStdout(readCtx, &pb.ReadStdoutRequest{
 		VmId: sandboxID,
 		Request: &agentgrpc.ReadStreamRequest{
 			ContainerId: containerID,
@@ -328,11 +400,28 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 	if err != nil && !isTimeout(err) {
 		return nil, fmt.Errorf("read stdout: %w", err)
 	}
-	if stdoutResp != nil {
-		stdout = stdoutResp.GetData()
+	if resp != nil {
+		return resp.GetData(), nil
+	}
+	return nil, nil
+}
+
+// ReadStderr reads only stderr from a process with a short timeout for non-blocking behavior.
+func (p *Platform) ReadStderr(ctx context.Context, sessionID, execID string) ([]byte, error) {
+	containerID, err := p.getProcessContainer(execID)
+	if err != nil {
+		return nil, err
 	}
 
-	stderrResp, err := p.client.ReadStderr(readCtx, &pb.ReadStderrRequest{
+	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
+	defer cancel()
+
+	resp, err := p.client.ReadStderr(readCtx, &pb.ReadStderrRequest{
 		VmId: sandboxID,
 		Request: &agentgrpc.ReadStreamRequest{
 			ContainerId: containerID,
@@ -343,14 +432,10 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 	if err != nil && !isTimeout(err) {
 		return nil, fmt.Errorf("read stderr: %w", err)
 	}
-	if stderrResp != nil {
-		stderr = stderrResp.GetData()
+	if resp != nil {
+		return resp.GetData(), nil
 	}
-
-	return &platform.ProcessOutput{
-		Stdout: stdout,
-		Stderr: stderr,
-	}, nil
+	return nil, nil
 }
 
 // KillProcess kills a process.
@@ -453,7 +538,6 @@ func (p *Platform) ResizeProcess(ctx context.Context, sessionID, execID string, 
 
 // waitForSandboxReady waits for a sandbox to be ready using exponential backoff with jitter.
 func (p *Platform) waitForSandboxReady(ctx context.Context, sessionID, containerName string) (*platform.Sandbox, error) {
-	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, sandboxReadyTimeout)
 	defer cancel()
 
@@ -467,7 +551,6 @@ func (p *Platform) waitForSandboxReady(ctx context.Context, sessionID, container
 
 		if sandbox != nil && sandbox.Status == platform.StatusRunning && sandbox.SandboxID != "" {
 			if cid := getContainerID(sandbox, containerName); cid != "" {
-				slog.Debug("sandbox ready", "session_id", sessionID, "elapsed", time.Since(start))
 				return sandbox, nil
 			}
 		}

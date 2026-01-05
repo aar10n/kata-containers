@@ -23,6 +23,8 @@ type Platform interface {
 	StartProcess(ctx context.Context, req StartProcessRequest) (*Process, error)
 	WriteToProcess(ctx context.Context, sessionID, execID string, data []byte) error
 	ReadFromProcess(ctx context.Context, sessionID, execID string) (*ProcessOutput, error)
+	ReadStdout(ctx context.Context, sessionID, execID string) ([]byte, error)
+	ReadStderr(ctx context.Context, sessionID, execID string) ([]byte, error)
 	KillProcess(ctx context.Context, sessionID, execID string) error
 	IsProcessAlive(ctx context.Context, sessionID, execID string) (bool, error)
 	ResizeProcess(ctx context.Context, sessionID, execID string, rows, columns uint32) error

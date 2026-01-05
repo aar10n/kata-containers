@@ -68,8 +68,6 @@ func main() {
 	manager := k8s.NewManager(clientset, k8s.ManagerConfig{
 		Namespace:        cfg.Sandbox.Namespace,
 		RuntimeClassName: cfg.Sandbox.RuntimeClassName,
-		DefaultImage:     cfg.Sandbox.DefaultImage,
-		DefaultCommand:   cfg.Sandbox.DefaultCommand,
 		NodeSelector:     cfg.Sandbox.NodeSelector,
 	}, watcher.Store())
 

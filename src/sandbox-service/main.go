@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/api"
+	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/api/mcp"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/config"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform/docker"
@@ -26,7 +27,7 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	platformImpl, defaultImage, defaultCommand, err := buildPlatform(cfg)
+	platformImpl, err := buildPlatform(cfg)
 	if err != nil {
 		log.Fatalf("init platform: %v", err)
 	}
@@ -46,8 +47,8 @@ func main() {
 
 	svc := service.New(
 		platformImpl,
-		defaultImage,
-		defaultCommand,
+		cfg.Sandbox.DefaultImage,
+		cfg.Sandbox.DefaultCommand,
 		cfg.Kata.MainContainer,
 		cfg.Kata.ShellContainer,
 		cfg.Exec.DefaultTimeout,
@@ -57,8 +58,20 @@ func main() {
 		leaderElection,
 	)
 	defer svc.Stop()
-	server := api.NewServer(svc)
 
+	// Start MCP server if enabled
+	if cfg.MCP.Enabled {
+		mcpServer := mcp.NewServer(svc)
+		go func() {
+			log.Printf("MCP server listening on %s", cfg.MCP.Addr)
+			if err := mcpServer.ListenAndServe(cfg.MCP.Addr); err != nil && err != http.ErrServerClosed {
+				log.Printf("MCP server error: %v", err)
+			}
+		}()
+	}
+
+	// Start HTTP API server
+	server := api.NewServer(svc)
 	httpServer := &http.Server{
 		Addr:              cfg.HTTP.Addr,
 		Handler:           server.Routes(),
@@ -71,18 +84,15 @@ func main() {
 	}
 }
 
-func buildPlatform(cfg config.Config) (platform.Platform, string, []string, error) {
+func buildPlatform(cfg config.Config) (platform.Platform, error) {
 	switch cfg.Platform {
 	case "kata":
-		plat, err := kata.New(kata.Config{
+		return kata.New(kata.Config{
 			SandboxAgentAddr: cfg.Kata.SandboxAgentAddr,
 		})
-		// For Kata, image/command are managed by sandbox-agent
-		return plat, "", nil, err
 	case "docker":
-		plat, err := docker.New(cfg.Docker.DefaultImage, cfg.Docker.DefaultCommand)
-		return plat, cfg.Docker.DefaultImage, cfg.Docker.DefaultCommand, err
+		return docker.New()
 	default:
-		return nil, "", nil, fmt.Errorf("unknown platform: %s", cfg.Platform)
+		return nil, fmt.Errorf("unknown platform: %s", cfg.Platform)
 	}
 }

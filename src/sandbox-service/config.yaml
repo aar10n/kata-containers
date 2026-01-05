@@ -19,10 +19,6 @@ kata:
   main_container: "sandbox"
   shell_container: "shell"
 
-docker:
-  default_image: "python:3.11-slim"
-  default_command: ["sleep", "infinity"]
-
 exec:
   default_timeout: 30s
   max_output_bytes: 1048576
@@ -30,3 +26,7 @@ exec:
 sandbox:
   default_ttl: 10m
   cleanup_interval: 30s
+  # Default container image for sandboxes
+  default_image: "python:3.11-slim"
+  # Default command for sandbox containers
+  default_command: ["sleep", "infinity"]

@@ -11,17 +11,23 @@ import (
 
 // Config holds all configuration for sandbox-service.
 type Config struct {
-	HTTP    HTTPConfig    `mapstructure:"http"`
-	Platform string       `mapstructure:"platform"`
-	Kata    KataConfig    `mapstructure:"kata"`
-	Docker  DockerConfig  `mapstructure:"docker"`
-	Exec    ExecConfig    `mapstructure:"exec"`
-	Sandbox SandboxConfig `mapstructure:"sandbox"`
+	HTTP     HTTPConfig    `mapstructure:"http"`
+	MCP      MCPConfig     `mapstructure:"mcp"`
+	Platform string        `mapstructure:"platform"`
+	Kata     KataConfig    `mapstructure:"kata"`
+	Exec     ExecConfig    `mapstructure:"exec"`
+	Sandbox  SandboxConfig `mapstructure:"sandbox"`
 }
 
 // HTTPConfig holds HTTP server configuration.
 type HTTPConfig struct {
 	Addr string `mapstructure:"addr"`
+}
+
+// MCPConfig holds MCP server configuration.
+type MCPConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Addr    string `mapstructure:"addr"`
 }
 
 // KataConfig holds Kata platform configuration.
@@ -52,12 +58,6 @@ type LeaderElectionConfig struct {
 	RetryPeriod time.Duration `mapstructure:"retry_period"`
 }
 
-// DockerConfig holds Docker platform configuration.
-type DockerConfig struct {
-	DefaultImage   string   `mapstructure:"default_image"`
-	DefaultCommand []string `mapstructure:"default_command"`
-}
-
 // ExecConfig holds command execution configuration.
 type ExecConfig struct {
 	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
@@ -68,6 +68,10 @@ type ExecConfig struct {
 type SandboxConfig struct {
 	DefaultTTL      time.Duration `mapstructure:"default_ttl"`
 	CleanupInterval time.Duration `mapstructure:"cleanup_interval"`
+	// DefaultImage is the container image to use for new sandboxes.
+	DefaultImage string `mapstructure:"default_image"`
+	// DefaultCommand is the command to run in new sandbox containers.
+	DefaultCommand []string `mapstructure:"default_command"`
 }
 
 // Flags defines command-line flags that can override config values.
@@ -75,6 +79,7 @@ type Flags struct {
 	ConfigFile       string
 	Platform         string
 	HTTPAddr         string
+	MCPAddr          string
 	KataAgentAddr    string
 }
 
@@ -83,6 +88,10 @@ func DefaultConfig() Config {
 	return Config{
 		HTTP: HTTPConfig{
 			Addr: ":8080",
+		},
+		MCP: MCPConfig{
+			Enabled: true,
+			Addr:    ":8081",
 		},
 		Platform: "kata",
 		Kata: KataConfig{
@@ -96,10 +105,6 @@ func DefaultConfig() Config {
 				RetryPeriod:   2 * time.Second,
 			},
 		},
-		Docker: DockerConfig{
-			DefaultImage:   "python:3.11-slim",
-			DefaultCommand: []string{"sleep", "infinity"},
-		},
 		Exec: ExecConfig{
 			DefaultTimeout: 30 * time.Second,
 			MaxOutputBytes: 1024 * 1024,
@@ -107,6 +112,8 @@ func DefaultConfig() Config {
 		Sandbox: SandboxConfig{
 			DefaultTTL:      10 * time.Minute,
 			CleanupInterval: 30 * time.Second,
+			DefaultImage:    "python:3.11-slim",
+			DefaultCommand:  []string{"sleep", "infinity"},
 		},
 	}
 }
@@ -119,6 +126,7 @@ func RegisterFlags() *Flags {
 	pflag.StringVarP(&flags.ConfigFile, "config", "c", "", "Path to config file")
 	pflag.StringVarP(&flags.Platform, "platform", "p", "", "Platform type: kata or docker (overrides config)")
 	pflag.StringVar(&flags.HTTPAddr, "http-addr", "", "HTTP listen address (overrides config)")
+	pflag.StringVar(&flags.MCPAddr, "mcp-addr", "", "MCP server listen address (overrides config)")
 	pflag.StringVar(&flags.KataAgentAddr, "kata-agent-addr", "", "Sandbox-agent address for Kata platform (overrides config)")
 
 	return flags
@@ -132,6 +140,8 @@ func Load(flags *Flags) (Config, error) {
 	// Set defaults
 	defaults := DefaultConfig()
 	v.SetDefault("http.addr", defaults.HTTP.Addr)
+	v.SetDefault("mcp.enabled", defaults.MCP.Enabled)
+	v.SetDefault("mcp.addr", defaults.MCP.Addr)
 	v.SetDefault("platform", defaults.Platform)
 	v.SetDefault("kata.sandbox_agent_addr", defaults.Kata.SandboxAgentAddr)
 	v.SetDefault("kata.main_container", defaults.Kata.MainContainer)
@@ -140,12 +150,12 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("kata.leader_election.lease_duration", defaults.Kata.LeaderElection.LeaseDuration)
 	v.SetDefault("kata.leader_election.renew_deadline", defaults.Kata.LeaderElection.RenewDeadline)
 	v.SetDefault("kata.leader_election.retry_period", defaults.Kata.LeaderElection.RetryPeriod)
-	v.SetDefault("docker.default_image", defaults.Docker.DefaultImage)
-	v.SetDefault("docker.default_command", defaults.Docker.DefaultCommand)
 	v.SetDefault("exec.default_timeout", defaults.Exec.DefaultTimeout)
 	v.SetDefault("exec.max_output_bytes", defaults.Exec.MaxOutputBytes)
 	v.SetDefault("sandbox.default_ttl", defaults.Sandbox.DefaultTTL)
 	v.SetDefault("sandbox.cleanup_interval", defaults.Sandbox.CleanupInterval)
+	v.SetDefault("sandbox.default_image", defaults.Sandbox.DefaultImage)
+	v.SetDefault("sandbox.default_command", defaults.Sandbox.DefaultCommand)
 
 	// Enable environment variable overrides
 	// Environment variables use SANDBOX_SERVICE_ prefix with underscores
@@ -168,6 +178,9 @@ func Load(flags *Flags) (Config, error) {
 	}
 	if flags.HTTPAddr != "" {
 		v.Set("http.addr", flags.HTTPAddr)
+	}
+	if flags.MCPAddr != "" {
+		v.Set("mcp.addr", flags.MCPAddr)
 	}
 	if flags.KataAgentAddr != "" {
 		v.Set("kata.sandbox_agent_addr", flags.KataAgentAddr)

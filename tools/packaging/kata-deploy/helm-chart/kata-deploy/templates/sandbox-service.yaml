@@ -64,6 +64,9 @@ data:
   config.yaml: |
     http:
       addr: ":8080"
+    mcp:
+      enabled: {{ dig "mcp" "enabled" true .Values.sandboxService }}
+      addr: ":8081"
     platform: kata
     kata:
       sandbox_agent_addr: "http://{{ $sandboxAgentName }}.{{ .Release.Namespace }}:8080"
@@ -73,6 +76,8 @@ data:
     sandbox:
       default_ttl: {{ .Values.sandboxService.defaultTTL | default "10m" | quote }}
       cleanup_interval: {{ .Values.sandboxService.cleanupInterval | default "30s" | quote }}
+      default_image: {{ .Values.sandboxService.defaultImage | default "python:3.11-slim" | quote }}
+      default_command: {{ .Values.sandboxService.defaultCommand | default (list "sleep" "infinity") | toJson }}
 ---
 
 # Service
@@ -94,6 +99,12 @@ spec:
       port: 8080
       protocol: TCP
       targetPort: http
+    {{- if dig "mcp" "enabled" true .Values.sandboxService }}
+    - name: mcp
+      port: 8081
+      protocol: TCP
+      targetPort: mcp
+    {{- end }}
 ---
 
 # Deployment
@@ -117,7 +128,7 @@ spec:
         app.kubernetes.io/name: sandbox-service
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        checksum/config: {{ printf "%s|%s" .Values.sandboxService.defaultTTL .Values.sandboxService.cleanupInterval | sha256sum }}
+        checksum/config: {{ printf "%s|%s|%s|%v" .Values.sandboxService.defaultTTL .Values.sandboxService.cleanupInterval .Values.sandboxService.defaultImage .Values.sandboxService.defaultCommand | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       containers:
@@ -130,6 +141,11 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if dig "mcp" "enabled" true .Values.sandboxService }}
+            - name: mcp
+              containerPort: 8081
+              protocol: TCP
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz

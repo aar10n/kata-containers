@@ -27,8 +27,6 @@ type ManagerConfig struct {
 	Namespace        string
 	RuntimeClassName string
 	NodeSelector     map[string]string
-	DefaultImage     string
-	DefaultCommand   []string
 }
 
 // Manager handles K8s pod CRUD operations for sandboxes.
@@ -42,12 +40,6 @@ type Manager struct {
 func NewManager(client kubernetes.Interface, config ManagerConfig, store *Store) *Manager {
 	if config.Namespace == "" {
 		config.Namespace = "default"
-	}
-	if config.DefaultImage == "" {
-		config.DefaultImage = "python:3.11-slim"
-	}
-	if len(config.DefaultCommand) == 0 {
-		config.DefaultCommand = []string{"sleep", "infinity"}
 	}
 	return &Manager{
 		client: client,
@@ -79,12 +71,12 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 
 	image := strings.TrimSpace(req.Image)
 	if image == "" {
-		image = m.config.DefaultImage
+		return nil, errors.New("image is required")
 	}
 
 	command := req.Command
 	if len(command) == 0 {
-		command = append([]string{}, m.config.DefaultCommand...)
+		return nil, errors.New("command is required")
 	}
 
 	labels := map[string]string{

@@ -6,6 +6,7 @@ require (
 	github.com/cohere-ai/kata-containers/src/sandbox-agent v0.0.0
 	github.com/docker/docker v27.3.1+incompatible
 	github.com/kata-containers/kata-containers/src/runtime v0.0.0
+	github.com/mark3labs/mcp-go v0.32.0
 	github.com/spf13/pflag v1.0.10
 	github.com/spf13/viper v1.21.0
 	google.golang.org/grpc v1.77.0
@@ -64,6 +65,7 @@ require (
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
+	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.64.0 // indirect
 	go.opentelemetry.io/otel v1.39.0 // indirect

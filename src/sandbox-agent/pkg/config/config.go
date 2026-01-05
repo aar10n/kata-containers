@@ -58,8 +58,6 @@ type ExecConfig struct {
 type SandboxConfig struct {
 	Namespace        string            `mapstructure:"namespace"`
 	RuntimeClassName string            `mapstructure:"runtime_class"`
-	DefaultImage     string            `mapstructure:"default_image"`
-	DefaultCommand   []string          `mapstructure:"default_command"`
 	NodeSelector     map[string]string `mapstructure:"node_selector"`
 }
 
@@ -96,8 +94,6 @@ func DefaultConfig() Config {
 		Sandbox: SandboxConfig{
 			Namespace:        "default",
 			RuntimeClassName: "",
-			DefaultImage:     "python:3.11-slim",
-			DefaultCommand:   []string{"sleep", "infinity"},
 		},
 	}
 }
@@ -135,8 +131,6 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("exec::timeout", defaults.Exec.Timeout)
 	v.SetDefault("sandbox::namespace", defaults.Sandbox.Namespace)
 	v.SetDefault("sandbox::runtime_class", defaults.Sandbox.RuntimeClassName)
-	v.SetDefault("sandbox::default_image", defaults.Sandbox.DefaultImage)
-	v.SetDefault("sandbox::default_command", defaults.Sandbox.DefaultCommand)
 
 	// Enable environment variable overrides
 	// Environment variables use SANDBOX_AGENT_ prefix with underscores

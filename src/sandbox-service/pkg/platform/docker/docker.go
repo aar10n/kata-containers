@@ -35,36 +35,41 @@ const (
 )
 
 type Platform struct {
-	docker         *client.Client
-	defaultImage   string
-	defaultCommand []string
-	mu             sync.RWMutex
-	processes      map[string]*dockerProcess
+	docker    *client.Client
+	mu        sync.RWMutex
+	processes map[string]*dockerProcess
 }
 
 type dockerProcess struct {
-	execID      string
-	containerID string
-	conn        types.HijackedResponse
-	buffer      []byte
-	terminal    bool
-	mu          sync.Mutex
+	execID       string
+	containerID  string
+	conn         types.HijackedResponse
+	buffer       []byte
+	stdoutBuffer []byte
+	stderrBuffer []byte
+	terminal     bool
+	mu           sync.Mutex
 }
 
-func New(defaultImage string, defaultCommand []string) (*Platform, error) {
+func New() (*Platform, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("create docker client: %w", err)
 	}
 	return &Platform{
-		docker:         cli,
-		defaultImage:   defaultImage,
-		defaultCommand: append([]string{}, defaultCommand...),
-		processes:      make(map[string]*dockerProcess),
+		docker:    cli,
+		processes: make(map[string]*dockerProcess),
 	}, nil
 }
 
 func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandboxRequest) (*platform.Sandbox, error) {
+	if req.Image == "" {
+		return nil, errors.New("image is required")
+	}
+	if len(req.Command) == 0 {
+		return nil, errors.New("command is required")
+	}
+
 	name := containerName(req.SessionID)
 	_, err := p.docker.ContainerInspect(ctx, name)
 	if err == nil {
@@ -75,13 +80,7 @@ func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandbox
 	}
 
 	image := req.Image
-	if image == "" {
-		image = p.defaultImage
-	}
 	command := req.Command
-	if len(command) == 0 {
-		command = append([]string{}, p.defaultCommand...)
-	}
 
 	now := time.Now().UTC()
 	labels := map[string]string{
@@ -387,6 +386,94 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 		Stdout: stdout,
 		Stderr: stderr,
 	}, nil
+}
+
+// fillBuffers reads available data from the process stream and fills stdout/stderr buffers.
+// Must be called with proc.mu held.
+func (p *Platform) fillBuffers(proc *dockerProcess) error {
+	buf := make([]byte, 4096)
+
+	if err := proc.conn.Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		return err
+	}
+
+	n, err := proc.conn.Reader.Read(buf)
+	if err != nil && !isTimeout(err) {
+		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			proc.conn.Close()
+		}
+		return err
+	}
+
+	if n <= 0 {
+		return nil
+	}
+
+	proc.buffer = append(proc.buffer, buf[:n]...)
+
+	if proc.terminal {
+		// Terminal mode: all output is stdout
+		if isDockerMuxed(proc.buffer) {
+			stdout, _, remaining, err := demuxDockerStream(proc.buffer)
+			if err != nil {
+				return err
+			}
+			proc.buffer = remaining
+			proc.stdoutBuffer = append(proc.stdoutBuffer, stdout...)
+		} else {
+			proc.stdoutBuffer = append(proc.stdoutBuffer, proc.buffer...)
+			proc.buffer = nil
+		}
+	} else {
+		// Non-terminal: demux into stdout and stderr
+		stdout, stderr, remaining, err := demuxDockerStream(proc.buffer)
+		if err != nil {
+			return err
+		}
+		proc.buffer = remaining
+		proc.stdoutBuffer = append(proc.stdoutBuffer, stdout...)
+		proc.stderrBuffer = append(proc.stderrBuffer, stderr...)
+	}
+
+	return nil
+}
+
+// ReadStdout reads only stdout from a process.
+func (p *Platform) ReadStdout(ctx context.Context, sessionID, execID string) ([]byte, error) {
+	proc := p.getProcess(execID)
+	if proc == nil {
+		return nil, fmt.Errorf("process not found: %s", execID)
+	}
+
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+
+	if err := p.fillBuffers(proc); err != nil && !isTimeout(err) {
+		return nil, err
+	}
+
+	stdout := proc.stdoutBuffer
+	proc.stdoutBuffer = nil
+	return stdout, nil
+}
+
+// ReadStderr reads only stderr from a process.
+func (p *Platform) ReadStderr(ctx context.Context, sessionID, execID string) ([]byte, error) {
+	proc := p.getProcess(execID)
+	if proc == nil {
+		return nil, fmt.Errorf("process not found: %s", execID)
+	}
+
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+
+	if err := p.fillBuffers(proc); err != nil && !isTimeout(err) {
+		return nil, err
+	}
+
+	stderr := proc.stderrBuffer
+	proc.stderrBuffer = nil
+	return stderr, nil
 }
 
 func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) error {

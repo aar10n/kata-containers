@@ -42,8 +42,6 @@ data:
     sandbox:
       namespace: {{ .Values.sandboxAgent.sandboxNamespace | quote }}
       runtime_class: {{ .Values.sandboxAgent.runtimeClass | quote }}
-      default_image: {{ .Values.sandboxAgent.defaultImage | quote }}
-      default_command: ["sleep", "infinity"]
       {{- with .Values.sandboxAgent.sandboxNodeSelector }}
       node_selector:
         {{- toYaml . | nindent 8 }}
@@ -132,7 +130,7 @@ spec:
         app.kubernetes.io/name: sandbox-agent
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%s|%v" .Values.sandboxAgent.sandboxNamespace .Values.sandboxAgent.runtimeClass .Values.sandboxAgent.defaultImage .Values.sandboxAgent.grpcDialTimeout .Values.sandboxAgent.resyncInterval .Values.sandboxAgent.agentTimeout .Values.sandboxAgent.execTimeout .Values.sandboxAgent.maxOutputBytes .Values.sandboxAgent.sandboxNodeSelector | sha256sum }}
+        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%v" .Values.sandboxAgent.sandboxNamespace .Values.sandboxAgent.runtimeClass .Values.sandboxAgent.grpcDialTimeout .Values.sandboxAgent.resyncInterval .Values.sandboxAgent.agentTimeout .Values.sandboxAgent.execTimeout .Values.sandboxAgent.maxOutputBytes .Values.sandboxAgent.sandboxNodeSelector | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       {{- with .Values.nodeSelector }}

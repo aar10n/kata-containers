@@ -19,7 +19,7 @@ use std::sync::Arc;
 use ttrpc::{
     self,
     error::get_rpc_status,
-    r#async::{Server as TtrpcServer, TtrpcContext},
+    r#async::{Server as TtrpcServer, ServerStreamSender, TtrpcContext},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -30,8 +30,8 @@ use protobuf::MessageField;
 use protocols::agent::{
     AddSwapPathRequest, AddSwapRequest, AgentDetails, CopyFileRequest, GetIPTablesRequest,
     GetIPTablesResponse, GuestDetailsResponse, Interfaces, Metrics, OOMEvent, ReadStreamResponse,
-    Routes, SetIPTablesRequest, SetIPTablesResponse, StatsContainerResponse, VolumeStatsRequest,
-    WaitProcessResponse, WriteStreamResponse,
+    Routes, SetIPTablesRequest, SetIPTablesResponse, StatsContainerResponse, StreamRequest,
+    StreamResponse, VolumeStatsRequest, WaitProcessResponse, WriteStreamResponse,
 };
 use protocols::csi::{
     volume_usage::Unit as VolumeUsage_Unit, VolumeCondition, VolumeStatsResponse, VolumeUsage,
@@ -720,6 +720,89 @@ impl AgentService {
             }
         }
     }
+
+    /// Streaming version of read_stream that continuously sends output chunks
+    /// until the process terminates or an error occurs.
+    async fn do_stream(
+        &self,
+        req: &StreamRequest,
+        stdout: bool,
+        sender: ServerStreamSender<StreamResponse>,
+    ) -> ttrpc::Result<()> {
+        let cid = &req.container_id;
+        let eid = &req.exec_id;
+
+        let term_exit_notifier;
+        let reader = {
+            let mut sandbox = self.sandbox.lock().await;
+            let p = sandbox
+                .find_container_process(cid.as_str(), eid.as_str())
+                .map_err(sandbox_err_to_ttrpc)?;
+
+            term_exit_notifier = p.term_exit_notifier.clone();
+
+            if p.term_master.is_some() {
+                p.get_reader(StreamType::TermMaster)
+            } else if stdout {
+                if p.parent_stdout.is_some() {
+                    p.get_reader(StreamType::ParentStdout)
+                } else {
+                    None
+                }
+            } else {
+                p.get_reader(StreamType::ParentStderr)
+            }
+        };
+
+        let reader = reader.ok_or_else(|| {
+            get_rpc_status(ttrpc::Code::UNAVAILABLE, "cannot get stream reader")
+        })?;
+
+        // Read buffer size - 8KB chunks
+        const BUF_SIZE: usize = 8192;
+
+        loop {
+            tokio::select! {
+                biased;
+                v = read_stream(&reader, BUF_SIZE) => {
+                    match v {
+                        Ok(data) if !data.is_empty() => {
+                            let mut resp = StreamResponse::new();
+                            resp.set_data(data);
+                            if let Err(e) = sender.send(&resp).await {
+                                // Client disconnected or other error
+                                return Err(get_rpc_status(
+                                    ttrpc::Code::ABORTED,
+                                    format!("failed to send stream response: {}", e),
+                                ));
+                            }
+                        }
+                        Ok(_) => {
+                            // Empty read, yield to other tasks briefly
+                            tokio::task::yield_now().await;
+                        }
+                        Err(e) => {
+                            return Err(get_rpc_status(
+                                ttrpc::Code::INTERNAL,
+                                format!("stream read error: {}", e),
+                            ));
+                        }
+                    }
+                }
+                _ = term_exit_notifier.notified() => {
+                    // Process has terminated, drain any remaining data
+                    if let Ok(data) = read_stream(&reader, BUF_SIZE).await {
+                        if !data.is_empty() {
+                            let mut resp = StreamResponse::new();
+                            resp.set_data(data);
+                            let _ = sender.send(&resp).await;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 fn mem_agent_memcgconfig_to_memcg_optionconfig(
@@ -944,6 +1027,24 @@ impl agent_ttrpc::AgentService for AgentService {
             response.clear_data();
         }
         Ok(response)
+    }
+
+    async fn stream_stdout(
+        &self,
+        _ctx: &TtrpcContext,
+        req: StreamRequest,
+        sender: ServerStreamSender<StreamResponse>,
+    ) -> ttrpc::Result<()> {
+        self.do_stream(&req, true, sender).await
+    }
+
+    async fn stream_stderr(
+        &self,
+        _ctx: &TtrpcContext,
+        req: StreamRequest,
+        sender: ServerStreamSender<StreamResponse>,
+    ) -> ttrpc::Result<()> {
+        self.do_stream(&req, false, sender).await
     }
 
     async fn close_stdin(

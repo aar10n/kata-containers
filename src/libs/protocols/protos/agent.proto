@@ -47,6 +47,10 @@ service AgentService {
 	rpc CloseStdin(CloseStdinRequest) returns (google.protobuf.Empty);
 	rpc TtyWinResize(TtyWinResizeRequest) returns (google.protobuf.Empty);
 
+	// streaming stdio - server-streaming variants for efficient output reading
+	rpc StreamStdout(StreamRequest) returns (stream StreamResponse);
+	rpc StreamStderr(StreamRequest) returns (stream StreamResponse);
+
 	// networking
 	rpc UpdateInterface(UpdateInterfaceRequest) returns (types.Interface);
 	rpc UpdateRoutes(UpdateRoutesRequest) returns (Routes);
@@ -281,6 +285,17 @@ message ReadStreamRequest {
 }
 
 message ReadStreamResponse {
+	bytes data = 1;
+}
+
+// Streaming request for server-streaming stdout/stderr
+message StreamRequest {
+	string container_id = 1;
+	string exec_id = 2;
+}
+
+// Streaming response chunk for stdout/stderr
+message StreamResponse {
 	bytes data = 1;
 }
 

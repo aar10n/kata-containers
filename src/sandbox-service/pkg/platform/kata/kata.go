@@ -536,6 +536,88 @@ func (p *Platform) ResizeProcess(ctx context.Context, sessionID, execID string, 
 	return nil
 }
 
+// StreamStdout returns a channel that streams stdout chunks from a process.
+func (p *Platform) StreamStdout(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.StreamChunk, error) {
+	containerID, err := p.getProcessContainer(req.ExecID)
+	if err != nil {
+		return nil, err
+	}
+
+	sandboxID, err := p.getSandboxIDCached(ctx, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	stream, err := p.client.StreamReadStdout(ctx, &pb.StreamReadRequest{
+		VmId:           sandboxID,
+		ContainerId:    containerID,
+		ExecId:         req.ExecID,
+		PollIntervalMs: req.PollIntervalMs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("stream stdout: %w", err)
+	}
+
+	return p.streamToChannel(ctx, stream), nil
+}
+
+// StreamStderr returns a channel that streams stderr chunks from a process.
+func (p *Platform) StreamStderr(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.StreamChunk, error) {
+	containerID, err := p.getProcessContainer(req.ExecID)
+	if err != nil {
+		return nil, err
+	}
+
+	sandboxID, err := p.getSandboxIDCached(ctx, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	stream, err := p.client.StreamReadStderr(ctx, &pb.StreamReadRequest{
+		VmId:           sandboxID,
+		ContainerId:    containerID,
+		ExecId:         req.ExecID,
+		PollIntervalMs: req.PollIntervalMs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("stream stderr: %w", err)
+	}
+
+	return p.streamToChannel(ctx, stream), nil
+}
+
+type grpcStreamReceiver interface {
+	Recv() (*pb.StreamChunk, error)
+}
+
+func (p *Platform) streamToChannel(ctx context.Context, stream grpcStreamReceiver) <-chan platform.StreamChunk {
+	ch := make(chan platform.StreamChunk)
+	go func() {
+		defer close(ch)
+		for {
+			chunk, err := stream.Recv()
+			if err != nil {
+				// Check for context cancellation
+				if ctx.Err() != nil {
+					return
+				}
+				// EOF or other error - send final chunk
+				ch <- platform.StreamChunk{EOF: true, Err: err}
+				return
+			}
+			select {
+			case ch <- platform.StreamChunk{Data: chunk.GetData(), EOF: chunk.GetEof()}:
+				if chunk.GetEof() {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
+}
+
 // waitForSandboxReady waits for a sandbox to be ready using exponential backoff with jitter.
 func (p *Platform) waitForSandboxReady(ctx context.Context, sessionID, containerName string) (*platform.Sandbox, error) {
 	ctx, cancel := context.WithTimeout(ctx, sandboxReadyTimeout)

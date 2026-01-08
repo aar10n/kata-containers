@@ -182,6 +182,50 @@ fn codegen(path: &str, protos: &[&str], async_all: bool) -> Result<(), std::io::
     use_serde(protos, out_dir)?;
     Ok(())
 }
+/// Fix streaming handlers in sync ttrpc code.
+/// Streaming RPCs are only supported in async mode. The sync codegen generates
+/// broken handlers for streaming methods, so we replace the entire handler
+/// function body with a stub that returns UNIMPLEMENTED.
+fn fix_sync_streaming_handlers(file_name: &str) -> Result<(), std::io::Error> {
+    let mut src = File::open(file_name)?;
+    let mut contents = String::new();
+    src.read_to_string(&mut contents)?;
+    drop(src);
+
+    // Replace broken streaming handler function bodies with UNIMPLEMENTED stubs
+    // The generated code has patterns like:
+    //     fn handler(&self, ctx: ::ttrpc::TtrpcContext, req: ::ttrpc::Request) -> ::ttrpc::Result<()> {
+    //         ::ttrpc::request_handler!(self, ctx, req, agent, StreamRequest, stream_stdout);
+    //         Ok(())
+    //     }
+    // We replace the whole body with a simple UNIMPLEMENTED error
+    let streaming_methods = ["stream_stdout", "stream_stderr"];
+
+    for method in streaming_methods {
+        // Pattern: the macro call followed by Ok(())
+        let pattern = format!(
+            r#"::ttrpc::request_handler!(self, ctx, req, agent, StreamRequest, {});
+        Ok(())"#,
+            method
+        );
+        // Use escaped braces in format string: {{method}} produces {method} literally
+        let replacement = format!(
+            r#"let _ = (ctx, req); // silence unused warnings
+        Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(
+            ::ttrpc::Code::UNIMPLEMENTED,
+            "{method} is only available in async mode".to_string()
+        )))"#,
+            method = method
+        );
+        contents = contents.replace(&pattern, &replacement);
+    }
+
+    let mut dst = File::create(file_name)?;
+    dst.write_all(contents.as_bytes())?;
+
+    Ok(())
+}
+
 fn real_main() -> Result<(), std::io::Error> {
     codegen(
         "src",
@@ -228,6 +272,11 @@ fn real_main() -> Result<(), std::io::Error> {
         ],
         false,
     )?;
+
+    // Fix streaming handlers in sync agent_ttrpc.rs - streaming RPCs are only
+    // supported in async mode, so we replace the broken handlers with stubs
+    // that return UNIMPLEMENTED
+    fix_sync_streaming_handlers("src/agent_ttrpc.rs")?;
 
     codegen("src", &["protos/cri-api/api.proto"], false)?;
 

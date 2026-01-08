@@ -536,6 +536,128 @@ func (p *Platform) ResizeProcess(ctx context.Context, sessionID, execID string, 
 	})
 }
 
+const defaultStreamPollInterval = 50 * time.Millisecond
+
+// StreamStdout returns a channel that streams stdout chunks from a process.
+func (p *Platform) StreamStdout(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.StreamChunk, error) {
+	proc := p.getProcess(req.ExecID)
+	if proc == nil {
+		return nil, fmt.Errorf("process not found: %s", req.ExecID)
+	}
+
+	pollInterval := defaultStreamPollInterval
+	if req.PollIntervalMs > 0 {
+		pollInterval = time.Duration(req.PollIntervalMs) * time.Millisecond
+	}
+
+	ch := make(chan platform.StreamChunk)
+	go func() {
+		defer close(ch)
+		consecutiveEmpty := 0
+		const maxConsecutiveEmpty = 3
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			proc.mu.Lock()
+			if err := p.fillBuffers(proc); err != nil && !isTimeout(err) {
+				proc.mu.Unlock()
+				ch <- platform.StreamChunk{EOF: true, Err: err}
+				return
+			}
+			data := proc.stdoutBuffer
+			proc.stdoutBuffer = nil
+			proc.mu.Unlock()
+
+			if len(data) > 0 {
+				consecutiveEmpty = 0
+				select {
+				case ch <- platform.StreamChunk{Data: data}:
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				consecutiveEmpty++
+				if consecutiveEmpty >= maxConsecutiveEmpty {
+					ch <- platform.StreamChunk{EOF: true}
+					return
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pollInterval):
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// StreamStderr returns a channel that streams stderr chunks from a process.
+func (p *Platform) StreamStderr(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.StreamChunk, error) {
+	proc := p.getProcess(req.ExecID)
+	if proc == nil {
+		return nil, fmt.Errorf("process not found: %s", req.ExecID)
+	}
+
+	pollInterval := defaultStreamPollInterval
+	if req.PollIntervalMs > 0 {
+		pollInterval = time.Duration(req.PollIntervalMs) * time.Millisecond
+	}
+
+	ch := make(chan platform.StreamChunk)
+	go func() {
+		defer close(ch)
+		consecutiveEmpty := 0
+		const maxConsecutiveEmpty = 3
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			proc.mu.Lock()
+			if err := p.fillBuffers(proc); err != nil && !isTimeout(err) {
+				proc.mu.Unlock()
+				ch <- platform.StreamChunk{EOF: true, Err: err}
+				return
+			}
+			data := proc.stderrBuffer
+			proc.stderrBuffer = nil
+			proc.mu.Unlock()
+
+			if len(data) > 0 {
+				consecutiveEmpty = 0
+				select {
+				case ch <- platform.StreamChunk{Data: data}:
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				consecutiveEmpty++
+				if consecutiveEmpty >= maxConsecutiveEmpty {
+					ch <- platform.StreamChunk{EOF: true}
+					return
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pollInterval):
+			}
+		}
+	}()
+	return ch, nil
+}
+
 func applyTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return ctx, func() {}

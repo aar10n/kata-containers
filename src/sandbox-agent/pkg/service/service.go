@@ -65,6 +65,24 @@ type Service interface {
 	CopyFile(ctx context.Context, vmID string, req *agentgrpc.CopyFileRequest) error
 	GetVolumeStats(ctx context.Context, vmID string, req *agentgrpc.VolumeStatsRequest) (*agentgrpc.VolumeStatsResponse, error)
 	ResizeVolume(ctx context.Context, vmID string, req *agentgrpc.ResizeVolumeRequest) error
+
+	// Streaming read operations
+	StreamReadStdout(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error) error
+	StreamReadStderr(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error) error
+}
+
+// StreamReadRequest holds parameters for streaming read operations.
+type StreamReadRequest struct {
+	VMID           string
+	ContainerID    string
+	ExecID         string
+	PollIntervalMs int32
+}
+
+// StreamChunk represents a chunk of streaming output.
+type StreamChunk struct {
+	Data []byte
+	EOF  bool
 }
 
 // CreateSandboxRequest holds parameters for creating a sandbox.
@@ -421,4 +439,60 @@ func (s *service) execTimeout(override time.Duration) time.Duration {
 		return s.config.ExecTimeout
 	}
 	return 30 * time.Second
+}
+
+func (s *service) StreamReadStdout(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error) error {
+	return s.streamReadNative(ctx, req, send, true)
+}
+
+func (s *service) StreamReadStderr(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error) error {
+	return s.streamReadNative(ctx, req, send, false)
+}
+
+// streamReadNative uses the kata-agent's native streaming API for efficient output reading.
+func (s *service) streamReadNative(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error, stdout bool) error {
+	if err := requireVMID(req.VMID); err != nil {
+		return err
+	}
+
+	containerID := req.ContainerID
+	if containerID == "" {
+		containerID = req.VMID
+	}
+
+	streamReq := &agentgrpc.StreamRequest{
+		ContainerId: containerID,
+		ExecId:      req.ExecID,
+	}
+
+	var ch <-chan agent.StreamChunk
+	var err error
+	if stdout {
+		ch, err = s.agentClient.StreamStdout(ctx, req.VMID, streamReq)
+	} else {
+		ch, err = s.agentClient.StreamStderr(ctx, req.VMID, streamReq)
+	}
+	if err != nil {
+		return fmt.Errorf("start stream: %w", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case chunk, ok := <-ch:
+			if !ok {
+				// Channel closed without EOF marker
+				return send(StreamChunk{EOF: true})
+			}
+			if chunk.EOF {
+				return send(StreamChunk{EOF: true})
+			}
+			if len(chunk.Data) > 0 {
+				if err := send(StreamChunk{Data: chunk.Data}); err != nil {
+					return err
+				}
+			}
+		}
+	}
 }

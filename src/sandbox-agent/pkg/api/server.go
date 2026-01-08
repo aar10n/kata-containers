@@ -347,6 +347,121 @@ func (s *Server) ReadStderr(ctx context.Context, req *pb.ReadStderrRequest) (*ag
 	})
 }
 
+func (s *Server) StreamReadStdout(req *pb.StreamReadRequest, stream pb.SandboxAgent_StreamReadStdoutServer) error {
+	vmID := req.GetVmId()
+	if strings.TrimSpace(vmID) == "" {
+		return status.Error(codes.InvalidArgument, "vm_id is required")
+	}
+
+	nodeName, ok := s.svc.NodeForVM(vmID)
+	if !ok {
+		return status.Error(codes.NotFound, "vm id not found")
+	}
+
+	ctx := stream.Context()
+
+	// Local execution
+	if nodeName == s.cfg.NodeName {
+		svcReq := service.StreamReadRequest{
+			VMID:           vmID,
+			ContainerID:    req.GetContainerId(),
+			ExecID:         req.GetExecId(),
+			PollIntervalMs: req.GetPollIntervalMs(),
+		}
+		return s.svc.StreamReadStdout(ctx, svcReq, func(chunk service.StreamChunk) error {
+			return stream.Send(&pb.StreamChunk{
+				Data: chunk.Data,
+				Eof:  chunk.EOF,
+			})
+		})
+	}
+
+	// Remote execution - proxy to the correct node
+	client, conn, err := s.remoteClient(ctx, nodeName)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	remoteStream, err := client.StreamReadStdout(ctx, req)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to open remote stream: %v", err)
+	}
+
+	return forwardStreamChunks(remoteStream, stream)
+}
+
+func (s *Server) StreamReadStderr(req *pb.StreamReadRequest, stream pb.SandboxAgent_StreamReadStderrServer) error {
+	vmID := req.GetVmId()
+	if strings.TrimSpace(vmID) == "" {
+		return status.Error(codes.InvalidArgument, "vm_id is required")
+	}
+
+	nodeName, ok := s.svc.NodeForVM(vmID)
+	if !ok {
+		return status.Error(codes.NotFound, "vm id not found")
+	}
+
+	ctx := stream.Context()
+
+	// Local execution
+	if nodeName == s.cfg.NodeName {
+		svcReq := service.StreamReadRequest{
+			VMID:           vmID,
+			ContainerID:    req.GetContainerId(),
+			ExecID:         req.GetExecId(),
+			PollIntervalMs: req.GetPollIntervalMs(),
+		}
+		return s.svc.StreamReadStderr(ctx, svcReq, func(chunk service.StreamChunk) error {
+			return stream.Send(&pb.StreamChunk{
+				Data: chunk.Data,
+				Eof:  chunk.EOF,
+			})
+		})
+	}
+
+	// Remote execution - proxy to the correct node
+	client, conn, err := s.remoteClient(ctx, nodeName)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	remoteStream, err := client.StreamReadStderr(ctx, req)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to open remote stream: %v", err)
+	}
+
+	return forwardStreamChunks(remoteStream, stream)
+}
+
+type streamChunkReceiver interface {
+	Recv() (*pb.StreamChunk, error)
+}
+
+type streamChunkSender interface {
+	Send(*pb.StreamChunk) error
+}
+
+func forwardStreamChunks(recv streamChunkReceiver, send streamChunkSender) error {
+	for {
+		chunk, err := recv.Recv()
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			// EOF or other error from remote means we're done
+			return nil
+		}
+		if err := send.Send(chunk); err != nil {
+			return err
+		}
+		if chunk.GetEof() {
+			return nil
+		}
+	}
+}
+
 func (s *Server) CloseStdin(ctx context.Context, req *pb.CloseStdinRequest) (*emptypb.Empty, error) {
 	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
 		return s.svc.CloseStdin(ctx, req.GetVmId(), req.GetRequest())

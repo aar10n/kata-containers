@@ -64,8 +64,9 @@ fi
 
 remove_dot_docker_dir=false
 if [ ! -d "$HOME/.docker" ]; then
-	mkdir $HOME/.docker
-	remove_dot_docker_dir=true
+	mkdir -p $HOME/.docker 2>/dev/null || true
+	# Only mark for removal if we successfully created it and it's empty
+	[ -d "$HOME/.docker" ] && [ -z "$(ls -A $HOME/.docker 2>/dev/null)" ] && remove_dot_docker_dir=true
 fi
 
 "${script_dir}"/kata-deploy-copy-yq-installer.sh

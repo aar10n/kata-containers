@@ -389,6 +389,85 @@ func (c *Client) ResizeVolume(ctx context.Context, sandboxID string, req *agentg
 	})
 }
 
+// StreamChunk represents a chunk of streamed data.
+type StreamChunk struct {
+	Data []byte
+	EOF  bool
+}
+
+// StreamStdout streams stdout from a process using the native streaming API.
+// Returns a channel that receives data chunks and a channel for any errors.
+func (c *Client) StreamStdout(ctx context.Context, sandboxID string, req *agentgrpc.StreamRequest) (<-chan StreamChunk, error) {
+	client, err := c.getOrCreateClient(ctx, sandboxID, c.timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	dataCh, errCh := client.StreamStdoutChannel(ctx, req)
+	return c.mergeStreamChannels(ctx, sandboxID, dataCh, errCh), nil
+}
+
+// StreamStderr streams stderr from a process using the native streaming API.
+// Returns a channel that receives data chunks and a channel for any errors.
+func (c *Client) StreamStderr(ctx context.Context, sandboxID string, req *agentgrpc.StreamRequest) (<-chan StreamChunk, error) {
+	client, err := c.getOrCreateClient(ctx, sandboxID, c.timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	dataCh, errCh := client.StreamStderrChannel(ctx, req)
+	return c.mergeStreamChannels(ctx, sandboxID, dataCh, errCh), nil
+}
+
+func (c *Client) mergeStreamChannels(ctx context.Context, sandboxID string, dataCh <-chan []byte, errCh <-chan error) <-chan StreamChunk {
+	outCh := make(chan StreamChunk, 16)
+
+	go func() {
+		defer close(outCh)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case data, ok := <-dataCh:
+				if !ok {
+					// Data channel closed, check for error
+					select {
+					case err := <-errCh:
+						if err != nil {
+							c.invalidateClient(sandboxID)
+						}
+					default:
+					}
+					// Send EOF marker
+					select {
+					case outCh <- StreamChunk{EOF: true}:
+					case <-ctx.Done():
+					}
+					return
+				}
+				select {
+				case outCh <- StreamChunk{Data: data}:
+				case <-ctx.Done():
+					return
+				}
+			case err := <-errCh:
+				if err != nil {
+					c.invalidateClient(sandboxID)
+				}
+				// Send EOF marker on error too
+				select {
+				case outCh <- StreamChunk{EOF: true}:
+				case <-ctx.Done():
+				}
+				return
+			}
+		}
+	}()
+
+	return outCh
+}
+
 func (c *Client) agentURL(sandboxID string, timeout time.Duration) (string, error) {
 	if cached, ok := c.urlCache.Load(sandboxID); ok {
 		entry := cached.(*cachedURL)

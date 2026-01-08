@@ -88,6 +88,11 @@ service SandboxAgent {
   rpc ReadStderr(ReadStderrRequest) returns (grpc.ReadStreamResponse) {
     option (google.api.http) = { post: "/v1/agent/read-stderr" body: "*" };
   }
+
+  // Streaming read operations - server-side streaming for continuous output
+  rpc StreamReadStdout(StreamReadRequest) returns (stream StreamChunk);
+  rpc StreamReadStderr(StreamReadRequest) returns (stream StreamChunk);
+
   rpc CloseStdin(CloseStdinRequest) returns (google.protobuf.Empty) {
     option (google.api.http) = { post: "/v1/agent/close-stdin" body: "*" };
   }
@@ -361,4 +366,17 @@ message GetVolumeStatsRequest {
 message ResizeVolumeRequest {
   string vm_id = 1;
   grpc.ResizeVolumeRequest request = 2;
+}
+
+// Streaming read messages
+message StreamReadRequest {
+  string vm_id = 1;
+  string container_id = 2;
+  string exec_id = 3;
+  int32 poll_interval_ms = 4;  // How often to poll kata-agent (default 50ms)
+}
+
+message StreamChunk {
+  bytes data = 1;
+  bool eof = 2;  // True when process has exited and no more data
 }

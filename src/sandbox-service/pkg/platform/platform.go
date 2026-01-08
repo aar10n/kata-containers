@@ -28,6 +28,9 @@ type Platform interface {
 	KillProcess(ctx context.Context, sessionID, execID string) error
 	IsProcessAlive(ctx context.Context, sessionID, execID string) (bool, error)
 	ResizeProcess(ctx context.Context, sessionID, execID string, rows, columns uint32) error
+
+	StreamStdout(ctx context.Context, req StreamReadRequest) (<-chan StreamChunk, error)
+	StreamStderr(ctx context.Context, req StreamReadRequest) (<-chan StreamChunk, error)
 }
 
 type CreateSandboxRequest struct {
@@ -91,4 +94,18 @@ type Process struct {
 type ProcessOutput struct {
 	Stdout []byte
 	Stderr []byte
+}
+
+// StreamChunk represents a chunk of streaming output.
+type StreamChunk struct {
+	Data []byte
+	EOF  bool
+	Err  error
+}
+
+// StreamReadRequest holds parameters for streaming read operations.
+type StreamReadRequest struct {
+	SessionID      string
+	ExecID         string
+	PollIntervalMs int32
 }

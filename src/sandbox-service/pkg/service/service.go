@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -39,10 +40,37 @@ unset PROMPT_COMMAND
 printf '%s'
 `
 
+// shellWrapperScript is a wrapper that respawns bash when it exits.
+// This handles the case where a user runs 'exit' - the shell restarts automatically.
+// Note: Environment variables and state are lost on restart, which is expected.
+// The wrapper creates a bashrc that initializes each new bash instance.
+const shellWrapperScript = `#!/bin/bash
+# Create init script for each bash instance
+cat > /tmp/.sandbox-bashrc << 'BASHRC'
+bind 'set enable-bracketed-paste off' 2>/dev/null
+stty -echo 2>/dev/null
+export PS1=
+unset PROMPT_COMMAND
+BASHRC
+
+trap '' INT  # Ignore SIGINT in wrapper, let inner bash handle it
+first=1
+while true; do
+    if [ "$first" = "1" ]; then
+        first=0
+    else
+        # Print restart message to stderr so it doesn't interfere with markers
+        printf '\n[Shell exited, restarting with fresh state...]\n' >&2
+    fi
+    bash --rcfile /tmp/.sandbox-bashrc -i
+done
+`
+
 const pythonREPLWrapper = `#!/usr/bin/env python3
 """
 REPL wrapper for sandbox-service.
 Reads code blocks delimited by <<<EXEC>>>, executes them, and outputs <<<DONE>>>.
+Automatically handles exit()/sys.exit() by resetting state and continuing.
 """
 import sys
 import traceback
@@ -51,10 +79,16 @@ import io
 # Global context for persistent state
 __context__ = {'__builtins__': __builtins__}
 
+def reset_context():
+    """Reset the global context to a fresh state."""
+    global __context__
+    __context__ = {'__builtins__': __builtins__}
+
 def execute_code(code):
-    """Execute code and return (stdout, stderr)."""
+    """Execute code and return (stdout, stderr, should_reset)."""
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
+    should_reset = False
 
     old_stdout, old_stderr = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = stdout_capture, stderr_capture
@@ -70,12 +104,17 @@ def execute_code(code):
             # Fall back to exec for statements
             compiled = compile(code, '<repl>', 'exec')
             exec(compiled, __context__)
+    except SystemExit as e:
+        # Handle exit() / sys.exit() - reset state but don't actually exit
+        exit_code = e.code if e.code is not None else 0
+        print(f"[Python REPL reset - exit({exit_code}) called, state cleared]", file=sys.stderr)
+        should_reset = True
     except Exception:
         traceback.print_exc()
     finally:
         sys.stdout, sys.stderr = old_stdout, old_stderr
 
-    return stdout_capture.getvalue(), stderr_capture.getvalue()
+    return stdout_capture.getvalue(), stderr_capture.getvalue(), should_reset
 
 def main():
     code_buffer = []
@@ -85,13 +124,17 @@ def main():
             code = ''.join(code_buffer)
             code_buffer = []
 
-            stdout, stderr = execute_code(code)
+            stdout, stderr, should_reset = execute_code(code)
 
             # Output results
             if stdout:
                 sys.stdout.write(stdout)
             if stderr:
                 sys.stderr.write(stderr)
+
+            # Reset context if exit() was called
+            if should_reset:
+                reset_context()
 
             # Signal completion
             sys.stdout.write('<<<DONE>>>\n')
@@ -192,6 +235,15 @@ type SessionInfo struct {
 	LastUsedAt time.Time
 }
 
+// OutputChunk represents a chunk of streaming output.
+type OutputChunk struct {
+	Stdout   []byte
+	Stderr   []byte
+	Done     bool
+	ExitCode int
+	Error    string
+}
+
 func New(p platform.Platform, defaultImage string, defaultCommand []string, mainContainer string, shellContainer string, defaultTimeout time.Duration, maxOutputBytes int, defaultTTL time.Duration, cleanupInterval time.Duration, leaderElection LeaderElectionConfig) *Service {
 	if strings.TrimSpace(mainContainer) == "" {
 		mainContainer = "sandbox"
@@ -275,6 +327,104 @@ func (s *Service) Exec(ctx context.Context, sessionID string, input ExecInput) (
 	return result, nil
 }
 
+// DownloadFile reads a file from the sandbox and returns its contents.
+// The file is read using base64 encoding to safely handle binary content.
+func (s *Service) DownloadFile(ctx context.Context, sessionID, path string) ([]byte, error) {
+	if sessionID == "" {
+		return nil, errors.New("session_id is required")
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("path is required")
+	}
+
+	if err := s.ensureReady(ctx, sessionID, ""); err != nil {
+		return nil, err
+	}
+
+	// Use base64 to safely handle binary files
+	result, err := s.platform.Exec(ctx, platform.ExecRequest{
+		SessionID:     sessionID,
+		ContainerName: s.mainContainer,
+		Command:       []string{"base64", path},
+		Timeout:       s.defaultTimeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if result.ExitCode != 0 {
+		errMsg := strings.TrimSpace(result.Stderr)
+		if errMsg == "" {
+			errMsg = "failed to read file"
+		}
+		return nil, fmt.Errorf("%s", errMsg)
+	}
+
+	// Decode the base64 content
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(result.Stdout))
+	if err != nil {
+		return nil, fmt.Errorf("decode file content: %w", err)
+	}
+
+	return decoded, nil
+}
+
+// UploadFile writes data to a file in the sandbox.
+// If overwrite is false and the file already exists, an error is returned.
+func (s *Service) UploadFile(ctx context.Context, sessionID, path string, data []byte, overwrite bool) error {
+	if sessionID == "" {
+		return errors.New("session_id is required")
+	}
+	if strings.TrimSpace(path) == "" {
+		return errors.New("path is required")
+	}
+
+	if err := s.ensureReady(ctx, sessionID, ""); err != nil {
+		return err
+	}
+
+	// Check if file exists when overwrite is false
+	if !overwrite {
+		checkResult, err := s.platform.Exec(ctx, platform.ExecRequest{
+			SessionID:     sessionID,
+			ContainerName: s.mainContainer,
+			Command:       []string{"test", "-e", path},
+			Timeout:       s.defaultTimeout,
+		})
+		if err != nil {
+			return err
+		}
+		if checkResult.ExitCode == 0 {
+			return fmt.Errorf("file already exists: %s", path)
+		}
+	}
+
+	// Encode data as base64 and write to file
+	encoded := base64.StdEncoding.EncodeToString(data)
+
+	// Use shell to decode base64 and write to file
+	// We use printf to avoid issues with echo and special characters
+	result, err := s.platform.Exec(ctx, platform.ExecRequest{
+		SessionID:     sessionID,
+		ContainerName: s.mainContainer,
+		Command:       []string{"sh", "-c", fmt.Sprintf("printf '%%s' '%s' | base64 -d > '%s'", encoded, path)},
+		Timeout:       s.defaultTimeout,
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.ExitCode != 0 {
+		errMsg := strings.TrimSpace(result.Stderr)
+		if errMsg == "" {
+			errMsg = "failed to write file"
+		}
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	return nil
+}
+
 func (s *Service) ExecShell(ctx context.Context, sessionID, command string, timeout time.Duration) (*ShellResult, error) {
 	if sessionID == "" {
 		return nil, errors.New("session_id is required")
@@ -326,6 +476,172 @@ func (s *Service) ExecShell(ctx context.Context, sessionID, command string, time
 		Output:   output,
 		ExitCode: exitCode,
 	}, nil
+}
+
+// StreamExecShell executes a shell command and streams output via the onChunk callback.
+// The callback is called with each chunk of stdout/stderr data as it becomes available.
+// The final call will have Done=true and include the exit code.
+func (s *Service) StreamExecShell(ctx context.Context, sessionID, command string, timeout time.Duration, onChunk func(OutputChunk)) error {
+	if sessionID == "" {
+		return errors.New("session_id is required")
+	}
+	if strings.TrimSpace(command) == "" {
+		return errors.New("command is required")
+	}
+	if timeout <= 0 {
+		timeout = defaultProcTimeout
+	}
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, s.readyTimeout)
+	defer readyCancel()
+
+	if err := s.ensureReady(readyCtx, sessionID, ""); err != nil {
+		return err
+	}
+
+	proc, err := s.ensureShell(readyCtx, sessionID)
+	if err != nil {
+		return err
+	}
+
+	cmdCtx, cmdCancel := context.WithTimeout(ctx, timeout)
+	defer cmdCancel()
+
+	marker := fmt.Sprintf("__MARKER_%d_%s__", time.Now().UnixNano(), randomString(8))
+	cmdWithMarker := fmt.Sprintf("%s\nprintf '<<<EXIT:%%d:%s>>>\\n' $?\n", command, marker)
+
+	if err := s.platform.WriteToProcess(cmdCtx, sessionID, proc.ExecID, []byte(cmdWithMarker)); err != nil {
+		return err
+	}
+
+	return s.streamUntilMarker(cmdCtx, sessionID, proc.ExecID, marker, onChunk)
+}
+
+// streamUntilMarker reads stdout/stderr and streams chunks until the marker is found.
+// For TTY mode (shell), the kata-agent may return all output on stderr, so we check
+// for the marker in both streams.
+func (s *Service) streamUntilMarker(ctx context.Context, sessionID, execID, marker string, onChunk func(OutputChunk)) error {
+	pattern := regexp.MustCompile(`<<<EXIT:(\d+):` + regexp.QuoteMeta(marker) + `>>>\r?\n?`)
+
+	// Start streaming from both stdout and stderr
+	stdoutCh, err := s.platform.StreamStdout(ctx, platform.StreamReadRequest{
+		SessionID:      sessionID,
+		ExecID:         execID,
+		PollIntervalMs: 50,
+	})
+	if err != nil {
+		return fmt.Errorf("start stdout stream: %w", err)
+	}
+
+	stderrCh, err := s.platform.StreamStderr(ctx, platform.StreamReadRequest{
+		SessionID:      sessionID,
+		ExecID:         execID,
+		PollIntervalMs: 50,
+	})
+	if err != nil {
+		return fmt.Errorf("start stderr stream: %w", err)
+	}
+
+	// For TTY shells, stdout and stderr are merged. The kata-agent may return
+	// all data on either stream (typically stderr for TTY). We buffer both and
+	// check for the marker in either.
+	var pendingOutput bytes.Buffer
+	stdoutDone := false
+	stderrDone := false
+
+	// Helper to check for marker and send final chunks
+	checkAndComplete := func() bool {
+		content := pendingOutput.String()
+		if matches := pattern.FindStringSubmatch(content); matches != nil {
+			// Found marker - extract exit code and send final chunk
+			exitCode, _ := strconv.Atoi(matches[1])
+			output := pattern.ReplaceAllString(content, "")
+			output = normalizeShellOutput(output)
+			if len(output) > 0 {
+				onChunk(OutputChunk{Stdout: []byte(output)})
+			}
+			onChunk(OutputChunk{Done: true, ExitCode: exitCode})
+			return true
+		}
+		return false
+	}
+
+	// Helper to flush buffered output (keeping tail for marker detection)
+	flushPending := func() {
+		if pendingOutput.Len() > 100 {
+			data := pendingOutput.Bytes()
+			sendLen := len(data) - 100
+			if sendLen > 0 {
+				normalized := normalizeShellOutput(string(data[:sendLen]))
+				if len(normalized) > 0 {
+					onChunk(OutputChunk{Stdout: []byte(normalized)})
+				}
+				pendingOutput.Reset()
+				pendingOutput.Write(data[sendLen:])
+			}
+		}
+	}
+
+	for !stdoutDone || !stderrDone {
+		select {
+		case <-ctx.Done():
+			onChunk(OutputChunk{Done: true, ExitCode: -1, Error: "command timed out"})
+			return ctx.Err()
+
+		case chunk, ok := <-stdoutCh:
+			if !ok {
+				stdoutDone = true
+				continue
+			}
+			if chunk.EOF {
+				stdoutDone = true
+				continue
+			}
+			if chunk.Err != nil {
+				onChunk(OutputChunk{Done: true, ExitCode: -1, Error: chunk.Err.Error()})
+				return chunk.Err
+			}
+
+			// For TTY, all output is treated as stdout
+			pendingOutput.Write(chunk.Data)
+			if checkAndComplete() {
+				return nil
+			}
+			flushPending()
+
+		case chunk, ok := <-stderrCh:
+			if !ok {
+				stderrDone = true
+				continue
+			}
+			if chunk.EOF {
+				stderrDone = true
+				continue
+			}
+			if chunk.Err != nil {
+				// Stderr errors are not fatal
+				continue
+			}
+
+			// For TTY shells, stderr may contain all output (including the marker)
+			// so we treat it the same as stdout for marker detection
+			if len(chunk.Data) > 0 {
+				pendingOutput.Write(chunk.Data)
+				if checkAndComplete() {
+					return nil
+				}
+				flushPending()
+			}
+		}
+	}
+
+	// If we get here without finding the marker, something went wrong
+	remaining := normalizeShellOutput(pendingOutput.String())
+	if len(remaining) > 0 {
+		onChunk(OutputChunk{Stdout: []byte(remaining)})
+	}
+	onChunk(OutputChunk{Done: true, ExitCode: -1, Error: "marker not found"})
+	return errors.New("marker not found in output")
 }
 
 func (s *Service) ResetShell(ctx context.Context, sessionID string) error {
@@ -467,6 +783,139 @@ func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeou
 		Output: string(output.Stdout),
 		Error:  string(output.Stderr),
 	}, nil
+}
+
+// StreamExecPython executes Python code and streams output via the onChunk callback.
+// The callback is called with each chunk of stdout/stderr data as it becomes available.
+// The final call will have Done=true.
+func (s *Service) StreamExecPython(ctx context.Context, sessionID, code string, timeout time.Duration, onChunk func(OutputChunk)) error {
+	if sessionID == "" {
+		return errors.New("session_id is required")
+	}
+	if strings.TrimSpace(code) == "" {
+		return errors.New("code is required")
+	}
+	if timeout <= 0 {
+		timeout = defaultProcTimeout
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if err := s.ensureReady(ctx, sessionID, ""); err != nil {
+		return err
+	}
+
+	proc, err := s.ensurePythonREPL(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+
+	payload := code + "\n<<<EXEC>>>\n"
+	if err := s.platform.WriteToProcess(ctx, sessionID, proc.ExecID, []byte(payload)); err != nil {
+		return err
+	}
+
+	return s.streamUntilDone(ctx, sessionID, proc.ExecID, onChunk)
+}
+
+// streamUntilDone reads stdout/stderr and streams chunks until <<<DONE>>> is found.
+func (s *Service) streamUntilDone(ctx context.Context, sessionID, execID string, onChunk func(OutputChunk)) error {
+	// Start streaming from both stdout and stderr
+	stdoutCh, err := s.platform.StreamStdout(ctx, platform.StreamReadRequest{
+		SessionID:      sessionID,
+		ExecID:         execID,
+		PollIntervalMs: 50,
+	})
+	if err != nil {
+		return fmt.Errorf("start stdout stream: %w", err)
+	}
+
+	stderrCh, err := s.platform.StreamStderr(ctx, platform.StreamReadRequest{
+		SessionID:      sessionID,
+		ExecID:         execID,
+		PollIntervalMs: 50,
+	})
+	if err != nil {
+		return fmt.Errorf("start stderr stream: %w", err)
+	}
+
+	var pendingStdout bytes.Buffer
+	stdoutDone := false
+	stderrDone := false
+	const doneMarker = "<<<DONE>>>\n"
+
+	for !stdoutDone || !stderrDone {
+		select {
+		case <-ctx.Done():
+			onChunk(OutputChunk{Done: true, ExitCode: -1, Error: "execution timed out"})
+			return ctx.Err()
+
+		case chunk, ok := <-stdoutCh:
+			if !ok {
+				stdoutDone = true
+				continue
+			}
+			if chunk.EOF {
+				stdoutDone = true
+				continue
+			}
+			if chunk.Err != nil {
+				onChunk(OutputChunk{Done: true, ExitCode: -1, Error: chunk.Err.Error()})
+				return chunk.Err
+			}
+
+			// Check if we have the done marker
+			pendingStdout.Write(chunk.Data)
+			content := pendingStdout.String()
+
+			if idx := strings.Index(content, doneMarker); idx >= 0 {
+				// Found marker - send remaining output and complete
+				output := content[:idx]
+				if len(output) > 0 {
+					onChunk(OutputChunk{Stdout: []byte(output)})
+				}
+				onChunk(OutputChunk{Done: true, ExitCode: 0})
+				return nil
+			}
+
+			// Send what we have so far (keep last part in case marker is split)
+			if pendingStdout.Len() > len(doneMarker) {
+				data := pendingStdout.Bytes()
+				sendLen := len(data) - len(doneMarker)
+				if sendLen > 0 {
+					onChunk(OutputChunk{Stdout: data[:sendLen]})
+					pendingStdout.Reset()
+					pendingStdout.Write(data[sendLen:])
+				}
+			}
+
+		case chunk, ok := <-stderrCh:
+			if !ok {
+				stderrDone = true
+				continue
+			}
+			if chunk.EOF {
+				stderrDone = true
+				continue
+			}
+			if chunk.Err != nil {
+				// Stderr errors are not fatal
+				continue
+			}
+			if len(chunk.Data) > 0 {
+				onChunk(OutputChunk{Stderr: chunk.Data})
+			}
+		}
+	}
+
+	// If we get here without finding the marker, send remaining and complete with error
+	remaining := pendingStdout.String()
+	if len(remaining) > 0 {
+		onChunk(OutputChunk{Stdout: []byte(remaining)})
+	}
+	onChunk(OutputChunk{Done: true, ExitCode: -1, Error: "done marker not found"})
+	return errors.New("done marker not found in output")
 }
 
 func (s *Service) ResetPython(ctx context.Context, sessionID string) error {
@@ -713,19 +1162,24 @@ func (s *Service) ensureShell(ctx context.Context, sessionID string) (*ProcessSt
 		s.mu.Unlock()
 	}
 
+	// Inject the shell wrapper script that respawns bash on exit
+	wrapperPath := "/tmp/shell-wrapper.sh"
+	_, err := s.platform.Exec(ctx, platform.ExecRequest{
+		SessionID:     sessionID,
+		ContainerName: s.shellContainer,
+		Command:       []string{"/bin/sh", "-c", fmt.Sprintf("cat > %s << 'WRAPPER_EOF'\n%s\nWRAPPER_EOF\nchmod +x %s", wrapperPath, shellWrapperScript, wrapperPath)},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to inject shell wrapper: %w", err)
+	}
+
 	proc, err := s.platform.StartProcess(ctx, platform.StartProcessRequest{
 		SessionID:     sessionID,
 		ContainerName: s.shellContainer,
 		ExecID:        fmt.Sprintf("%s-shell", sessionID),
-		Command: []string{
-			"/usr/bin/env",
-			"bash",
-			"--noprofile",
-			"--norc",
-			"-i",
-		},
-		Env:      []string{"PS1=", "PROMPT_COMMAND=", "TERM=xterm-256color"},
-		Terminal: true,
+		Command:       []string{wrapperPath},
+		Env:           []string{"PS1=", "PROMPT_COMMAND=", "TERM=xterm-256color"},
+		Terminal:      true,
 	})
 	if err != nil {
 		return nil, err

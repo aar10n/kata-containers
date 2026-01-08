@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -217,13 +218,17 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		{http.MethodDelete, "", s.handleDeleteSession},
 		{http.MethodPost, "exec", s.handleExecRoute},
 		{http.MethodGet, "status", s.handleStatusRoute},
+		{http.MethodGet, "download_file", s.handleDownloadFileRoute},
+		{http.MethodPost, "upload_file", s.handleUploadFileRoute},
 		{http.MethodPost, "shell", s.handleShellExecRoute},
+		{http.MethodGet, "shell/stream", s.handleShellStreamRoute},
 		{http.MethodPost, "shell/reset", s.handleShellResetRoute},
 		{http.MethodGet, "shell/status", s.handleShellStatusRoute},
 		{http.MethodPost, "shell/resize", s.handleShellResizeRoute},
 		{http.MethodPost, "shell/jobs", s.handleStartJobRoute},
 		{http.MethodGet, "shell/jobs", s.handleListJobsRoute},
 		{http.MethodPost, "repl/python", s.handlePythonExecRoute},
+		{http.MethodGet, "repl/python/stream", s.handlePythonStreamRoute},
 		{http.MethodPost, "repl/python/reset", s.handlePythonResetRoute},
 		{http.MethodGet, "repl/python/status", s.handlePythonStatusRoute},
 	}
@@ -269,8 +274,20 @@ func (s *Server) handleStatusRoute(w http.ResponseWriter, r *http.Request, p rou
 	s.handleStatus(w, r, p.sessionID)
 }
 
+func (s *Server) handleDownloadFileRoute(w http.ResponseWriter, r *http.Request, p routeParams) {
+	s.handleDownloadFile(w, r, p.sessionID)
+}
+
+func (s *Server) handleUploadFileRoute(w http.ResponseWriter, r *http.Request, p routeParams) {
+	s.handleUploadFile(w, r, p.sessionID)
+}
+
 func (s *Server) handleShellExecRoute(w http.ResponseWriter, r *http.Request, p routeParams) {
 	s.handleShellExec(w, r, p.sessionID)
+}
+
+func (s *Server) handleShellStreamRoute(w http.ResponseWriter, r *http.Request, p routeParams) {
+	s.handleShellStream(w, r, p.sessionID)
 }
 
 func (s *Server) handleShellResetRoute(w http.ResponseWriter, r *http.Request, p routeParams) {
@@ -309,6 +326,10 @@ func (s *Server) handlePythonExecRoute(w http.ResponseWriter, r *http.Request, p
 	s.handlePythonExec(w, r, p.sessionID)
 }
 
+func (s *Server) handlePythonStreamRoute(w http.ResponseWriter, r *http.Request, p routeParams) {
+	s.handlePythonStream(w, r, p.sessionID)
+}
+
 func (s *Server) handlePythonResetRoute(w http.ResponseWriter, r *http.Request, p routeParams) {
 	s.handlePythonReset(w, r, p.sessionID)
 }
@@ -344,6 +365,77 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, sessionID st
 		ExitCode: result.ExitCode,
 		Stdout:   result.Stdout,
 		Stderr:   result.Stderr,
+	})
+}
+
+func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request, sessionID string) {
+	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	if path == "" {
+		writeError(w, http.StatusBadRequest, "path parameter is required")
+		return
+	}
+
+	data, err := s.svc.DownloadFile(r.Context(), sessionID, path)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	// Extract filename from path for Content-Disposition header
+	filename := path
+	if idx := strings.LastIndex(path, "/"); idx >= 0 {
+		filename = path[idx+1:]
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request, sessionID string) {
+	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	if path == "" {
+		writeError(w, http.StatusBadRequest, "path parameter is required")
+		return
+	}
+
+	overwrite := r.URL.Query().Get("overwrite") == "true"
+
+	// Parse multipart form with 32MB max memory
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "file field is required")
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read file: "+err.Error())
+		return
+	}
+
+	if err := s.svc.UploadFile(r.Context(), sessionID, path, data, overwrite); err != nil {
+		// Check if it's a "file already exists" error
+		if strings.Contains(err.Error(), "file already exists") {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"uploaded": true,
+		"path":     path,
+		"size":     len(data),
 	})
 }
 
@@ -464,6 +556,108 @@ func (s *Server) handlePythonStatus(w http.ResponseWriter, r *http.Request, sess
 		LastUsedAt: formatTime(status.LastUsedAt),
 		Message:    status.Message,
 	})
+}
+
+// SSE streaming types
+type SSEStdoutEvent struct {
+	Data string `json:"data"` // base64 encoded
+}
+
+type SSEStderrEvent struct {
+	Data string `json:"data"` // base64 encoded
+}
+
+type SSEDoneEvent struct {
+	ExitCode int    `json:"exit_code"`
+	Error    string `json:"error,omitempty"`
+}
+
+func (s *Server) handleShellStream(w http.ResponseWriter, r *http.Request, sessionID string) {
+	command := strings.TrimSpace(r.URL.Query().Get("command"))
+	if command == "" {
+		writeError(w, http.StatusBadRequest, "command parameter is required")
+		return
+	}
+
+	timeout := time.Duration(0)
+	if timeoutMs := r.URL.Query().Get("timeout_ms"); timeoutMs != "" {
+		if ms, err := strconv.ParseInt(timeoutMs, 10, 64); err == nil && ms > 0 {
+			timeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+
+	s.streamExec(w, r, sessionID, command, "", timeout, true)
+}
+
+func (s *Server) handlePythonStream(w http.ResponseWriter, r *http.Request, sessionID string) {
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "code parameter is required")
+		return
+	}
+
+	timeout := time.Duration(0)
+	if timeoutMs := r.URL.Query().Get("timeout_ms"); timeoutMs != "" {
+		if ms, err := strconv.ParseInt(timeoutMs, 10, 64); err == nil && ms > 0 {
+			timeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+
+	s.streamExec(w, r, sessionID, "", code, timeout, false)
+}
+
+func (s *Server) streamExec(w http.ResponseWriter, r *http.Request, sessionID, command, code string, timeout time.Duration, isShell bool) {
+	// Check if client supports SSE
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ctx := r.Context()
+
+	// Send chunks as SSE events
+	sendChunk := func(chunk service.OutputChunk) {
+		if len(chunk.Stdout) > 0 {
+			writeSSEEvent(w, "stdout", SSEStdoutEvent{Data: string(chunk.Stdout)})
+			flusher.Flush()
+		}
+		if len(chunk.Stderr) > 0 {
+			writeSSEEvent(w, "stderr", SSEStderrEvent{Data: string(chunk.Stderr)})
+			flusher.Flush()
+		}
+		if chunk.Done {
+			writeSSEEvent(w, "done", SSEDoneEvent{ExitCode: chunk.ExitCode, Error: chunk.Error})
+			flusher.Flush()
+		}
+	}
+
+	var err error
+	if isShell {
+		err = s.svc.StreamExecShell(ctx, sessionID, command, timeout, sendChunk)
+	} else {
+		err = s.svc.StreamExecPython(ctx, sessionID, code, timeout, sendChunk)
+	}
+
+	if err != nil && !errors.Is(err, context.Canceled) {
+		// Send error as final event if not already sent
+		writeSSEEvent(w, "error", ErrorResponse{Error: err.Error()})
+		flusher.Flush()
+	}
+}
+
+func writeSSEEvent(w http.ResponseWriter, event string, data any) {
+	jsonData, _ := json.Marshal(data)
+	_, _ = w.Write([]byte("event: " + event + "\n"))
+	_, _ = w.Write([]byte("data: " + string(jsonData) + "\n\n"))
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, sessionID string) {

@@ -5,6 +5,7 @@ go 1.25.1
 require (
 	github.com/containerd/containerd v1.7.29
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.1
 	github.com/kata-containers/kata-containers/src/runtime v0.0.0
 	github.com/spf13/pflag v1.0.10
@@ -16,6 +17,7 @@ require (
 	k8s.io/api v0.33.0
 	k8s.io/apimachinery v0.33.0
 	k8s.io/client-go v0.33.0
+	k8s.io/cri-api v0.33.0
 )
 
 require (

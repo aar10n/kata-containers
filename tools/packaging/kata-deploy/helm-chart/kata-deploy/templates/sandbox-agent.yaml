@@ -26,6 +26,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 data:
   config.yaml: |
+    mode: {{ .Values.sandboxAgent.mode | default "kata" | quote }}
     http:
       addr: ":8080"
     grpc:
@@ -33,15 +34,26 @@ data:
       dial_timeout: {{ .Values.sandboxAgent.grpcDialTimeout | default "5s" | quote }}
     kubernetes:
       resync_interval: {{ .Values.sandboxAgent.resyncInterval | default "5m" | quote }}
+    {{- if eq (.Values.sandboxAgent.mode | default "kata") "kata" }}
     agent:
       timeout: {{ .Values.sandboxAgent.agentTimeout | default "10s" | quote }}
       read_chunk_size: {{ .Values.sandboxAgent.readChunkSize | default 4096 }}
       max_output_size: {{ .Values.sandboxAgent.maxOutputBytes | default 1048576 }}
+    {{- end }}
+    {{- if eq (.Values.sandboxAgent.mode | default "kata") "pod" }}
+    cri:
+      socket: {{ .Values.sandboxAgent.cri.socket | default "" | quote }}
+      timeout: {{ .Values.sandboxAgent.cri.timeout | default "30s" | quote }}
+    hostfs:
+      kubelet_root: {{ .Values.sandboxAgent.hostfs.kubeletRoot | default "/var/lib/kubelet" | quote }}
+    {{- end }}
     exec:
       timeout: {{ .Values.sandboxAgent.execTimeout | default "30s" | quote }}
     sandbox:
       namespace: {{ .Values.sandboxAgent.sandboxNamespace | quote }}
+      {{- if eq (.Values.sandboxAgent.mode | default "kata") "kata" }}
       runtime_class: {{ .Values.sandboxAgent.runtimeClass | quote }}
+      {{- end }}
       {{- with .Values.sandboxAgent.sandboxNodeSelector }}
       node_selector:
         {{- toYaml . | nindent 8 }}
@@ -130,9 +142,14 @@ spec:
         app.kubernetes.io/name: sandbox-agent
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%v" .Values.sandboxAgent.sandboxNamespace .Values.sandboxAgent.runtimeClass .Values.sandboxAgent.grpcDialTimeout .Values.sandboxAgent.resyncInterval .Values.sandboxAgent.agentTimeout .Values.sandboxAgent.execTimeout .Values.sandboxAgent.maxOutputBytes .Values.sandboxAgent.sandboxNodeSelector | sha256sum }}
+        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%s|%v|%s|%s|%s" .Values.sandboxAgent.mode .Values.sandboxAgent.sandboxNamespace .Values.sandboxAgent.runtimeClass .Values.sandboxAgent.grpcDialTimeout .Values.sandboxAgent.resyncInterval .Values.sandboxAgent.agentTimeout .Values.sandboxAgent.execTimeout .Values.sandboxAgent.maxOutputBytes .Values.sandboxAgent.sandboxNodeSelector .Values.sandboxAgent.cri.socket .Values.sandboxAgent.cri.timeout .Values.sandboxAgent.hostfs.kubeletRoot | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
+      {{- if eq (.Values.sandboxAgent.mode | default "kata") "pod" }}
+      # Pod mode requires hostNetwork to access CRI streaming endpoint
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
 {{- toYaml . | nindent 8 }}
@@ -170,6 +187,8 @@ spec:
             - name: config
               mountPath: /etc/sandbox-agent
               readOnly: true
+            {{- if eq (.Values.sandboxAgent.mode | default "kata") "kata" }}
+            # Kata mode: access to shim management sockets
             - name: shim-sockets
               mountPath: /run/vc/sbs
               readOnly: true
@@ -179,10 +198,24 @@ spec:
             - name: containerd-sock
               mountPath: /run/containerd
               readOnly: true
+            {{- else }}
+            # Pod mode: access to CRI socket and kubelet pods for emptyDir
+            - name: cri-sock
+              mountPath: /run/containerd
+              readOnly: true
+            - name: crio-sock
+              mountPath: /var/run/crio
+              readOnly: true
+            - name: kubelet-pods
+              mountPath: /var/lib/kubelet/pods
+              readOnly: false
+            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ $name }}-config
+        {{- if eq (.Values.sandboxAgent.mode | default "kata") "kata" }}
+        # Kata mode volumes
         - name: shim-sockets
           hostPath:
             path: /run/vc/sbs
@@ -195,4 +228,19 @@ spec:
           hostPath:
             path: /run/containerd
             type: Directory
+        {{- else }}
+        # Pod mode volumes
+        - name: cri-sock
+          hostPath:
+            path: /run/containerd
+            type: DirectoryOrCreate
+        - name: crio-sock
+          hostPath:
+            path: /var/run/crio
+            type: DirectoryOrCreate
+        - name: kubelet-pods
+          hostPath:
+            path: {{ .Values.sandboxAgent.hostfs.kubeletRoot | default "/var/lib/kubelet" }}/pods
+            type: Directory
+        {{- end }}
 {{- end }}

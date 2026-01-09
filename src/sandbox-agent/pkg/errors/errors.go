@@ -10,4 +10,5 @@ var (
 	ErrInvalidArgument  = errors.New("invalid argument")
 	ErrConnectionClosed = errors.New("connection closed")
 	ErrEOF              = errors.New("end of stream")
+	ErrNotSupported     = errors.New("operation not supported")
 )

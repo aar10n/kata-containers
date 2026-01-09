@@ -3,23 +3,26 @@ package service
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/agent"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/backend"
 	apierrors "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/errors"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/hostfs"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
-	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/shim_mgmt"
-	agenttypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
-	agentgrpc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 )
 
+// Config holds service configuration.
 type Config struct {
 	NodeName    string
 	ExecTimeout time.Duration
+	Mode        string // "kata" or "pod"
 }
 
+// Service defines the sandbox agent service interface.
 type Service interface {
 	// Sandbox lifecycle
 	CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*k8s.SandboxInfo, error)
@@ -28,61 +31,42 @@ type Service interface {
 	ListSandboxes(ctx context.Context, nodeName string) []*k8s.SandboxInfo
 	UpdateSandboxActivity(ctx context.Context, sessionID string) error
 
-	// VM operations
+	// Routing helpers
 	NodeForVM(vmID string) (string, bool)
 	SandboxAgentAddressForNode(nodeName string) (string, bool)
 	ResolveSandboxID(ctx context.Context, containerID string) (string, error)
+
+	// Command execution
 	Exec(ctx context.Context, req ExecRequest) (ExecResponse, error)
-	SaveVMState(ctx context.Context, vmID, statePath string) error
-	RestoreVMState(ctx context.Context, vmID, statePath string) error
-	CreateContainer(ctx context.Context, vmID string, req *agentgrpc.CreateContainerRequest) error
-	StartContainer(ctx context.Context, vmID string, req *agentgrpc.StartContainerRequest) error
-	RemoveContainer(ctx context.Context, vmID string, req *agentgrpc.RemoveContainerRequest) error
-	ExecProcess(ctx context.Context, vmID string, req *agentgrpc.ExecProcessRequest) error
-	SignalProcess(ctx context.Context, vmID string, req *agentgrpc.SignalProcessRequest) error
-	WaitProcess(ctx context.Context, vmID string, req *agentgrpc.WaitProcessRequest) (*agentgrpc.WaitProcessResponse, error)
-	UpdateContainer(ctx context.Context, vmID string, req *agentgrpc.UpdateContainerRequest) error
-	UpdateEphemeralMounts(ctx context.Context, vmID string, req *agentgrpc.UpdateEphemeralMountsRequest) error
-	StatsContainer(ctx context.Context, vmID string, req *agentgrpc.StatsContainerRequest) (*agentgrpc.StatsContainerResponse, error)
-	PauseContainer(ctx context.Context, vmID string, req *agentgrpc.PauseContainerRequest) error
-	ResumeContainer(ctx context.Context, vmID string, req *agentgrpc.ResumeContainerRequest) error
-	WriteStdin(ctx context.Context, vmID string, req *agentgrpc.WriteStreamRequest) (*agentgrpc.WriteStreamResponse, error)
-	ReadStdout(ctx context.Context, vmID string, req *agentgrpc.ReadStreamRequest) (*agentgrpc.ReadStreamResponse, error)
-	ReadStderr(ctx context.Context, vmID string, req *agentgrpc.ReadStreamRequest) (*agentgrpc.ReadStreamResponse, error)
-	CloseStdin(ctx context.Context, vmID string, req *agentgrpc.CloseStdinRequest) error
-	TtyWinResize(ctx context.Context, vmID string, req *agentgrpc.TtyWinResizeRequest) error
-	UpdateInterface(ctx context.Context, vmID string, req *agentgrpc.UpdateInterfaceRequest) (*agenttypes.Interface, error)
-	UpdateRoutes(ctx context.Context, vmID string, req *agentgrpc.UpdateRoutesRequest) (*agentgrpc.Routes, error)
-	ListInterfaces(ctx context.Context, vmID string, req *agentgrpc.ListInterfacesRequest) (*agentgrpc.Interfaces, error)
-	ListRoutes(ctx context.Context, vmID string, req *agentgrpc.ListRoutesRequest) (*agentgrpc.Routes, error)
-	AddARPNeighbors(ctx context.Context, vmID string, req *agentgrpc.AddARPNeighborsRequest) error
-	GetIPTables(ctx context.Context, vmID string, req *agentgrpc.GetIPTablesRequest) (*agentgrpc.GetIPTablesResponse, error)
-	SetIPTables(ctx context.Context, vmID string, req *agentgrpc.SetIPTablesRequest) (*agentgrpc.SetIPTablesResponse, error)
-	GetMetrics(ctx context.Context, vmID string, req *agentgrpc.GetMetricsRequest) (*agentgrpc.Metrics, error)
-	MemAgentMemcgSet(ctx context.Context, vmID string, req *agentgrpc.MemAgentMemcgConfig) error
-	MemAgentCompactSet(ctx context.Context, vmID string, req *agentgrpc.MemAgentCompactConfig) error
-	SetGuestDateTime(ctx context.Context, vmID string, req *agentgrpc.SetGuestDateTimeRequest) error
-	CopyFile(ctx context.Context, vmID string, req *agentgrpc.CopyFileRequest) error
-	GetVolumeStats(ctx context.Context, vmID string, req *agentgrpc.VolumeStatsRequest) (*agentgrpc.VolumeStatsResponse, error)
-	ResizeVolume(ctx context.Context, vmID string, req *agentgrpc.ResizeVolumeRequest) error
 
-	// Streaming read operations
-	StreamReadStdout(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error) error
-	StreamReadStderr(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error) error
-}
+	// Process management (interactive/streaming)
+	StartProcess(ctx context.Context, req StartProcessRequest) (*ProcessInfo, error)
+	WriteToProcess(ctx context.Context, sessionID, processID string, data []byte) error
+	ReadStdout(ctx context.Context, sessionID, processID string, maxBytes int) ([]byte, error)
+	ReadStderr(ctx context.Context, sessionID, processID string, maxBytes int) ([]byte, error)
+	StreamStdout(ctx context.Context, sessionID, processID string) (<-chan backend.StreamChunk, error)
+	StreamStderr(ctx context.Context, sessionID, processID string) (<-chan backend.StreamChunk, error)
+	CloseStdin(ctx context.Context, sessionID, processID string) error
+	KillProcess(ctx context.Context, sessionID, processID string, signal int) error
+	WaitProcess(ctx context.Context, sessionID, processID string) (int32, error)
+	ResizeTerminal(ctx context.Context, sessionID, processID string, rows, cols uint32) error
 
-// StreamReadRequest holds parameters for streaming read operations.
-type StreamReadRequest struct {
-	VMID           string
-	ContainerID    string
-	ExecID         string
-	PollIntervalMs int32
-}
+	// File operations (via emptyDir host access)
+	ReadFile(ctx context.Context, sessionID, path string) ([]byte, error)
+	WriteFile(ctx context.Context, sessionID, path string, content []byte, mode uint32) error
+	ReadArchive(ctx context.Context, sessionID, path string) (io.ReadCloser, error)
+	WriteArchive(ctx context.Context, sessionID, destDir string, tarData io.Reader) error
 
-// StreamChunk represents a chunk of streaming output.
-type StreamChunk struct {
-	Data []byte
-	EOF  bool
+	// VM state operations (kata mode only)
+	SupportsStateOps() bool
+	SaveVMState(ctx context.Context, sessionID, statePath string) error
+	RestoreVMState(ctx context.Context, sessionID, statePath string) error
+
+	// Mode info
+	Mode() string
+
+	// Cleanup
+	Close() error
 }
 
 // CreateSandboxRequest holds parameters for creating a sandbox.
@@ -94,77 +78,68 @@ type CreateSandboxRequest struct {
 	Labels    map[string]string
 }
 
-type service struct {
-	config      Config
-	store       *k8s.Store
-	manager     *k8s.Manager
-	agentClient *agent.Client
-	shimClient  *shim_mgmt.Client
-}
-
-func New(cfg Config, store *k8s.Store, manager *k8s.Manager, agentClient *agent.Client, shimClient *shim_mgmt.Client) Service {
-	if shimClient == nil {
-		shimClient = shim_mgmt.New(shim_mgmt.Config{})
-	}
-	return &service{
-		config:      cfg,
-		store:       store,
-		manager:     manager,
-		agentClient: agentClient,
-		shimClient:  shimClient,
-	}
-}
-
+// ExecRequest holds parameters for command execution.
 type ExecRequest struct {
-	VMID        string
-	ContainerID string
-	Args        []string
-	Env         []string
-	Cwd         string
-	Timeout     time.Duration
+	SessionID string
+	Args      []string
+	Env       []string
+	Cwd       string
+	Timeout   time.Duration
 }
 
+// ExecResponse holds command execution results.
 type ExecResponse struct {
 	Stdout   string
 	Stderr   string
 	ExitCode int32
 }
 
-func (s *service) NodeForVM(vmID string) (string, bool) {
-	return s.store.NodeForVM(vmID)
+// StartProcessRequest holds parameters for starting an interactive process.
+type StartProcessRequest struct {
+	SessionID string
+	Command   []string
+	Env       []string
+	Cwd       string
+	TTY       bool
 }
 
-func (s *service) SandboxAgentAddressForNode(nodeName string) (string, bool) {
-	return s.store.SandboxAgentAddressForNode(nodeName)
+// ProcessInfo holds information about a started process.
+type ProcessInfo struct {
+	ProcessID   string
+	ContainerID string
 }
 
-func (s *service) ResolveSandboxID(ctx context.Context, containerID string) (string, error) {
-	if strings.TrimSpace(containerID) == "" {
-		return "", fmt.Errorf("%w: container id is required", apierrors.ErrInvalidArgument)
-	}
-	sandboxID := k8s.ResolveSandboxIDFromContainerID(containerID)
-	if sandboxID == "" {
-		return "", fmt.Errorf("%w: sandbox id not found", apierrors.ErrNotFound)
-	}
-	return sandboxID, nil
+type service struct {
+	config  Config
+	store   *k8s.Store
+	manager *k8s.Manager
+	backend backend.ExecutionBackend
+	hostfs  *hostfs.HostFS
 }
 
-func (s *service) Exec(ctx context.Context, req ExecRequest) (ExecResponse, error) {
-	if req.VMID == "" {
-		return ExecResponse{}, fmt.Errorf("%w: vm id is required", apierrors.ErrInvalidArgument)
+// New creates a new service instance.
+func New(cfg Config, store *k8s.Store, manager *k8s.Manager, be backend.ExecutionBackend, hfs *hostfs.HostFS) Service {
+	return &service{
+		config:  cfg,
+		store:   store,
+		manager: manager,
+		backend: be,
+		hostfs:  hfs,
 	}
-
-	result, err := s.agentClient.Exec(ctx, req.VMID, req.ContainerID, req.Args, req.Env, req.Cwd, s.execTimeout(req.Timeout))
-	if err != nil {
-		return ExecResponse{}, err
-	}
-
-	return ExecResponse{
-		Stdout:   result.Stdout,
-		Stderr:   result.Stderr,
-		ExitCode: result.ExitCode,
-	}, nil
 }
+
+func (s *service) Mode() string {
+	return s.config.Mode
+}
+
+func (s *service) Close() error {
+	if s.backend != nil {
+		return s.backend.Close()
+	}
+	return nil
+}
+
+// Sandbox lifecycle
 
 func (s *service) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*k8s.SandboxInfo, error) {
 	return s.manager.CreateSandbox(ctx, k8s.CreateSandboxRequest{
@@ -190,7 +165,6 @@ func (s *service) DeleteSandbox(ctx context.Context, sessionID string) error {
 
 func (s *service) ListSandboxes(ctx context.Context, nodeName string) []*k8s.SandboxInfo {
 	sandboxes := s.store.ListSandboxes(nodeName)
-	// Sort by node then session ID for consistent ordering
 	sort.Slice(sandboxes, func(i, j int) bool {
 		if sandboxes[i].Node == sandboxes[j].Node {
 			return sandboxes[i].SessionID < sandboxes[j].SessionID
@@ -204,231 +178,265 @@ func (s *service) UpdateSandboxActivity(ctx context.Context, sessionID string) e
 	return s.manager.UpdateSandboxActivity(ctx, sessionID)
 }
 
-func (s *service) SaveVMState(ctx context.Context, vmID, statePath string) error {
-	if err := requireVMID(vmID); err != nil {
+// Routing helpers
+
+func (s *service) NodeForVM(vmID string) (string, bool) {
+	return s.store.NodeForVM(vmID)
+}
+
+func (s *service) SandboxAgentAddressForNode(nodeName string) (string, bool) {
+	return s.store.SandboxAgentAddressForNode(nodeName)
+}
+
+func (s *service) ResolveSandboxID(ctx context.Context, containerID string) (string, error) {
+	if strings.TrimSpace(containerID) == "" {
+		return "", fmt.Errorf("%w: container id is required", apierrors.ErrInvalidArgument)
+	}
+	sandboxID := k8s.ResolveSandboxIDFromContainerID(containerID)
+	if sandboxID == "" {
+		return "", fmt.Errorf("%w: sandbox id not found", apierrors.ErrNotFound)
+	}
+	return sandboxID, nil
+}
+
+// Command execution
+
+func (s *service) Exec(ctx context.Context, req ExecRequest) (ExecResponse, error) {
+	containerID, err := s.resolveContainerID(req.SessionID)
+	if err != nil {
+		return ExecResponse{}, err
+	}
+
+	result, err := s.backend.Exec(ctx, containerID, req.Args, req.Env, req.Cwd, s.execTimeout(req.Timeout))
+	if err != nil {
+		return ExecResponse{}, err
+	}
+
+	return ExecResponse{
+		Stdout:   result.Stdout,
+		Stderr:   result.Stderr,
+		ExitCode: result.ExitCode,
+	}, nil
+}
+
+// Process management
+
+func (s *service) StartProcess(ctx context.Context, req StartProcessRequest) (*ProcessInfo, error) {
+	containerID, err := s.resolveContainerID(req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	proc, err := s.backend.StartProcess(ctx, containerID, req.Command, req.Env, req.Cwd, req.TTY)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ProcessInfo{
+		ProcessID:   proc.ID,
+		ContainerID: proc.ContainerID,
+	}, nil
+}
+
+func (s *service) WriteToProcess(ctx context.Context, sessionID, processID string, data []byte) error {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
 		return err
 	}
+	return s.backend.WriteToProcess(ctx, containerID, processID, data)
+}
+
+func (s *service) ReadStdout(ctx context.Context, sessionID, processID string, maxBytes int) ([]byte, error) {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.backend.ReadStdout(ctx, containerID, processID, maxBytes)
+}
+
+func (s *service) ReadStderr(ctx context.Context, sessionID, processID string, maxBytes int) ([]byte, error) {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.backend.ReadStderr(ctx, containerID, processID, maxBytes)
+}
+
+func (s *service) StreamStdout(ctx context.Context, sessionID, processID string) (<-chan backend.StreamChunk, error) {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.backend.StreamStdout(ctx, containerID, processID)
+}
+
+func (s *service) StreamStderr(ctx context.Context, sessionID, processID string) (<-chan backend.StreamChunk, error) {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.backend.StreamStderr(ctx, containerID, processID)
+}
+
+func (s *service) CloseStdin(ctx context.Context, sessionID, processID string) error {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return err
+	}
+	return s.backend.CloseStdin(ctx, containerID, processID)
+}
+
+func (s *service) KillProcess(ctx context.Context, sessionID, processID string, signal int) error {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return err
+	}
+	return s.backend.KillProcess(ctx, containerID, processID, signal)
+}
+
+func (s *service) WaitProcess(ctx context.Context, sessionID, processID string) (int32, error) {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return -1, err
+	}
+	return s.backend.WaitProcess(ctx, containerID, processID)
+}
+
+func (s *service) ResizeTerminal(ctx context.Context, sessionID, processID string, rows, cols uint32) error {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return err
+	}
+	return s.backend.ResizeTerminal(ctx, containerID, processID, rows, cols)
+}
+
+// File operations
+
+func (s *service) ReadFile(ctx context.Context, sessionID, path string) ([]byte, error) {
+	if s.hostfs == nil {
+		return nil, fmt.Errorf("%w: file operations not available", apierrors.ErrNotSupported)
+	}
+
+	podUID, ok := s.store.PodUIDForSession(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
+	}
+
+	return s.hostfs.ReadFile(ctx, podUID, path)
+}
+
+func (s *service) WriteFile(ctx context.Context, sessionID, path string, content []byte, mode uint32) error {
+	if s.hostfs == nil {
+		return fmt.Errorf("%w: file operations not available", apierrors.ErrNotSupported)
+	}
+
+	podUID, ok := s.store.PodUIDForSession(sessionID)
+	if !ok {
+		return fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
+	}
+
+	return s.hostfs.WriteFile(ctx, podUID, path, content, modeToFileMode(mode))
+}
+
+func (s *service) ReadArchive(ctx context.Context, sessionID, path string) (io.ReadCloser, error) {
+	if s.hostfs == nil {
+		return nil, fmt.Errorf("%w: file operations not available", apierrors.ErrNotSupported)
+	}
+
+	podUID, ok := s.store.PodUIDForSession(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
+	}
+
+	return s.hostfs.ReadArchive(ctx, podUID, path)
+}
+
+func (s *service) WriteArchive(ctx context.Context, sessionID, destDir string, tarData io.Reader) error {
+	if s.hostfs == nil {
+		return fmt.Errorf("%w: file operations not available", apierrors.ErrNotSupported)
+	}
+
+	podUID, ok := s.store.PodUIDForSession(sessionID)
+	if !ok {
+		return fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
+	}
+
+	return s.hostfs.WriteArchive(ctx, podUID, destDir, tarData)
+}
+
+// VM state operations
+
+func (s *service) SupportsStateOps() bool {
+	return s.backend.SupportsStateOps()
+}
+
+func (s *service) SaveVMState(ctx context.Context, sessionID, statePath string) error {
+	if !s.backend.SupportsStateOps() {
+		return fmt.Errorf("%w: VM state operations not supported in %s mode", apierrors.ErrNotSupported, s.config.Mode)
+	}
+
+	sandboxID, err := s.resolveSandboxID(sessionID)
+	if err != nil {
+		return err
+	}
+
 	if strings.TrimSpace(statePath) == "" {
 		return fmt.Errorf("%w: state path is required", apierrors.ErrInvalidArgument)
 	}
-	return s.shimClient.SaveVMState(ctx, vmID, statePath)
+
+	return s.backend.SaveState(ctx, sandboxID)
 }
 
-func (s *service) RestoreVMState(ctx context.Context, vmID, statePath string) error {
-	if err := requireVMID(vmID); err != nil {
+func (s *service) RestoreVMState(ctx context.Context, sessionID, statePath string) error {
+	if !s.backend.SupportsStateOps() {
+		return fmt.Errorf("%w: VM state operations not supported in %s mode", apierrors.ErrNotSupported, s.config.Mode)
+	}
+
+	sandboxID, err := s.resolveSandboxID(sessionID)
+	if err != nil {
 		return err
 	}
+
 	if strings.TrimSpace(statePath) == "" {
 		return fmt.Errorf("%w: state path is required", apierrors.ErrInvalidArgument)
 	}
-	return s.shimClient.RestoreVMState(ctx, vmID, statePath)
+
+	return s.backend.RestoreState(ctx, sandboxID, statePath)
 }
 
-func (s *service) CreateContainer(ctx context.Context, vmID string, req *agentgrpc.CreateContainerRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.CreateContainer(ctx, vmID, req)
-	})
-}
+// Internal helpers
 
-func (s *service) StartContainer(ctx context.Context, vmID string, req *agentgrpc.StartContainerRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.StartContainer(ctx, vmID, req)
-	})
-}
-
-func (s *service) RemoveContainer(ctx context.Context, vmID string, req *agentgrpc.RemoveContainerRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.RemoveContainer(ctx, vmID, req)
-	})
-}
-
-func (s *service) ExecProcess(ctx context.Context, vmID string, req *agentgrpc.ExecProcessRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.ExecProcess(ctx, vmID, req)
-	})
-}
-
-func (s *service) SignalProcess(ctx context.Context, vmID string, req *agentgrpc.SignalProcessRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.SignalProcess(ctx, vmID, req)
-	})
-}
-
-func (s *service) WaitProcess(ctx context.Context, vmID string, req *agentgrpc.WaitProcessRequest) (*agentgrpc.WaitProcessResponse, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
+func (s *service) resolveContainerID(sessionID string) (string, error) {
+	if sessionID == "" {
+		return "", fmt.Errorf("%w: session id is required", apierrors.ErrInvalidArgument)
 	}
-	return s.agentClient.WaitProcess(ctx, vmID, req)
-}
 
-func (s *service) UpdateContainer(ctx context.Context, vmID string, req *agentgrpc.UpdateContainerRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.UpdateContainer(ctx, vmID, req)
-	})
-}
-
-func (s *service) UpdateEphemeralMounts(ctx context.Context, vmID string, req *agentgrpc.UpdateEphemeralMountsRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.UpdateEphemeralMounts(ctx, vmID, req)
-	})
-}
-
-func (s *service) StatsContainer(ctx context.Context, vmID string, req *agentgrpc.StatsContainerRequest) (*agentgrpc.StatsContainerResponse, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
+	// In pod mode, use container ID from pod status
+	if s.config.Mode == "pod" {
+		containerID, ok := s.store.ContainerIDForSession(sessionID)
+		if !ok {
+			return "", fmt.Errorf("%w: container not found for session", apierrors.ErrNotFound)
+		}
+		return containerID, nil
 	}
-	return s.agentClient.StatsContainer(ctx, vmID, req)
-}
 
-func (s *service) PauseContainer(ctx context.Context, vmID string, req *agentgrpc.PauseContainerRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.PauseContainer(ctx, vmID, req)
-	})
-}
-
-func (s *service) ResumeContainer(ctx context.Context, vmID string, req *agentgrpc.ResumeContainerRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.ResumeContainer(ctx, vmID, req)
-	})
-}
-
-func (s *service) WriteStdin(ctx context.Context, vmID string, req *agentgrpc.WriteStreamRequest) (*agentgrpc.WriteStreamResponse, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
+	// In kata mode, use sandbox ID
+	sandboxID, err := s.resolveSandboxID(sessionID)
+	if err != nil {
+		return "", err
 	}
-	return s.agentClient.WriteStdin(ctx, vmID, req)
+	return sandboxID, nil
 }
 
-func (s *service) ReadStdout(ctx context.Context, vmID string, req *agentgrpc.ReadStreamRequest) (*agentgrpc.ReadStreamResponse, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
+func (s *service) resolveSandboxID(sessionID string) (string, error) {
+	info, ok := s.store.GetSandbox(sessionID)
+	if !ok {
+		return "", fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
 	}
-	return s.agentClient.ReadStdout(ctx, vmID, req)
-}
-
-func (s *service) ReadStderr(ctx context.Context, vmID string, req *agentgrpc.ReadStreamRequest) (*agentgrpc.ReadStreamResponse, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
+	if info.SandboxID == "" {
+		return "", fmt.Errorf("%w: sandbox id not yet available", apierrors.ErrNotFound)
 	}
-	return s.agentClient.ReadStderr(ctx, vmID, req)
-}
-
-func (s *service) CloseStdin(ctx context.Context, vmID string, req *agentgrpc.CloseStdinRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.CloseStdin(ctx, vmID, req)
-	})
-}
-
-func (s *service) TtyWinResize(ctx context.Context, vmID string, req *agentgrpc.TtyWinResizeRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.TtyWinResize(ctx, vmID, req)
-	})
-}
-
-func (s *service) UpdateInterface(ctx context.Context, vmID string, req *agentgrpc.UpdateInterfaceRequest) (*agenttypes.Interface, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
-	}
-	return s.agentClient.UpdateInterface(ctx, vmID, req)
-}
-
-func (s *service) UpdateRoutes(ctx context.Context, vmID string, req *agentgrpc.UpdateRoutesRequest) (*agentgrpc.Routes, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
-	}
-	return s.agentClient.UpdateRoutes(ctx, vmID, req)
-}
-
-func (s *service) ListInterfaces(ctx context.Context, vmID string, req *agentgrpc.ListInterfacesRequest) (*agentgrpc.Interfaces, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
-	}
-	return s.agentClient.ListInterfaces(ctx, vmID, req)
-}
-
-func (s *service) ListRoutes(ctx context.Context, vmID string, req *agentgrpc.ListRoutesRequest) (*agentgrpc.Routes, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
-	}
-	return s.agentClient.ListRoutes(ctx, vmID, req)
-}
-
-func (s *service) AddARPNeighbors(ctx context.Context, vmID string, req *agentgrpc.AddARPNeighborsRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.AddARPNeighbors(ctx, vmID, req)
-	})
-}
-
-func (s *service) GetIPTables(ctx context.Context, vmID string, req *agentgrpc.GetIPTablesRequest) (*agentgrpc.GetIPTablesResponse, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
-	}
-	return s.agentClient.GetIPTables(ctx, vmID, req)
-}
-
-func (s *service) SetIPTables(ctx context.Context, vmID string, req *agentgrpc.SetIPTablesRequest) (*agentgrpc.SetIPTablesResponse, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
-	}
-	return s.agentClient.SetIPTables(ctx, vmID, req)
-}
-
-func (s *service) GetMetrics(ctx context.Context, vmID string, req *agentgrpc.GetMetricsRequest) (*agentgrpc.Metrics, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
-	}
-	return s.agentClient.GetMetrics(ctx, vmID, req)
-}
-
-func (s *service) MemAgentMemcgSet(ctx context.Context, vmID string, req *agentgrpc.MemAgentMemcgConfig) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.MemAgentMemcgSet(ctx, vmID, req)
-	})
-}
-
-func (s *service) MemAgentCompactSet(ctx context.Context, vmID string, req *agentgrpc.MemAgentCompactConfig) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.MemAgentCompactSet(ctx, vmID, req)
-	})
-}
-
-func (s *service) SetGuestDateTime(ctx context.Context, vmID string, req *agentgrpc.SetGuestDateTimeRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.SetGuestDateTime(ctx, vmID, req)
-	})
-}
-
-func (s *service) CopyFile(ctx context.Context, vmID string, req *agentgrpc.CopyFileRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.CopyFile(ctx, vmID, req)
-	})
-}
-
-func (s *service) GetVolumeStats(ctx context.Context, vmID string, req *agentgrpc.VolumeStatsRequest) (*agentgrpc.VolumeStatsResponse, error) {
-	if err := requireVMID(vmID); err != nil {
-		return nil, err
-	}
-	return s.agentClient.GetVolumeStats(ctx, vmID, req)
-}
-
-func (s *service) ResizeVolume(ctx context.Context, vmID string, req *agentgrpc.ResizeVolumeRequest) error {
-	return s.callAgent(ctx, vmID, func(ctx context.Context) error {
-		return s.agentClient.ResizeVolume(ctx, vmID, req)
-	})
-}
-
-func (s *service) callAgent(ctx context.Context, vmID string, fn func(context.Context) error) error {
-	if err := requireVMID(vmID); err != nil {
-		return err
-	}
-	return fn(ctx)
-}
-
-func requireVMID(vmID string) error {
-	if vmID == "" {
-		return fmt.Errorf("%w: vm id is required", apierrors.ErrInvalidArgument)
-	}
-	return nil
+	return info.SandboxID, nil
 }
 
 func (s *service) execTimeout(override time.Duration) time.Duration {
@@ -441,58 +449,9 @@ func (s *service) execTimeout(override time.Duration) time.Duration {
 	return 30 * time.Second
 }
 
-func (s *service) StreamReadStdout(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error) error {
-	return s.streamReadNative(ctx, req, send, true)
-}
-
-func (s *service) StreamReadStderr(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error) error {
-	return s.streamReadNative(ctx, req, send, false)
-}
-
-// streamReadNative uses the kata-agent's native streaming API for efficient output reading.
-func (s *service) streamReadNative(ctx context.Context, req StreamReadRequest, send func(StreamChunk) error, stdout bool) error {
-	if err := requireVMID(req.VMID); err != nil {
-		return err
+func modeToFileMode(mode uint32) os.FileMode {
+	if mode == 0 {
+		return 0644
 	}
-
-	containerID := req.ContainerID
-	if containerID == "" {
-		containerID = req.VMID
-	}
-
-	streamReq := &agentgrpc.StreamRequest{
-		ContainerId: containerID,
-		ExecId:      req.ExecID,
-	}
-
-	var ch <-chan agent.StreamChunk
-	var err error
-	if stdout {
-		ch, err = s.agentClient.StreamStdout(ctx, req.VMID, streamReq)
-	} else {
-		ch, err = s.agentClient.StreamStderr(ctx, req.VMID, streamReq)
-	}
-	if err != nil {
-		return fmt.Errorf("start stream: %w", err)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case chunk, ok := <-ch:
-			if !ok {
-				// Channel closed without EOF marker
-				return send(StreamChunk{EOF: true})
-			}
-			if chunk.EOF {
-				return send(StreamChunk{EOF: true})
-			}
-			if len(chunk.Data) > 0 {
-				if err := send(StreamChunk{Data: chunk.Data}); err != nil {
-					return err
-				}
-			}
-		}
-	}
+	return os.FileMode(mode)
 }

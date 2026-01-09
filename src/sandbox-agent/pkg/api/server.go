@@ -3,16 +3,16 @@ package api
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/api/pb"
+	apierrors "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/errors"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/service"
-	agenttypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
-	agentgrpc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -49,8 +49,13 @@ func (s *Server) Register(grpcServer *grpc.Server) {
 }
 
 func (s *Server) Health(ctx context.Context, _ *emptypb.Empty) (*pb.HealthResponse, error) {
-	return &pb.HealthResponse{Status: "ok"}, nil
+	return &pb.HealthResponse{
+		Status: "ok",
+		Mode:   s.svc.Mode(),
+	}, nil
 }
+
+// Sandbox lifecycle
 
 func (s *Server) CreateSandbox(ctx context.Context, req *pb.CreateSandboxRequest) (*pb.SandboxInfo, error) {
 	if req == nil {
@@ -151,32 +156,43 @@ func sandboxInfoToProto(info *k8s.SandboxInfo) *pb.SandboxInfo {
 	}
 
 	return &pb.SandboxInfo{
-		SessionId:     info.SessionID,
-		SandboxId:     info.SandboxID,
-		Containers:    containers,
-		Status:        string(info.Status),
-		Node:          info.Node,
-		CreatedAtUnix: info.CreatedAt.Unix(),
+		SessionId:      info.SessionID,
+		SandboxId:      info.SandboxID,
+		Containers:     containers,
+		Status:         string(info.Status),
+		Node:           info.Node,
+		CreatedAtUnix:  info.CreatedAt.Unix(),
 		LastUsedAtUnix: info.LastUsedAt.Unix(),
-		Labels:        info.Labels,
+		Labels:         info.Labels,
 	}
 }
+
+// Command execution
 
 func (s *Server) Exec(ctx context.Context, req *pb.ExecRequest) (*pb.ExecResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*pb.ExecResponse, error) {
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		// Fallback for backwards compatibility during migration
+		sessionID = req.GetVmId()
+	}
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return callUnary(ctx, s, sessionID, func(ctx context.Context) (*pb.ExecResponse, error) {
 		resp, err := s.svc.Exec(ctx, service.ExecRequest{
-			VMID:        req.GetVmId(),
-			ContainerID: req.GetContainerId(),
-			Args:        req.GetArgs(),
-			Env:         req.GetEnv(),
-			Cwd:         req.GetCwd(),
-			Timeout:     time.Duration(req.GetTimeoutMs()) * time.Millisecond,
+			SessionID: sessionID,
+			Args:      req.GetArgs(),
+			Env:       req.GetEnv(),
+			Cwd:       req.GetCwd(),
+			Timeout:   time.Duration(req.GetTimeoutMs()) * time.Millisecond,
 		})
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "exec failed: %v", err)
+			return nil, toGRPCError(err)
 		}
 		return &pb.ExecResponse{
 			Stdout:   resp.Stdout,
@@ -188,9 +204,394 @@ func (s *Server) Exec(ctx context.Context, req *pb.ExecRequest) (*pb.ExecRespons
 	})
 }
 
+// Process management
+
+func (s *Server) StartProcess(ctx context.Context, req *pb.StartProcessRequest) (*pb.StartProcessResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return callUnary(ctx, s, sessionID, func(ctx context.Context) (*pb.StartProcessResponse, error) {
+		proc, err := s.svc.StartProcess(ctx, service.StartProcessRequest{
+			SessionID: sessionID,
+			Command:   req.GetCommand(),
+			Env:       req.GetEnv(),
+			Cwd:       req.GetCwd(),
+			TTY:       req.GetTty(),
+		})
+		if err != nil {
+			return nil, toGRPCError(err)
+		}
+		return &pb.StartProcessResponse{
+			ProcessId:   proc.ProcessID,
+			ContainerId: proc.ContainerID,
+		}, nil
+	}, func(ctx context.Context, client pb.SandboxAgentClient) (*pb.StartProcessResponse, error) {
+		return client.StartProcess(ctx, req)
+	})
+}
+
+func (s *Server) WriteToProcess(ctx context.Context, req *pb.WriteToProcessRequest) (*emptypb.Empty, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return s.callEmpty(ctx, sessionID, func(ctx context.Context) error {
+		return s.svc.WriteToProcess(ctx, sessionID, req.GetProcessId(), req.GetData())
+	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
+		_, err := client.WriteToProcess(ctx, req)
+		return err
+	})
+}
+
+func (s *Server) ReadProcessStdout(ctx context.Context, req *pb.ReadProcessOutputRequest) (*pb.ReadProcessOutputResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return callUnary(ctx, s, sessionID, func(ctx context.Context) (*pb.ReadProcessOutputResponse, error) {
+		data, err := s.svc.ReadStdout(ctx, sessionID, req.GetProcessId(), int(req.GetMaxBytes()))
+		if err != nil {
+			return nil, toGRPCError(err)
+		}
+		return &pb.ReadProcessOutputResponse{Data: data}, nil
+	}, func(ctx context.Context, client pb.SandboxAgentClient) (*pb.ReadProcessOutputResponse, error) {
+		return client.ReadProcessStdout(ctx, req)
+	})
+}
+
+func (s *Server) ReadProcessStderr(ctx context.Context, req *pb.ReadProcessOutputRequest) (*pb.ReadProcessOutputResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return callUnary(ctx, s, sessionID, func(ctx context.Context) (*pb.ReadProcessOutputResponse, error) {
+		data, err := s.svc.ReadStderr(ctx, sessionID, req.GetProcessId(), int(req.GetMaxBytes()))
+		if err != nil {
+			return nil, toGRPCError(err)
+		}
+		return &pb.ReadProcessOutputResponse{Data: data}, nil
+	}, func(ctx context.Context, client pb.SandboxAgentClient) (*pb.ReadProcessOutputResponse, error) {
+		return client.ReadProcessStderr(ctx, req)
+	})
+}
+
+func (s *Server) CloseProcessStdin(ctx context.Context, req *pb.CloseProcessStdinRequest) (*emptypb.Empty, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return s.callEmpty(ctx, sessionID, func(ctx context.Context) error {
+		return s.svc.CloseStdin(ctx, sessionID, req.GetProcessId())
+	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
+		_, err := client.CloseProcessStdin(ctx, req)
+		return err
+	})
+}
+
+func (s *Server) KillProcess(ctx context.Context, req *pb.KillProcessRequest) (*emptypb.Empty, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return s.callEmpty(ctx, sessionID, func(ctx context.Context) error {
+		return s.svc.KillProcess(ctx, sessionID, req.GetProcessId(), int(req.GetSignal()))
+	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
+		_, err := client.KillProcess(ctx, req)
+		return err
+	})
+}
+
+func (s *Server) WaitProcess(ctx context.Context, req *pb.WaitProcessRequest) (*pb.WaitProcessResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return callUnary(ctx, s, sessionID, func(ctx context.Context) (*pb.WaitProcessResponse, error) {
+		exitCode, err := s.svc.WaitProcess(ctx, sessionID, req.GetProcessId())
+		if err != nil {
+			return nil, toGRPCError(err)
+		}
+		return &pb.WaitProcessResponse{ExitCode: exitCode}, nil
+	}, func(ctx context.Context, client pb.SandboxAgentClient) (*pb.WaitProcessResponse, error) {
+		return client.WaitProcess(ctx, req)
+	})
+}
+
+func (s *Server) ResizeTerminal(ctx context.Context, req *pb.ResizeTerminalRequest) (*emptypb.Empty, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return s.callEmpty(ctx, sessionID, func(ctx context.Context) error {
+		return s.svc.ResizeTerminal(ctx, sessionID, req.GetProcessId(), req.GetRows(), req.GetCols())
+	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
+		_, err := client.ResizeTerminal(ctx, req)
+		return err
+	})
+}
+
+// File operations
+
+func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.ReadFileResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return callUnary(ctx, s, sessionID, func(ctx context.Context) (*pb.ReadFileResponse, error) {
+		content, err := s.svc.ReadFile(ctx, sessionID, req.GetPath())
+		if err != nil {
+			return nil, toGRPCError(err)
+		}
+		return &pb.ReadFileResponse{Content: content}, nil
+	}, func(ctx context.Context, client pb.SandboxAgentClient) (*pb.ReadFileResponse, error) {
+		return client.ReadFile(ctx, req)
+	})
+}
+
+func (s *Server) WriteFile(ctx context.Context, req *pb.WriteFileRequest) (*emptypb.Empty, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return s.callEmpty(ctx, sessionID, func(ctx context.Context) error {
+		return s.svc.WriteFile(ctx, sessionID, req.GetPath(), req.GetContent(), req.GetMode())
+	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
+		_, err := client.WriteFile(ctx, req)
+		return err
+	})
+}
+
+func (s *Server) ReadArchive(req *pb.ReadArchiveRequest, stream pb.SandboxAgent_ReadArchiveServer) error {
+	if req == nil {
+		return status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	ctx := stream.Context()
+
+	// Check if local
+	info, err := s.svc.GetSandbox(ctx, sessionID)
+	if err != nil {
+		return toGRPCError(err)
+	}
+
+	if info.Node != s.cfg.NodeName {
+		// Remote execution
+		client, conn, err := s.remoteClient(ctx, info.Node)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		remoteStream, err := client.ReadArchive(ctx, req)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to open remote stream: %v", err)
+		}
+
+		for {
+			chunk, err := remoteStream.Recv()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := stream.Send(chunk); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Local execution
+	reader, err := s.svc.ReadArchive(ctx, sessionID, req.GetPath())
+	if err != nil {
+		return toGRPCError(err)
+	}
+	defer reader.Close()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			if err := stream.Send(&pb.ArchiveChunk{Data: buf[:n]}); err != nil {
+				return err
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return status.Errorf(codes.Internal, "read archive: %v", err)
+		}
+	}
+}
+
+func (s *Server) WriteArchive(stream pb.SandboxAgent_WriteArchiveServer) error {
+	ctx := stream.Context()
+
+	// First message should be header
+	first, err := stream.Recv()
+	if err != nil {
+		return status.Error(codes.InvalidArgument, "failed to receive header")
+	}
+
+	header := first.GetHeader()
+	if header == nil {
+		return status.Error(codes.InvalidArgument, "first message must be header")
+	}
+
+	sessionID := header.GetSessionId()
+	if sessionID == "" {
+		return status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	// Check if local
+	info, err := s.svc.GetSandbox(ctx, sessionID)
+	if err != nil {
+		return toGRPCError(err)
+	}
+
+	if info.Node != s.cfg.NodeName {
+		// Remote execution - forward to correct node
+		client, conn, err := s.remoteClient(ctx, info.Node)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		remoteStream, err := client.WriteArchive(ctx)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to open remote stream: %v", err)
+		}
+
+		// Send header
+		if err := remoteStream.Send(first); err != nil {
+			return err
+		}
+
+		// Forward all data
+		for {
+			msg, err := stream.Recv()
+			if err == io.EOF {
+				resp, err := remoteStream.CloseAndRecv()
+				if err != nil {
+					return err
+				}
+				return stream.SendAndClose(resp)
+			}
+			if err != nil {
+				return err
+			}
+			if err := remoteStream.Send(msg); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Local execution - create pipe and stream data
+	pr, pw := io.Pipe()
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer pw.Close()
+		for {
+			msg, err := stream.Recv()
+			if err == io.EOF {
+				errCh <- nil
+				return
+			}
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if data := msg.GetData(); len(data) > 0 {
+				if _, err := pw.Write(data); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+
+	if err := s.svc.WriteArchive(ctx, sessionID, header.GetDestDir(), pr); err != nil {
+		return toGRPCError(err)
+	}
+
+	if err := <-errCh; err != nil {
+		return status.Errorf(codes.Internal, "stream error: %v", err)
+	}
+
+	return stream.SendAndClose(&pb.WriteArchiveResponse{})
+}
+
+// VM state operations (kata mode only)
+
 func (s *Server) SaveVMState(ctx context.Context, req *pb.SaveVMStateRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.SaveVMState(ctx, req.GetVmId(), req.GetPath())
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		sessionID = req.GetVmId() // backwards compatibility
+	}
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return s.callEmpty(ctx, sessionID, func(ctx context.Context) error {
+		return s.svc.SaveVMState(ctx, sessionID, req.GetPath())
 	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
 		_, err := client.SaveVMState(ctx, req)
 		return err
@@ -198,440 +599,26 @@ func (s *Server) SaveVMState(ctx context.Context, req *pb.SaveVMStateRequest) (*
 }
 
 func (s *Server) RestoreVMState(ctx context.Context, req *pb.RestoreVMStateRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.RestoreVMState(ctx, req.GetVmId(), req.GetPath())
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		sessionID = req.GetVmId() // backwards compatibility
+	}
+	if sessionID == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	return s.callEmpty(ctx, sessionID, func(ctx context.Context) error {
+		return s.svc.RestoreVMState(ctx, sessionID, req.GetPath())
 	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
 		_, err := client.RestoreVMState(ctx, req)
 		return err
 	})
 }
 
-func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.CreateContainer(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.CreateContainer(ctx, req)
-		return err
-	})
-}
+// Internal helpers
 
-func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.StartContainer(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.StartContainer(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) RemoveContainer(ctx context.Context, req *pb.RemoveContainerRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.RemoveContainer(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.RemoveContainer(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) ExecProcess(ctx context.Context, req *pb.ExecProcessRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.ExecProcess(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.ExecProcess(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) SignalProcess(ctx context.Context, req *pb.SignalProcessRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.SignalProcess(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.SignalProcess(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) WaitProcess(ctx context.Context, req *pb.WaitProcessRequest) (*agentgrpc.WaitProcessResponse, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.WaitProcessResponse, error) {
-		resp, err := s.svc.WaitProcess(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.WaitProcessResponse, error) {
-		return client.WaitProcess(ctx, req)
-	})
-}
-
-func (s *Server) UpdateContainer(ctx context.Context, req *pb.UpdateContainerRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.UpdateContainer(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.UpdateContainer(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) UpdateEphemeralMounts(ctx context.Context, req *pb.UpdateEphemeralMountsRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.UpdateEphemeralMounts(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.UpdateEphemeralMounts(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) StatsContainer(ctx context.Context, req *pb.StatsContainerRequest) (*agentgrpc.StatsContainerResponse, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.StatsContainerResponse, error) {
-		resp, err := s.svc.StatsContainer(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.StatsContainerResponse, error) {
-		return client.StatsContainer(ctx, req)
-	})
-}
-
-func (s *Server) PauseContainer(ctx context.Context, req *pb.PauseContainerRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.PauseContainer(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.PauseContainer(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) ResumeContainer(ctx context.Context, req *pb.ResumeContainerRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.ResumeContainer(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.ResumeContainer(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) WriteStdin(ctx context.Context, req *pb.WriteStdinRequest) (*agentgrpc.WriteStreamResponse, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.WriteStreamResponse, error) {
-		resp, err := s.svc.WriteStdin(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.WriteStreamResponse, error) {
-		return client.WriteStdin(ctx, req)
-	})
-}
-
-func (s *Server) ReadStdout(ctx context.Context, req *pb.ReadStdoutRequest) (*agentgrpc.ReadStreamResponse, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.ReadStreamResponse, error) {
-		resp, err := s.svc.ReadStdout(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.ReadStreamResponse, error) {
-		return client.ReadStdout(ctx, req)
-	})
-}
-
-func (s *Server) ReadStderr(ctx context.Context, req *pb.ReadStderrRequest) (*agentgrpc.ReadStreamResponse, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.ReadStreamResponse, error) {
-		resp, err := s.svc.ReadStderr(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.ReadStreamResponse, error) {
-		return client.ReadStderr(ctx, req)
-	})
-}
-
-func (s *Server) StreamReadStdout(req *pb.StreamReadRequest, stream pb.SandboxAgent_StreamReadStdoutServer) error {
-	vmID := req.GetVmId()
-	if strings.TrimSpace(vmID) == "" {
-		return status.Error(codes.InvalidArgument, "vm_id is required")
-	}
-
-	nodeName, ok := s.svc.NodeForVM(vmID)
-	if !ok {
-		return status.Error(codes.NotFound, "vm id not found")
-	}
-
-	ctx := stream.Context()
-
-	// Local execution
-	if nodeName == s.cfg.NodeName {
-		svcReq := service.StreamReadRequest{
-			VMID:           vmID,
-			ContainerID:    req.GetContainerId(),
-			ExecID:         req.GetExecId(),
-			PollIntervalMs: req.GetPollIntervalMs(),
-		}
-		return s.svc.StreamReadStdout(ctx, svcReq, func(chunk service.StreamChunk) error {
-			return stream.Send(&pb.StreamChunk{
-				Data: chunk.Data,
-				Eof:  chunk.EOF,
-			})
-		})
-	}
-
-	// Remote execution - proxy to the correct node
-	client, conn, err := s.remoteClient(ctx, nodeName)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	remoteStream, err := client.StreamReadStdout(ctx, req)
-	if err != nil {
-		return status.Errorf(codes.Internal, "failed to open remote stream: %v", err)
-	}
-
-	return forwardStreamChunks(remoteStream, stream)
-}
-
-func (s *Server) StreamReadStderr(req *pb.StreamReadRequest, stream pb.SandboxAgent_StreamReadStderrServer) error {
-	vmID := req.GetVmId()
-	if strings.TrimSpace(vmID) == "" {
-		return status.Error(codes.InvalidArgument, "vm_id is required")
-	}
-
-	nodeName, ok := s.svc.NodeForVM(vmID)
-	if !ok {
-		return status.Error(codes.NotFound, "vm id not found")
-	}
-
-	ctx := stream.Context()
-
-	// Local execution
-	if nodeName == s.cfg.NodeName {
-		svcReq := service.StreamReadRequest{
-			VMID:           vmID,
-			ContainerID:    req.GetContainerId(),
-			ExecID:         req.GetExecId(),
-			PollIntervalMs: req.GetPollIntervalMs(),
-		}
-		return s.svc.StreamReadStderr(ctx, svcReq, func(chunk service.StreamChunk) error {
-			return stream.Send(&pb.StreamChunk{
-				Data: chunk.Data,
-				Eof:  chunk.EOF,
-			})
-		})
-	}
-
-	// Remote execution - proxy to the correct node
-	client, conn, err := s.remoteClient(ctx, nodeName)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	remoteStream, err := client.StreamReadStderr(ctx, req)
-	if err != nil {
-		return status.Errorf(codes.Internal, "failed to open remote stream: %v", err)
-	}
-
-	return forwardStreamChunks(remoteStream, stream)
-}
-
-type streamChunkReceiver interface {
-	Recv() (*pb.StreamChunk, error)
-}
-
-type streamChunkSender interface {
-	Send(*pb.StreamChunk) error
-}
-
-func forwardStreamChunks(recv streamChunkReceiver, send streamChunkSender) error {
-	for {
-		chunk, err := recv.Recv()
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			// EOF or other error from remote means we're done
-			return nil
-		}
-		if err := send.Send(chunk); err != nil {
-			return err
-		}
-		if chunk.GetEof() {
-			return nil
-		}
-	}
-}
-
-func (s *Server) CloseStdin(ctx context.Context, req *pb.CloseStdinRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.CloseStdin(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.CloseStdin(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) TtyWinResize(ctx context.Context, req *pb.TtyWinResizeRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.TtyWinResize(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.TtyWinResize(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) UpdateInterface(ctx context.Context, req *pb.UpdateInterfaceRequest) (*agenttypes.Interface, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agenttypes.Interface, error) {
-		resp, err := s.svc.UpdateInterface(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agenttypes.Interface, error) {
-		return client.UpdateInterface(ctx, req)
-	})
-}
-
-func (s *Server) UpdateRoutes(ctx context.Context, req *pb.UpdateRoutesRequest) (*agentgrpc.Routes, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.Routes, error) {
-		resp, err := s.svc.UpdateRoutes(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.Routes, error) {
-		return client.UpdateRoutes(ctx, req)
-	})
-}
-
-func (s *Server) ListInterfaces(ctx context.Context, req *pb.ListInterfacesRequest) (*agentgrpc.Interfaces, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.Interfaces, error) {
-		resp, err := s.svc.ListInterfaces(ctx, req.GetVmId(), &agentgrpc.ListInterfacesRequest{})
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.Interfaces, error) {
-		return client.ListInterfaces(ctx, req)
-	})
-}
-
-func (s *Server) ListRoutes(ctx context.Context, req *pb.ListRoutesRequest) (*agentgrpc.Routes, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.Routes, error) {
-		resp, err := s.svc.ListRoutes(ctx, req.GetVmId(), &agentgrpc.ListRoutesRequest{})
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.Routes, error) {
-		return client.ListRoutes(ctx, req)
-	})
-}
-
-func (s *Server) AddARPNeighbors(ctx context.Context, req *pb.AddARPNeighborsRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.AddARPNeighbors(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.AddARPNeighbors(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) GetIPTables(ctx context.Context, req *pb.GetIPTablesRequest) (*agentgrpc.GetIPTablesResponse, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.GetIPTablesResponse, error) {
-		resp, err := s.svc.GetIPTables(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.GetIPTablesResponse, error) {
-		return client.GetIPTables(ctx, req)
-	})
-}
-
-func (s *Server) SetIPTables(ctx context.Context, req *pb.SetIPTablesRequest) (*agentgrpc.SetIPTablesResponse, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.SetIPTablesResponse, error) {
-		resp, err := s.svc.SetIPTables(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.SetIPTablesResponse, error) {
-		return client.SetIPTables(ctx, req)
-	})
-}
-
-func (s *Server) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*agentgrpc.Metrics, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.Metrics, error) {
-		resp, err := s.svc.GetMetrics(ctx, req.GetVmId(), &agentgrpc.GetMetricsRequest{})
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.Metrics, error) {
-		return client.GetMetrics(ctx, req)
-	})
-}
-
-func (s *Server) MemAgentMemcgSet(ctx context.Context, req *pb.MemAgentMemcgSetRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.MemAgentMemcgSet(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.MemAgentMemcgSet(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) MemAgentCompactSet(ctx context.Context, req *pb.MemAgentCompactSetRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.MemAgentCompactSet(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.MemAgentCompactSet(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) SetGuestDateTime(ctx context.Context, req *pb.SetGuestDateTimeRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.SetGuestDateTime(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.SetGuestDateTime(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) CopyFile(ctx context.Context, req *pb.CopyFileRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.CopyFile(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.CopyFile(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) GetVolumeStats(ctx context.Context, req *pb.GetVolumeStatsRequest) (*agentgrpc.VolumeStatsResponse, error) {
-	return callUnary(ctx, s, req.GetVmId(), func(ctx context.Context) (*agentgrpc.VolumeStatsResponse, error) {
-		resp, err := s.svc.GetVolumeStats(ctx, req.GetVmId(), req.GetRequest())
-		if err != nil {
-			return nil, err
-		}
-		return resp, nil
-	}, func(ctx context.Context, client pb.SandboxAgentClient) (*agentgrpc.VolumeStatsResponse, error) {
-		return client.GetVolumeStats(ctx, req)
-	})
-}
-
-func (s *Server) ResizeVolume(ctx context.Context, req *pb.ResizeVolumeRequest) (*emptypb.Empty, error) {
-	return s.callEmpty(ctx, req.GetVmId(), func(ctx context.Context) error {
-		return s.svc.ResizeVolume(ctx, req.GetVmId(), req.GetRequest())
-	}, func(ctx context.Context, client pb.SandboxAgentClient) error {
-		_, err := client.ResizeVolume(ctx, req)
-		return err
-	})
-}
-
-func (s *Server) callEmpty(ctx context.Context, vmID string, local func(context.Context) error, remote func(context.Context, pb.SandboxAgentClient) error) (*emptypb.Empty, error) {
-	_, err := call(ctx, s, vmID, func(ctx context.Context) (struct{}, error) {
+func (s *Server) callEmpty(ctx context.Context, sessionID string, local func(context.Context) error, remote func(context.Context, pb.SandboxAgentClient) error) (*emptypb.Empty, error) {
+	_, err := call(ctx, s, sessionID, func(ctx context.Context) (struct{}, error) {
 		return struct{}{}, local(ctx)
 	}, func(ctx context.Context, client pb.SandboxAgentClient) (struct{}, error) {
 		return struct{}{}, remote(ctx, client)
@@ -642,34 +629,38 @@ func (s *Server) callEmpty(ctx context.Context, vmID string, local func(context.
 	return &emptypb.Empty{}, nil
 }
 
-func callUnary[T any](ctx context.Context, s *Server, vmID string, local func(context.Context) (T, error), remote func(context.Context, pb.SandboxAgentClient) (T, error)) (T, error) {
-	return call(ctx, s, vmID, local, remote)
+func callUnary[T any](ctx context.Context, s *Server, sessionID string, local func(context.Context) (T, error), remote func(context.Context, pb.SandboxAgentClient) (T, error)) (T, error) {
+	return call(ctx, s, sessionID, local, remote)
 }
 
-func call[T any](ctx context.Context, s *Server, vmID string, local func(context.Context) (T, error), remote func(context.Context, pb.SandboxAgentClient) (T, error)) (T, error) {
+func call[T any](ctx context.Context, s *Server, sessionID string, local func(context.Context) (T, error), remote func(context.Context, pb.SandboxAgentClient) (T, error)) (T, error) {
 	var zero T
-	if strings.TrimSpace(vmID) == "" {
-		return zero, status.Error(codes.InvalidArgument, "vm_id is required")
+	if strings.TrimSpace(sessionID) == "" {
+		return zero, status.Error(codes.InvalidArgument, "session_id is required")
 	}
 
-	nodeName, ok := s.svc.NodeForVM(vmID)
-	if !ok {
-		return zero, status.Error(codes.NotFound, "vm id not found")
+	// Get sandbox info to determine node
+	info, err := s.svc.GetSandbox(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, k8s.ErrSandboxNotFound) {
+			return zero, status.Error(codes.NotFound, "sandbox not found")
+		}
+		return zero, status.Errorf(codes.Internal, "get sandbox: %v", err)
 	}
 
-	if nodeName == s.cfg.NodeName {
+	if info.Node == "" || info.Node == s.cfg.NodeName {
 		return local(ctx)
 	}
 
 	if shouldRedirect(ctx) {
-		addr, ok := s.svc.SandboxAgentAddressForNode(nodeName)
+		addr, ok := s.svc.SandboxAgentAddressForNode(info.Node)
 		if !ok {
 			return zero, status.Error(codes.Unavailable, "target node address unavailable")
 		}
 		return zero, redirectError(addr, s.httpPort)
 	}
 
-	client, conn, err := s.remoteClient(ctx, nodeName)
+	client, conn, err := s.remoteClient(ctx, info.Node)
 	if err != nil {
 		return zero, err
 	}
@@ -716,4 +707,23 @@ func parseListenPort(listenAddr string) int {
 	}
 
 	return port
+}
+
+func toGRPCError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, apierrors.ErrNotFound) {
+		return status.Error(codes.NotFound, err.Error())
+	}
+	if errors.Is(err, apierrors.ErrInvalidArgument) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	if errors.Is(err, apierrors.ErrNotSupported) {
+		return status.Error(codes.Unimplemented, err.Error())
+	}
+	if errors.Is(err, k8s.ErrSandboxNotFound) {
+		return status.Error(codes.NotFound, err.Error())
+	}
+	return status.Errorf(codes.Internal, "%v", err)
 }

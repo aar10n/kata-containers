@@ -36,6 +36,7 @@ type ContainerInfo struct {
 type SandboxInfo struct {
 	SessionID   string
 	SandboxID   string
+	PodUID      string // Kubernetes pod UID, used for emptyDir volume access
 	Containers  []ContainerInfo
 	Status      SandboxStatus
 	Node        string
@@ -312,6 +313,39 @@ func (s *Store) PodNameForSession(sessionID string) (string, bool) {
 	return info.PodName, true
 }
 
+// PodUIDForSession returns the pod UID for a session.
+// This is used for direct emptyDir volume access on the host.
+func (s *Store) PodUIDForSession(sessionID string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	info, ok := s.sandboxes[sessionID]
+	if !ok {
+		return "", false
+	}
+	return info.PodUID, info.PodUID != ""
+}
+
+// ContainerIDForSession returns the first running container ID for a session.
+// This is used for CRI-based command execution.
+func (s *Store) ContainerIDForSession(sessionID string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	info, ok := s.sandboxes[sessionID]
+	if !ok {
+		return "", false
+	}
+
+	// Return first container ID if available
+	for _, c := range info.Containers {
+		if c.ContainerID != "" {
+			return c.ContainerID, true
+		}
+	}
+	return "", false
+}
+
 func extractPodIDs(pod *corev1.Pod) []string {
 	var ids []string
 
@@ -425,6 +459,11 @@ func (s *Store) extractSandboxInfo(pod *corev1.Pod) *SandboxInfo {
 		}
 	}
 
+	// In pod mode (non-Kata), use pod UID as sandbox ID if no containerd-based ID is available
+	if sandboxID == "" && pod.UID != "" {
+		sandboxID = string(pod.UID)
+	}
+
 	// Extract container info
 	containers := make([]ContainerInfo, 0, len(pod.Status.ContainerStatuses))
 	for _, cs := range pod.Status.ContainerStatuses {
@@ -457,6 +496,7 @@ func (s *Store) extractSandboxInfo(pod *corev1.Pod) *SandboxInfo {
 	return &SandboxInfo{
 		SessionID:  sessionID,
 		SandboxID:  sandboxID,
+		PodUID:     string(pod.UID),
 		Containers: containers,
 		Status:     status,
 		Node:       pod.Spec.NodeName,

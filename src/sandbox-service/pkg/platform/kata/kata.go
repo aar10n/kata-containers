@@ -12,7 +12,6 @@ import (
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/api/pb"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
-	agentgrpc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -41,8 +40,8 @@ type Platform struct {
 	conn              *grpc.ClientConn
 	client            pb.SandboxAgentClient
 	mu                sync.RWMutex
-	processContainers map[string]string            // execID -> containerID
-	sandboxCache      map[string]*cachedSandbox    // sessionID -> cached sandbox
+	processContainers map[string]string         // processID -> containerID
+	sandboxCache      map[string]*cachedSandbox // sessionID -> cached sandbox
 }
 
 // Config holds configuration for the Kata platform.
@@ -158,19 +157,6 @@ func (p *Platform) invalidateCache(sessionID string) {
 	p.mu.Unlock()
 }
 
-// getSandboxIDCached returns the sandboxID for a session, using cache when possible.
-func (p *Platform) getSandboxIDCached(ctx context.Context, sessionID string) (string, error) {
-	if cached := p.getCachedSandbox(sessionID); cached != nil && cached.SandboxID != "" {
-		return cached.SandboxID, nil
-	}
-
-	sandbox, err := p.GetSandbox(ctx, sessionID)
-	if err != nil {
-		return "", err
-	}
-	return sandbox.SandboxID, nil
-}
-
 // DeleteSandbox deletes a sandbox via the agent.
 func (p *Platform) DeleteSandbox(ctx context.Context, sessionID string) error {
 	_, err := p.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
@@ -202,12 +188,10 @@ func (p *Platform) ListSandboxes(ctx context.Context) ([]*platform.Sandbox, erro
 
 // Exec executes a command in a sandbox.
 func (p *Platform) Exec(ctx context.Context, req platform.ExecRequest) (*platform.ExecResult, error) {
-	sandbox, err := p.waitForSandboxReady(ctx, req.SessionID, req.ContainerName)
+	_, err := p.waitForSandboxReady(ctx, req.SessionID, req.ContainerName)
 	if err != nil {
 		return nil, err
 	}
-
-	containerID := getContainerID(sandbox, req.ContainerName)
 
 	var timeoutMs int64
 	if req.Timeout > 0 {
@@ -215,12 +199,11 @@ func (p *Platform) Exec(ctx context.Context, req platform.ExecRequest) (*platfor
 	}
 
 	resp, err := p.client.Exec(ctx, &pb.ExecRequest{
-		VmId:        sandbox.SandboxID,
-		ContainerId: containerID,
-		Args:        req.Command,
-		Env:         mapToEnv(req.Env),
-		Cwd:         req.WorkingDir,
-		TimeoutMs:   timeoutMs,
+		SessionId: req.SessionID,
+		Args:      req.Command,
+		Env:       mapToEnv(req.Env),
+		Cwd:       req.WorkingDir,
+		TimeoutMs: timeoutMs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("exec: %w", err)
@@ -238,35 +221,30 @@ func (p *Platform) Exec(ctx context.Context, req platform.ExecRequest) (*platfor
 
 // StartProcess starts a long-running process in a sandbox.
 func (p *Platform) StartProcess(ctx context.Context, req platform.StartProcessRequest) (*platform.Process, error) {
-	sandbox, err := p.waitForSandboxReady(ctx, req.SessionID, req.ContainerName)
+	_, err := p.waitForSandboxReady(ctx, req.SessionID, req.ContainerName)
 	if err != nil {
 		return nil, err
 	}
 
-	containerID := getContainerID(sandbox, req.ContainerName)
-
-	_, err = p.client.ExecProcess(ctx, &pb.ExecProcessRequest{
-		VmId: sandbox.SandboxID,
-		Request: &agentgrpc.ExecProcessRequest{
-			ContainerId: containerID,
-			ExecId:      req.ExecID,
-			Process: &agentgrpc.Process{
-				Terminal: req.Terminal,
-				Args:     req.Command,
-				Env:      req.Env,
-			},
-		},
+	resp, err := p.client.StartProcess(ctx, &pb.StartProcessRequest{
+		SessionId: req.SessionID,
+		Command:   req.Command,
+		Env:       req.Env,
+		Tty:       req.Terminal,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("exec process: %w", err)
+		return nil, fmt.Errorf("start process: %w", err)
 	}
 
+	processID := resp.GetProcessId()
+	containerID := resp.GetContainerId()
+
 	p.mu.Lock()
-	p.processContainers[req.ExecID] = containerID
+	p.processContainers[processID] = containerID
 	p.mu.Unlock()
 
 	return &platform.Process{
-		ExecID:    req.ExecID,
+		ExecID:    processID,
 		StartedAt: time.Now().UTC(),
 		Alive:     true,
 	}, nil
@@ -274,26 +252,13 @@ func (p *Platform) StartProcess(ctx context.Context, req platform.StartProcessRe
 
 // WriteToProcess writes data to a process stdin.
 func (p *Platform) WriteToProcess(ctx context.Context, sessionID, execID string, data []byte) error {
-	containerID, err := p.getProcessContainer(execID)
-	if err != nil {
-		return err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
-	if err != nil {
-		return err
-	}
-
-	_, err = p.client.WriteStdin(ctx, &pb.WriteStdinRequest{
-		VmId: sandboxID,
-		Request: &agentgrpc.WriteStreamRequest{
-			ContainerId: containerID,
-			ExecId:      execID,
-			Data:        data,
-		},
+	_, err := p.client.WriteToProcess(ctx, &pb.WriteToProcessRequest{
+		SessionId: sessionID,
+		ProcessId: execID,
+		Data:      data,
 	})
 	if err != nil {
-		return fmt.Errorf("write stdin: %w", err)
+		return fmt.Errorf("write to process: %w", err)
 	}
 
 	p.updateActivity(ctx, sessionID)
@@ -303,16 +268,6 @@ func (p *Platform) WriteToProcess(ctx context.Context, sessionID, execID string,
 // ReadFromProcess reads output from a process.
 // Reads stdout and stderr in parallel to avoid blocking on one while the other has data.
 func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string) (*platform.ProcessOutput, error) {
-	containerID, err := p.getProcessContainer(execID)
-	if err != nil {
-		return nil, err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-
 	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
 	defer cancel()
 
@@ -326,13 +281,10 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 	stderrCh := make(chan readResult, 1)
 
 	go func() {
-		resp, err := p.client.ReadStdout(readCtx, &pb.ReadStdoutRequest{
-			VmId: sandboxID,
-			Request: &agentgrpc.ReadStreamRequest{
-				ContainerId: containerID,
-				ExecId:      execID,
-				Len:         4096,
-			},
+		resp, err := p.client.ReadProcessStdout(readCtx, &pb.ReadProcessOutputRequest{
+			SessionId: sessionID,
+			ProcessId: execID,
+			MaxBytes:  4096,
 		})
 		var data []byte
 		if resp != nil {
@@ -342,13 +294,10 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 	}()
 
 	go func() {
-		resp, err := p.client.ReadStderr(readCtx, &pb.ReadStderrRequest{
-			VmId: sandboxID,
-			Request: &agentgrpc.ReadStreamRequest{
-				ContainerId: containerID,
-				ExecId:      execID,
-				Len:         4096,
-			},
+		resp, err := p.client.ReadProcessStderr(readCtx, &pb.ReadProcessOutputRequest{
+			SessionId: sessionID,
+			ProcessId: execID,
+			MaxBytes:  4096,
 		})
 		var data []byte
 		if resp != nil {
@@ -376,26 +325,13 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 
 // ReadStdout reads only stdout from a process with a short timeout for non-blocking behavior.
 func (p *Platform) ReadStdout(ctx context.Context, sessionID, execID string) ([]byte, error) {
-	containerID, err := p.getProcessContainer(execID)
-	if err != nil {
-		return nil, err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-
 	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
 	defer cancel()
 
-	resp, err := p.client.ReadStdout(readCtx, &pb.ReadStdoutRequest{
-		VmId: sandboxID,
-		Request: &agentgrpc.ReadStreamRequest{
-			ContainerId: containerID,
-			ExecId:      execID,
-			Len:         4096,
-		},
+	resp, err := p.client.ReadProcessStdout(readCtx, &pb.ReadProcessOutputRequest{
+		SessionId: sessionID,
+		ProcessId: execID,
+		MaxBytes:  4096,
 	})
 	if err != nil && !isTimeout(err) {
 		return nil, fmt.Errorf("read stdout: %w", err)
@@ -408,26 +344,13 @@ func (p *Platform) ReadStdout(ctx context.Context, sessionID, execID string) ([]
 
 // ReadStderr reads only stderr from a process with a short timeout for non-blocking behavior.
 func (p *Platform) ReadStderr(ctx context.Context, sessionID, execID string) ([]byte, error) {
-	containerID, err := p.getProcessContainer(execID)
-	if err != nil {
-		return nil, err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-
 	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
 	defer cancel()
 
-	resp, err := p.client.ReadStderr(readCtx, &pb.ReadStderrRequest{
-		VmId: sandboxID,
-		Request: &agentgrpc.ReadStreamRequest{
-			ContainerId: containerID,
-			ExecId:      execID,
-			Len:         4096,
-		},
+	resp, err := p.client.ReadProcessStderr(readCtx, &pb.ReadProcessOutputRequest{
+		SessionId: sessionID,
+		ProcessId: execID,
+		MaxBytes:  4096,
 	})
 	if err != nil && !isTimeout(err) {
 		return nil, fmt.Errorf("read stderr: %w", err)
@@ -440,27 +363,14 @@ func (p *Platform) ReadStderr(ctx context.Context, sessionID, execID string) ([]
 
 // KillProcess kills a process.
 func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) error {
-	containerID, err := p.getProcessContainer(execID)
-	if err != nil {
-		return err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
-	if err != nil {
-		return err
-	}
-
 	// Send SIGKILL
-	_, err = p.client.SignalProcess(ctx, &pb.SignalProcessRequest{
-		VmId: sandboxID,
-		Request: &agentgrpc.SignalProcessRequest{
-			ContainerId: containerID,
-			ExecId:      execID,
-			Signal:      9,
-		},
+	_, err := p.client.KillProcess(ctx, &pb.KillProcessRequest{
+		SessionId: sessionID,
+		ProcessId: execID,
+		Signal:    9,
 	})
 	if err != nil {
-		return fmt.Errorf("signal process: %w", err)
+		return fmt.Errorf("kill process: %w", err)
 	}
 
 	// Wait for exit
@@ -468,11 +378,8 @@ func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) er
 	defer cancel()
 
 	_, _ = p.client.WaitProcess(waitCtx, &pb.WaitProcessRequest{
-		VmId: sandboxID,
-		Request: &agentgrpc.WaitProcessRequest{
-			ContainerId: containerID,
-			ExecId:      execID,
-		},
+		SessionId: sessionID,
+		ProcessId: execID,
 	})
 
 	p.mu.Lock()
@@ -484,24 +391,11 @@ func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) er
 
 // IsProcessAlive checks if a process is still running.
 func (p *Platform) IsProcessAlive(ctx context.Context, sessionID, execID string) (bool, error) {
-	containerID, err := p.getProcessContainer(execID)
-	if err != nil {
-		return false, err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
-	if err != nil {
-		return false, err
-	}
-
 	// Send signal 0 to check if alive
-	_, err = p.client.SignalProcess(ctx, &pb.SignalProcessRequest{
-		VmId: sandboxID,
-		Request: &agentgrpc.SignalProcessRequest{
-			ContainerId: containerID,
-			ExecId:      execID,
-			Signal:      0,
-		},
+	_, err := p.client.KillProcess(ctx, &pb.KillProcessRequest{
+		SessionId: sessionID,
+		ProcessId: execID,
+		Signal:    0,
 	})
 	if err != nil {
 		return false, nil // Process is dead
@@ -511,111 +405,100 @@ func (p *Platform) IsProcessAlive(ctx context.Context, sessionID, execID string)
 
 // ResizeProcess resizes a process TTY.
 func (p *Platform) ResizeProcess(ctx context.Context, sessionID, execID string, rows, columns uint32) error {
-	containerID, err := p.getProcessContainer(execID)
-	if err != nil {
-		return err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, sessionID)
-	if err != nil {
-		return err
-	}
-
-	_, err = p.client.TtyWinResize(ctx, &pb.TtyWinResizeRequest{
-		VmId: sandboxID,
-		Request: &agentgrpc.TtyWinResizeRequest{
-			ContainerId: containerID,
-			ExecId:      execID,
-			Row:         rows,
-			Column:      columns,
-		},
+	_, err := p.client.ResizeTerminal(ctx, &pb.ResizeTerminalRequest{
+		SessionId: sessionID,
+		ProcessId: execID,
+		Rows:      rows,
+		Cols:      columns,
 	})
 	if err != nil {
-		return fmt.Errorf("tty resize: %w", err)
+		return fmt.Errorf("resize terminal: %w", err)
 	}
 	return nil
 }
 
 // StreamStdout returns a channel that streams stdout chunks from a process.
+// Note: Streaming is implemented via polling in the new API.
 func (p *Platform) StreamStdout(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.StreamChunk, error) {
-	containerID, err := p.getProcessContainer(req.ExecID)
-	if err != nil {
-		return nil, err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, req.SessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	stream, err := p.client.StreamReadStdout(ctx, &pb.StreamReadRequest{
-		VmId:           sandboxID,
-		ContainerId:    containerID,
-		ExecId:         req.ExecID,
-		PollIntervalMs: req.PollIntervalMs,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("stream stdout: %w", err)
-	}
-
-	return p.streamToChannel(ctx, stream), nil
-}
-
-// StreamStderr returns a channel that streams stderr chunks from a process.
-func (p *Platform) StreamStderr(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.StreamChunk, error) {
-	containerID, err := p.getProcessContainer(req.ExecID)
-	if err != nil {
-		return nil, err
-	}
-
-	sandboxID, err := p.getSandboxIDCached(ctx, req.SessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	stream, err := p.client.StreamReadStderr(ctx, &pb.StreamReadRequest{
-		VmId:           sandboxID,
-		ContainerId:    containerID,
-		ExecId:         req.ExecID,
-		PollIntervalMs: req.PollIntervalMs,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("stream stderr: %w", err)
-	}
-
-	return p.streamToChannel(ctx, stream), nil
-}
-
-type grpcStreamReceiver interface {
-	Recv() (*pb.StreamChunk, error)
-}
-
-func (p *Platform) streamToChannel(ctx context.Context, stream grpcStreamReceiver) <-chan platform.StreamChunk {
 	ch := make(chan platform.StreamChunk)
+	pollInterval := time.Duration(req.PollIntervalMs) * time.Millisecond
+	if pollInterval <= 0 {
+		pollInterval = 50 * time.Millisecond
+	}
+
 	go func() {
 		defer close(ch)
 		for {
-			chunk, err := stream.Recv()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			data, err := p.ReadStdout(ctx, req.SessionID, req.ExecID)
 			if err != nil {
-				// Check for context cancellation
-				if ctx.Err() != nil {
-					return
-				}
-				// EOF or other error - send final chunk
 				ch <- platform.StreamChunk{EOF: true, Err: err}
 				return
 			}
-			select {
-			case ch <- platform.StreamChunk{Data: chunk.GetData(), EOF: chunk.GetEof()}:
-				if chunk.GetEof() {
+			if len(data) > 0 {
+				select {
+				case ch <- platform.StreamChunk{Data: data}:
+				case <-ctx.Done():
 					return
 				}
+			}
+
+			select {
+			case <-time.After(pollInterval):
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-	return ch
+
+	return ch, nil
+}
+
+// StreamStderr returns a channel that streams stderr chunks from a process.
+// Note: Streaming is implemented via polling in the new API.
+func (p *Platform) StreamStderr(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.StreamChunk, error) {
+	ch := make(chan platform.StreamChunk)
+	pollInterval := time.Duration(req.PollIntervalMs) * time.Millisecond
+	if pollInterval <= 0 {
+		pollInterval = 50 * time.Millisecond
+	}
+
+	go func() {
+		defer close(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			data, err := p.ReadStderr(ctx, req.SessionID, req.ExecID)
+			if err != nil {
+				ch <- platform.StreamChunk{EOF: true, Err: err}
+				return
+			}
+			if len(data) > 0 {
+				select {
+				case ch <- platform.StreamChunk{Data: data}:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			select {
+			case <-time.After(pollInterval):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return ch, nil
 }
 
 // waitForSandboxReady waits for a sandbox to be ready using exponential backoff with jitter.
@@ -662,16 +545,6 @@ func (p *Platform) updateActivity(ctx context.Context, sessionID string) {
 	if err != nil {
 		slog.Warn("update activity failed", "session_id", sessionID, "error", err)
 	}
-}
-
-func (p *Platform) getProcessContainer(execID string) (string, error) {
-	p.mu.RLock()
-	containerID, ok := p.processContainers[execID]
-	p.mu.RUnlock()
-	if !ok || strings.TrimSpace(containerID) == "" {
-		return "", platform.ErrNotFound
-	}
-	return containerID, nil
 }
 
 // Helper functions

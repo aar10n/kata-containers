@@ -274,17 +274,46 @@ env:
 node-feature-discovery:
   enabled: false
 
+# CRIU Installer DaemonSet configuration
+# CRIU (Checkpoint/Restore In Userspace) is required for VM snapshot/restore functionality.
+# This DaemonSet installs CRIU on nodes where Kata containers will run.
+criuInstaller:
+  enabled: false
+  image: ubuntu:22.04
+  # Installation method:
+  #   - "package": Install via apt-get (recommended, requires internet access)
+  #   - "binary": Download a static binary from a custom URL
+  # Note: CRIU does not publish official pre-built static binaries.
+  # The "binary" method requires you to provide a URL to a custom-built static binary.
+  method: package
+  # Only used when method is "binary" - URL to download the static CRIU binary
+  # Example: https://your-artifacts-server.com/criu-static
+  binaryUrl: ""
+
 sandboxAgent:
   enabled: true
   image:
     reference: gcr.io/cohere-artifacts/sandbox-agent
     tag: ""
 
+  # Mode: "kata" (Kata VMs with kata-agent) or "pod" (regular pods with CRI)
+  mode: kata
+
   # Sandbox pod configuration
   sandboxNamespace: kata-sandboxes
-  runtimeClass: kata-qemu
+  runtimeClass: kata-qemu  # Only used in kata mode
   sandboxNodeSelector:
     katacontainers.io/kata-runtime: "true"
+
+  # CRI configuration (pod mode only)
+  cri:
+    # Socket path - auto-detected if empty (tries containerd then CRI-O)
+    socket: ""
+    timeout: "30s"
+
+  # Host filesystem configuration (pod mode only, for emptyDir access)
+  hostfs:
+    kubeletRoot: "/var/lib/kubelet"
 
 sandboxService:
   enabled: true

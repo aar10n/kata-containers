@@ -17,6 +17,13 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+const (
+	// SandboxDataVolumeName is the name of the emptyDir volume for sandbox data.
+	SandboxDataVolumeName = "sandbox-data"
+	// SandboxDataMountPath is the mount path inside the container for the data volume.
+	SandboxDataMountPath = "/data"
+)
+
 var (
 	ErrSandboxNotFound      = errors.New("sandbox not found")
 	ErrSandboxAlreadyExists = errors.New("sandbox already exists")
@@ -27,6 +34,9 @@ type ManagerConfig struct {
 	Namespace        string
 	RuntimeClassName string
 	NodeSelector     map[string]string
+	// PodMode indicates whether to create regular pods (true) or Kata VMs (false).
+	// When true, RuntimeClassName is not set and emptyDir volumes are added.
+	PodMode bool
 }
 
 // Manager handles K8s pod CRUD operations for sandboxes.
@@ -92,6 +102,44 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 	}
 
 	podName := podNameForSession(sessionID)
+
+	// Build container spec
+	container := corev1.Container{
+		Name:    "sandbox",
+		Image:   image,
+		Command: command,
+		Env:     mapToEnvVars(req.Env),
+	}
+
+	// Build pod spec
+	podSpec := corev1.PodSpec{
+		NodeSelector:  copyMap(m.config.NodeSelector),
+		Containers:    []corev1.Container{container},
+		RestartPolicy: corev1.RestartPolicyNever,
+	}
+
+	// Configure based on mode
+	if m.config.PodMode {
+		// Pod mode: add emptyDir volume for data, no RuntimeClassName
+		podSpec.Volumes = []corev1.Volume{
+			{
+				Name: SandboxDataVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		}
+		podSpec.Containers[0].VolumeMounts = []corev1.VolumeMount{
+			{
+				Name:      SandboxDataVolumeName,
+				MountPath: SandboxDataMountPath,
+			},
+		}
+	} else {
+		// Kata mode: set RuntimeClassName if configured
+		podSpec.RuntimeClassName = runtimeClassName(m.config.RuntimeClassName)
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        podName,
@@ -99,19 +147,7 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 			Labels:      labels,
 			Annotations: annotations,
 		},
-		Spec: corev1.PodSpec{
-			RuntimeClassName: runtimeClassName(m.config.RuntimeClassName),
-			NodeSelector:     copyMap(m.config.NodeSelector),
-			Containers: []corev1.Container{
-				{
-					Name:    "sandbox",
-					Image:   image,
-					Command: command,
-					Env:     mapToEnvVars(req.Env),
-				},
-			},
-			RestartPolicy: corev1.RestartPolicyNever,
-		},
+		Spec: podSpec,
 	}
 
 	created, err := m.client.CoreV1().Pods(m.config.Namespace).Create(ctx, pod, metav1.CreateOptions{})
@@ -126,6 +162,7 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 	return &SandboxInfo{
 		SessionID:  sessionID,
 		SandboxID:  "", // Not yet available
+		PodUID:     string(created.UID),
 		Containers: nil,
 		Status:     SandboxStatusPending,
 		Node:       created.Spec.NodeName,

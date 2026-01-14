@@ -1,0 +1,11 @@
+# Helm values override for load testing
+# Disables snapshot storage to prevent auto-save on delete
+#
+# Usage: helm upgrade kata ./tools/packaging/kata-deploy/helm-chart/kata-deploy \
+#          -f kata-snapshot-poc-values.yaml \
+#          -f load-test/values-loadtest.yaml
+
+sandboxAgent:
+  # Disable storage to prevent auto-save snapshots on pod deletion
+  storage:
+    enabled: false

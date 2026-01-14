@@ -1,0 +1,279 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-profiles-test
+  namespace: kata-system
+data:
+  k6-profiles.js: |
+    // Profile-based load test - see load-test/k6-profiles.js for full version
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Trend, Counter, Rate } from 'k6/metrics';
+
+    const sandboxCreateLatency = new Trend('sandbox_create_latency', true);
+    const commandLatency = new Trend('command_latency', true);
+    const pythonLatency = new Trend('python_latency', true);
+    const errors = new Counter('errors');
+    const successRate = new Rate('success_rate');
+    const commandsExecuted = new Counter('commands_executed');
+
+    const BASE_URL = __ENV.BASE_URL || 'http://kata-deploy-sandbox-service.kata-system:8080';
+    const SCENARIO = __ENV.SCENARIO || 'smoke';
+
+    // User profiles
+    const PROFILES = {
+      occasional: { commandInterval: [15, 30], pythonProb: 0.1, pythonHeavy: false },
+      steady: { commandInterval: [3, 6], batchSize: [2, 4], pythonProb: 0.3, pythonHeavy: false },
+      light_python: { commandInterval: [5, 10], pythonProb: 0.8, pythonHeavy: false },
+      heavy_python: { commandInterval: [8, 15], pythonProb: 0.9, pythonHeavy: true },
+      bursty: { commandInterval: [0.5, 1], batchSize: [5, 10], burstPause: [10, 20], pythonProb: 0.2, pythonHeavy: false },
+    };
+
+    // Scenario configurations
+    const SCENARIOS = {
+      smoke: { profiles: { steady: 2 }, duration: '1m' },
+      // Quick test: 3 min total, 15 VUs - good for iteration loop
+      quick: {
+        profiles: { occasional: 3, steady: 5, light_python: 4, heavy_python: 2, bursty: 1 },
+        stages: [
+          { duration: '30s', target: 15 },
+          { duration: '2m', target: 15 },
+          { duration: '30s', target: 0 },
+        ],
+      },
+      // Quick stress: 3 min total, 45 VUs - shows contention issues quickly
+      quick_stress: {
+        profiles: { occasional: 10, steady: 15, light_python: 10, heavy_python: 5, bursty: 5 },
+        stages: [
+          { duration: '30s', target: 45 },
+          { duration: '2m', target: 45 },
+          { duration: '30s', target: 0 },
+        ],
+      },
+      light_load: {
+        profiles: { occasional: 15, steady: 5, light_python: 3 },
+        stages: [
+          { duration: '2m', target: 23 },
+          { duration: '5m', target: 23 },
+          { duration: '1m', target: 0 },
+        ],
+      },
+      realistic: {
+        profiles: { occasional: 10, steady: 15, light_python: 10, heavy_python: 5, bursty: 5 },
+        stages: [
+          { duration: '3m', target: 45 },
+          { duration: '10m', target: 45 },
+          { duration: '2m', target: 0 },
+        ],
+      },
+      worst_case: {
+        profiles: { heavy_python: 20, bursty: 10, steady: 10 },
+        stages: [
+          { duration: '2m', target: 40 },
+          { duration: '5m', target: 40 },
+          { duration: '1m', target: 0 },
+        ],
+      },
+      stress: {
+        profiles: { steady: 50, heavy_python: 25, bursty: 25 },
+        stages: [
+          { duration: '2m', target: 25 },
+          { duration: '3m', target: 50 },
+          { duration: '3m', target: 75 },
+          { duration: '3m', target: 100 },
+          { duration: '3m', target: 125 },
+          { duration: '2m', target: 0 },
+        ],
+      },
+    };
+
+    function buildOptions() {
+      const scenario = SCENARIOS[SCENARIO];
+      if (!scenario) throw new Error(`Unknown scenario: ${SCENARIO}`);
+      const totalVUs = Object.values(scenario.profiles).reduce((a, b) => a + b, 0);
+
+      if (scenario.duration) {
+        return {
+          scenarios: { default: { executor: 'constant-vus', vus: totalVUs, duration: scenario.duration } },
+          thresholds: { http_req_failed: ['rate<0.1'], success_rate: ['rate>0.9'] },
+        };
+      }
+      return {
+        scenarios: { default: { executor: 'ramping-vus', startVUs: 0, stages: scenario.stages, gracefulRampDown: '30s' } },
+        thresholds: {
+          http_req_duration: ['p(95)<5000'],
+          http_req_failed: ['rate<0.05'],
+          success_rate: ['rate>0.95'],
+        },
+      };
+    }
+
+    export const options = buildOptions();
+
+    function rand(min, max) { return Array.isArray(min) ? Math.random() * (min[1] - min[0]) + min[0] : Math.random() * (max - min) + min; }
+    function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
+
+    function makeRequest(method, path, body = null) {
+      const url = `${BASE_URL}${path}`;
+      const params = { headers: { 'Content-Type': 'application/json' }, timeout: '30s' };
+      if (method === 'GET') return http.get(url, params);
+      if (method === 'POST') return http.post(url, body ? JSON.stringify(body) : null, params);
+      if (method === 'DELETE') return http.del(url, null, params);
+    }
+
+    function getProfileForVU(vuId) {
+      const scenario = SCENARIOS[SCENARIO];
+      let cumulative = 0;
+      const dist = [];
+      for (const [name, count] of Object.entries(scenario.profiles)) {
+        cumulative += count;
+        dist.push({ name, threshold: cumulative });
+      }
+      const pos = ((vuId - 1) % cumulative) + 1;
+      for (const { name, threshold } of dist) {
+        if (pos <= threshold) return name;
+      }
+      return Object.keys(scenario.profiles)[0];
+    }
+
+    const SHELL_CMDS = ['echo "hello"', 'pwd', 'ls -la', 'date', 'uptime', 'cat /etc/os-release | head -3'];
+    const LIGHT_PY = ['print("Hello")', 'print(sum(range(100)))', 'import sys; print(sys.version)', '[x**2 for x in range(10)]'];
+    const HEAVY_PY = [
+      'import time; start=time.time(); sum(i**2 for i in range(50000)); print(f"Done in {time.time()-start:.2f}s")',
+      'data=[list(range(500)) for _ in range(100)]; print(f"Sum: {sum(sum(r) for r in data)}")',
+      'result=0\\nfor i in range(100):\\n  for j in range(100): result+=i*j\\nprint(result)',
+    ];
+
+    function runShell(sid) {
+      const cmd = SHELL_CMDS[randInt(0, SHELL_CMDS.length - 1)];
+      const start = Date.now();
+      const res = makeRequest('POST', `/v1/${sid}/shell`, { command: cmd, timeout_ms: 10000 });
+      commandLatency.add(Date.now() - start);
+      commandsExecuted.add(1);
+      const ok = check(res, { 'shell ok': (r) => r.status === 200 });
+      successRate.add(ok);
+      if (!ok) errors.add(1);
+      return ok;
+    }
+
+    function runPython(sid, heavy) {
+      const snippets = heavy ? HEAVY_PY : LIGHT_PY;
+      const code = snippets[randInt(0, snippets.length - 1)];
+      const start = Date.now();
+      const res = makeRequest('POST', `/v1/${sid}/repl/python`, { code, timeout_ms: heavy ? 30000 : 15000 });
+      pythonLatency.add(Date.now() - start);
+      commandsExecuted.add(1);
+      const ok = check(res, { 'python ok': (r) => r.status === 200 });
+      successRate.add(ok);
+      if (!ok) errors.add(1);
+      return ok;
+    }
+
+    function executeProfile(sid, profileName) {
+      const p = PROFILES[profileName];
+
+      if (profileName === 'occasional') {
+        Math.random() < p.pythonProb ? runPython(sid, false) : runShell(sid);
+        sleep(rand(p.commandInterval));
+      }
+      else if (profileName === 'steady') {
+        const batch = Array.isArray(p.batchSize) ? randInt(...p.batchSize) : (p.batchSize || 1);
+        for (let i = 0; i < batch; i++) {
+          Math.random() < p.pythonProb ? runPython(sid, false) : runShell(sid);
+          sleep(rand(1, 2));
+        }
+        sleep(rand(p.commandInterval));
+      }
+      else if (profileName === 'light_python') {
+        Math.random() < p.pythonProb ? runPython(sid, false) : runShell(sid);
+        sleep(rand(p.commandInterval));
+      }
+      else if (profileName === 'heavy_python') {
+        Math.random() < p.pythonProb ? runPython(sid, true) : runShell(sid);
+        sleep(rand(p.commandInterval));
+      }
+      else if (profileName === 'bursty') {
+        const batch = Array.isArray(p.batchSize) ? randInt(...p.batchSize) : (p.batchSize || 5);
+        for (let i = 0; i < batch; i++) {
+          Math.random() < p.pythonProb ? runPython(sid, false) : runShell(sid);
+          sleep(rand(p.commandInterval));
+        }
+        sleep(rand(p.burstPause));
+      }
+    }
+
+    export function setup() {
+      const scenario = SCENARIOS[SCENARIO];
+      const total = Object.values(scenario.profiles).reduce((a, b) => a + b, 0);
+      console.log(`\n=== Load Test: ${SCENARIO} ===`);
+      console.log(`Target: ${BASE_URL}`);
+      console.log(`Total VUs: ${total}`);
+      for (const [n, c] of Object.entries(scenario.profiles)) console.log(`  ${n}: ${c}`);
+
+      const res = http.get(`${BASE_URL}/healthz`, { timeout: '5s' });
+      if (res.status !== 200) throw new Error(`Service unhealthy: ${res.status}`);
+      console.log('Service healthy\n');
+      return { startTime: Date.now() };
+    }
+
+    export default function(data) {
+      const sid = `loadtest-vu${__VU}`;
+      const profile = getProfileForVU(__VU);
+
+      if (__ITER === 0) {
+        console.log(`VU ${__VU}: ${profile}`);
+        const start = Date.now();
+        const res = makeRequest('POST', `/v1/${sid}/exec`, { command: ['/bin/echo', 'ready'], timeout_ms: 20000 });
+        sandboxCreateLatency.add(Date.now() - start);
+        const ok = check(res, { 'sandbox created': (r) => r.status === 200 });
+        successRate.add(ok);
+        if (!ok) { errors.add(1); console.log(`VU ${__VU}: sandbox failed`); sleep(5); return; }
+        sleep(1);
+      }
+
+      executeProfile(sid, profile);
+    }
+
+    export function teardown(data) {
+      console.log(`\nCompleted in ${((Date.now() - data.startTime) / 1000).toFixed(1)}s`);
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-profiles-test
+  namespace: kata-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: k6-profiles-test
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-os-distribution: cos
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          command: ["k6", "run", "/scripts/k6-profiles.js"]
+          env:
+            - name: BASE_URL
+              value: "http://kata-deploy-sandbox-service.kata-system:8080"
+            - name: SCENARIO
+              value: "smoke"  # smoke, light_load, realistic, worst_case, stress
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-profiles-test

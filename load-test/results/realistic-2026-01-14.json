@@ -1,0 +1,81 @@
+{
+  "test": {
+    "scenario": "realistic",
+    "timestamp": "2026-01-14T02:41:16Z",
+    "duration_seconds": 916.4,
+    "cluster": "gke_cohere-development_us-central1_aaron-poc"
+  },
+  "configuration": {
+    "total_vus": 45,
+    "profiles": {
+      "occasional": 10,
+      "steady": 15,
+      "light_python": 10,
+      "heavy_python": 5,
+      "bursty": 5
+    },
+    "stages": {
+      "ramp_up": "3m",
+      "hold": "10m",
+      "ramp_down": "2m"
+    },
+    "sandbox_mode": "pod",
+    "storage_enabled": false
+  },
+  "infrastructure": {
+    "nodes": [
+      {"name": "gke-aaron-poc-kata2-pool-9561edec-54ph", "pods": 15},
+      {"name": "gke-aaron-poc-kata2-pool-a859cce2-h6xx", "pods": 15},
+      {"name": "gke-aaron-poc-kata2-pool-e012c9de-eyvk", "pods": 14}
+    ],
+    "node_cpu_allocatable": "940m",
+    "node_memory_allocatable": "2825924Ki"
+  },
+  "results": {
+    "iterations": 2006,
+    "commands_executed": 3860,
+    "requests_total": 3906,
+    "requests_per_second": 4.26,
+    "success_rate": 1.0,
+    "errors": 0
+  },
+  "latencies_ms": {
+    "sandbox_create": {
+      "min": 877,
+      "avg": 3250,
+      "med": 1680,
+      "p90": 7080,
+      "p95": 8080,
+      "max": 8880
+    },
+    "shell_command": {
+      "min": 28,
+      "avg": 2760,
+      "med": 3010,
+      "p90": 3980,
+      "p95": 4240,
+      "max": 13400
+    },
+    "python_execution": {
+      "min": 30,
+      "avg": 2870,
+      "med": 3060,
+      "p90": 3960,
+      "p95": 4250,
+      "max": 9070
+    },
+    "http_req_duration": {
+      "min": 1.63,
+      "avg": 2800,
+      "med": 3020,
+      "p90": 3980,
+      "p95": 4260,
+      "max": 13400
+    }
+  },
+  "thresholds": {
+    "http_req_duration_p95_lt_5000": {"target": 5000, "actual": 4260, "passed": true},
+    "http_req_failed_lt_5pct": {"target": 0.05, "actual": 0.0, "passed": true},
+    "success_rate_gt_95pct": {"target": 0.95, "actual": 1.0, "passed": true}
+  }
+}

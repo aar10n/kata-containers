@@ -39,6 +39,7 @@ type Config struct {
 	HostFS     HostFSConfig     `mapstructure:"hostfs"`
 	Exec       ExecConfig       `mapstructure:"exec"`
 	Sandbox    SandboxConfig    `mapstructure:"sandbox"`
+	Storage    StorageConfig    `mapstructure:"storage"`
 }
 
 // HTTPConfig holds HTTP server configuration.
@@ -93,6 +94,23 @@ type SandboxConfig struct {
 	NodeSelector     map[string]string `mapstructure:"node_selector"`
 }
 
+// StorageConfig holds configuration for the storage service client.
+type StorageConfig struct {
+	// Enabled indicates whether storage/snapshot functionality is enabled.
+	// When enabled, sandbox-agent will connect to sandbox-service's storage gRPC server
+	// to get presigned URLs for uploading/downloading snapshots.
+	Enabled bool `mapstructure:"enabled"`
+	// Addr is the address of the sandbox-service storage gRPC server.
+	// Example: "sandbox-service.kata-system:9090"
+	Addr string `mapstructure:"addr"`
+	// Timeout for storage RPC calls.
+	Timeout time.Duration `mapstructure:"timeout"`
+	// InitImage is the container image used for the init container that
+	// downloads and extracts snapshots during pod creation.
+	// Should contain curl and tar.
+	InitImage string `mapstructure:"init_image"`
+}
+
 // Flags defines command-line flags that can override config values.
 type Flags struct {
 	ConfigFile  string
@@ -138,6 +156,12 @@ func DefaultConfig() Config {
 			Namespace:        "default",
 			RuntimeClassName: "",
 		},
+		Storage: StorageConfig{
+			Enabled:   false,
+			Addr:      "sandbox-service.kata-system:9090",
+			Timeout:   30 * time.Second,
+			InitImage: "busybox:1.36",
+		},
 	}
 }
 
@@ -181,6 +205,10 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("exec::timeout", defaults.Exec.Timeout)
 	v.SetDefault("sandbox::namespace", defaults.Sandbox.Namespace)
 	v.SetDefault("sandbox::runtime_class", defaults.Sandbox.RuntimeClassName)
+	v.SetDefault("storage::enabled", defaults.Storage.Enabled)
+	v.SetDefault("storage::addr", defaults.Storage.Addr)
+	v.SetDefault("storage::timeout", defaults.Storage.Timeout)
+	v.SetDefault("storage::init_image", defaults.Storage.InitImage)
 
 	// Enable environment variable overrides
 	// Environment variables use SANDBOX_AGENT_ prefix with underscores

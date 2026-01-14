@@ -201,8 +201,6 @@ func (b *Backend) StreamStdout(ctx context.Context, containerID, processID strin
 	ch := make(chan backend.StreamChunk)
 	go func() {
 		defer close(ch)
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
 
 		for {
 			select {
@@ -215,8 +213,9 @@ func (b *Backend) StreamStdout(ctx context.Context, containerID, processID strin
 				}
 				ch <- backend.StreamChunk{EOF: true}
 				return
-			case <-ticker.C:
-				if data := state.conn.ReadStdout(4096); len(data) > 0 {
+			case <-state.conn.DataReady():
+				// New data available, read all buffered stdout
+				if data := state.conn.ReadStdout(0); len(data) > 0 {
 					ch <- backend.StreamChunk{Data: data}
 				}
 			}
@@ -240,8 +239,6 @@ func (b *Backend) StreamStderr(ctx context.Context, containerID, processID strin
 	ch := make(chan backend.StreamChunk)
 	go func() {
 		defer close(ch)
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
 
 		for {
 			select {
@@ -254,9 +251,54 @@ func (b *Backend) StreamStderr(ctx context.Context, containerID, processID strin
 				}
 				ch <- backend.StreamChunk{EOF: true}
 				return
-			case <-ticker.C:
-				if data := state.conn.ReadStderr(4096); len(data) > 0 {
+			case <-state.conn.DataReady():
+				// New data available, read all buffered stderr
+				if data := state.conn.ReadStderr(0); len(data) > 0 {
 					ch <- backend.StreamChunk{Data: data}
+				}
+			}
+		}
+	}()
+
+	return ch, nil
+}
+
+// StreamOutput returns a channel that streams both stdout and stderr data.
+func (b *Backend) StreamOutput(ctx context.Context, containerID, processID string) (<-chan backend.OutputChunk, error) {
+	state, err := b.getProcess(processID)
+	if err != nil {
+		return nil, err
+	}
+
+	if state.conn == nil {
+		return nil, backend.ErrNotSupported
+	}
+
+	ch := make(chan backend.OutputChunk)
+	go func() {
+		defer close(ch)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-state.conn.Done():
+				// Connection closed, send any remaining data
+				if data := state.conn.ReadStdout(0); len(data) > 0 {
+					ch <- backend.OutputChunk{Stream: backend.StreamStdout, Data: data}
+				}
+				if data := state.conn.ReadStderr(0); len(data) > 0 {
+					ch <- backend.OutputChunk{Stream: backend.StreamStderr, Data: data}
+				}
+				ch <- backend.OutputChunk{EOF: true}
+				return
+			case <-state.conn.DataReady():
+				// New data available, read both buffers
+				if data := state.conn.ReadStdout(0); len(data) > 0 {
+					ch <- backend.OutputChunk{Stream: backend.StreamStdout, Data: data}
+				}
+				if data := state.conn.ReadStderr(0); len(data) > 0 {
+					ch <- backend.OutputChunk{Stream: backend.StreamStderr, Data: data}
 				}
 			}
 		}

@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package storage.v1;
+
+option go_package = "github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/api/pb;pb";
+
+// StorageService provides presigned URL generation for sandbox file storage.
+// This is an internal gRPC service called by sandbox-agent to upload/download
+// sandbox files.
+service StorageService {
+  // GetUploadURL returns a presigned PUT URL for uploading a file.
+  // The sandbox-agent calls this after tarring the /data directory during suspend.
+  rpc GetUploadURL(GetUploadURLRequest) returns (GetUploadURLResponse);
+
+  // GetDownloadURL returns a presigned GET URL for downloading a file.
+  // Returns NOT_FOUND if no file exists for the session.
+  rpc GetDownloadURL(GetDownloadURLRequest) returns (GetDownloadURLResponse);
+
+  // CheckFileExists checks if a file exists for the given session.
+  rpc CheckFileExists(CheckFileExistsRequest) returns (CheckFileExistsResponse);
+
+  // DeleteFile deletes a file for a session.
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+}
+
+message GetUploadURLRequest {
+  string session_id = 1;
+  string file_name = 2; // Name of the file (e.g., "snapshot.tar.gz")
+}
+
+message GetUploadURLResponse {
+  // Presigned PUT URL for uploading the file
+  string url = 1;
+  // S3 key where the file will be stored
+  string key = 2;
+  // URL expiry time in seconds
+  int64 expires_in_seconds = 3;
+}
+
+message GetDownloadURLRequest {
+  string session_id = 1;
+  string file_name = 2;
+}
+
+message GetDownloadURLResponse {
+  // Presigned GET URL for downloading the file
+  string url = 1;
+  // S3 key where the file is stored
+  string key = 2;
+  // URL expiry time in seconds
+  int64 expires_in_seconds = 3;
+}
+
+message CheckFileExistsRequest {
+  string session_id = 1;
+  string file_name = 2;
+}
+
+message CheckFileExistsResponse {
+  bool exists = 1;
+  // Size in bytes (0 if not exists)
+  int64 size_bytes = 2;
+  // Last modified timestamp (0 if not exists)
+  int64 last_modified_unix = 3;
+}
+
+message DeleteFileRequest {
+  string session_id = 1;
+  string file_name = 2;
+}
+
+message DeleteFileResponse {
+  bool deleted = 1;
+}

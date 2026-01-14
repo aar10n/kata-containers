@@ -31,6 +31,7 @@ type Platform interface {
 
 	StreamStdout(ctx context.Context, req StreamReadRequest) (<-chan StreamChunk, error)
 	StreamStderr(ctx context.Context, req StreamReadRequest) (<-chan StreamChunk, error)
+	StreamOutput(ctx context.Context, req StreamReadRequest) (<-chan OutputChunk, error)
 }
 
 type CreateSandboxRequest struct {
@@ -39,6 +40,9 @@ type CreateSandboxRequest struct {
 	Command   []string
 	Env       map[string]string
 	Labels    map[string]string
+	// DownloadURL is a presigned GET URL for downloading a snapshot to restore.
+	// If set, sandbox-agent will create an init container to restore the snapshot.
+	DownloadURL string
 }
 
 type Sandbox struct {
@@ -102,6 +106,22 @@ type StreamChunk struct {
 	EOF  bool
 	Err  error
 }
+
+// OutputChunk represents a chunk of combined stdout/stderr output.
+type OutputChunk struct {
+	Stream StreamType
+	Data   []byte
+	EOF    bool
+	Err    error
+}
+
+// StreamType indicates the source of output data.
+type StreamType int
+
+const (
+	StreamStdout StreamType = iota
+	StreamStderr
+)
 
 // StreamReadRequest holds parameters for streaming read operations.
 type StreamReadRequest struct {

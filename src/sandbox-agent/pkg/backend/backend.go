@@ -33,6 +33,21 @@ type StreamChunk struct {
 	EOF  bool
 }
 
+// OutputChunk represents a chunk from stdout or stderr.
+type OutputChunk struct {
+	Stream StreamType
+	Data   []byte
+	EOF    bool
+}
+
+// StreamType indicates stdout or stderr.
+type StreamType int
+
+const (
+	StreamStdout StreamType = iota
+	StreamStderr
+)
+
 // ExecutionBackend defines the interface for executing commands in containers.
 // This abstraction allows different implementations for Kata VMs (via kata-agent)
 // and regular pods (via CRI).
@@ -58,6 +73,11 @@ type ExecutionBackend interface {
 
 	// StreamStderr returns a channel that streams stderr data.
 	StreamStderr(ctx context.Context, containerID, processID string) (<-chan StreamChunk, error)
+
+	// StreamOutput returns a channel that streams both stdout and stderr data.
+	// This is more efficient than calling StreamStdout and StreamStderr separately
+	// as it uses a single goroutine and avoids coordination issues.
+	StreamOutput(ctx context.Context, containerID, processID string) (<-chan OutputChunk, error)
 
 	// CloseStdin closes the stdin of a process.
 	CloseStdin(ctx context.Context, containerID, processID string) error

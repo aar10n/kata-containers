@@ -50,21 +50,30 @@ type SandboxInfo struct {
 // (from containerd) and needs to be persisted to the pod annotation.
 type SandboxIDCallback func(sessionID, sandboxID string)
 
+// PodDeletingCallback is called when a pod with the snapshot finalizer
+// is being deleted (has a deletion timestamp). The callback should save
+// the snapshot and then remove the finalizer to allow deletion to proceed.
+type PodDeletingCallback func(sessionID string)
+
 type Store struct {
-	mu                 sync.RWMutex
-	sandboxes          map[string]*SandboxInfo // session_id -> sandbox info
-	vmToSession        map[string]string       // sandbox_id (vm_id) -> session_id
-	nodeToAddr         map[string]string
-	nodeToSandboxPodIP map[string]string
-	onSandboxIDFound   SandboxIDCallback
+	mu                   sync.RWMutex
+	sandboxes            map[string]*SandboxInfo // session_id -> sandbox info
+	vmToSession          map[string]string       // sandbox_id (vm_id) -> session_id
+	nodeToAddr           map[string]string
+	nodeToSandboxPodIP   map[string]string
+	onSandboxIDFound     SandboxIDCallback
+	onPodDeleting        PodDeletingCallback
+	pendingSnapshotSaves map[string]bool // sessions that have already triggered snapshot save
+	localNodeName        string          // node name for this agent, used to filter finalizer handling
 }
 
 func NewStore() *Store {
 	return &Store{
-		sandboxes:          make(map[string]*SandboxInfo),
-		vmToSession:        make(map[string]string),
-		nodeToAddr:         make(map[string]string),
-		nodeToSandboxPodIP: make(map[string]string),
+		sandboxes:            make(map[string]*SandboxInfo),
+		vmToSession:          make(map[string]string),
+		nodeToAddr:           make(map[string]string),
+		nodeToSandboxPodIP:   make(map[string]string),
+		pendingSnapshotSaves: make(map[string]bool),
 	}
 }
 
@@ -74,6 +83,31 @@ func (s *Store) SetSandboxIDCallback(cb SandboxIDCallback) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onSandboxIDFound = cb
+}
+
+// SetPodDeletingCallback sets a callback that is invoked when a pod with
+// the snapshot finalizer is being deleted. The callback should save the
+// snapshot and remove the finalizer.
+func (s *Store) SetPodDeletingCallback(cb PodDeletingCallback) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onPodDeleting = cb
+}
+
+// ClearPendingSnapshotSave removes a session from the pending snapshot tracking.
+// This should be called after a snapshot has been saved or the save has failed.
+func (s *Store) ClearPendingSnapshotSave(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pendingSnapshotSaves, sessionID)
+}
+
+// SetLocalNodeName sets the node name for this agent instance.
+// This is used to filter finalizer handling to only the agent on the pod's node.
+func (s *Store) SetLocalNodeName(nodeName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.localNodeName = nodeName
 }
 
 // UpdateSandboxID updates the sandbox ID for a session and populates the vmToSession mapping.
@@ -131,13 +165,31 @@ func (s *Store) SetPod(pod *corev1.Pod) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	s.sandboxes[sessionID] = info
 
 	// Track sandbox_id -> session_id mapping for VM operations
 	if info.SandboxID != "" {
 		s.vmToSession[info.SandboxID] = sessionID
+	}
+
+	// Check if pod is being deleted and has snapshot finalizer
+	// Only trigger callback if this agent is on the same node as the pod
+	// (to avoid all agents trying to handle the same finalizer)
+	var cb PodDeletingCallback
+	if pod.DeletionTimestamp != nil && hasSnapshotFinalizer(pod) {
+		isLocalPod := s.localNodeName != "" && nodeName == s.localNodeName
+		if isLocalPod && !s.pendingSnapshotSaves[sessionID] {
+			s.pendingSnapshotSaves[sessionID] = true
+			cb = s.onPodDeleting
+		}
+	}
+
+	s.mu.Unlock()
+
+	// Call callback outside of lock to avoid deadlock
+	if cb != nil {
+		go cb(sessionID)
 	}
 }
 
@@ -346,6 +398,28 @@ func (s *Store) ContainerIDForSession(sessionID string) (string, bool) {
 	return "", false
 }
 
+// SandboxIDForContainerID returns the sandbox ID (VM ID) for a given container ID.
+// This is used in kata mode to look up the shim socket path from a container ID.
+func (s *Store) SandboxIDForContainerID(containerID string) (string, bool) {
+	containerID = normalizeID(containerID)
+	if containerID == "" {
+		return "", false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Search through all sandboxes to find one with this container ID
+	for _, info := range s.sandboxes {
+		for _, c := range info.Containers {
+			if c.ContainerID == containerID {
+				return info.SandboxID, info.SandboxID != ""
+			}
+		}
+	}
+	return "", false
+}
+
 func extractPodIDs(pod *corev1.Pod) []string {
 	var ids []string
 
@@ -421,6 +495,19 @@ func extractSessionID(pod *corev1.Pod) string {
 		return ""
 	}
 	return strings.TrimSpace(pod.Labels[sessionIDLabelKey])
+}
+
+// hasSnapshotFinalizer checks if the pod has our snapshot finalizer.
+func hasSnapshotFinalizer(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, f := range pod.Finalizers {
+		if f == SnapshotFinalizer {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) extractSandboxInfo(pod *corev1.Pod) *SandboxInfo {

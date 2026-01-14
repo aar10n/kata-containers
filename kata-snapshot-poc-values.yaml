@@ -1,0 +1,154 @@
+# Helm values for Kata Containers with Snapshot POC
+# Deploy with: helm install kata ./tools/packaging/kata-deploy/helm-chart/kata-deploy -f kata-snapshot-poc-values.yaml
+
+imagePullPolicy: Always
+
+# Custom image with snapshot support (uncomment after building)
+# image:
+#   reference: gcr.io/cohere-artifacts/kata-deploy
+#   tag: "snapshot-poc"
+
+# Kubernetes distribution (adjust if using k3s, rke2, etc.)
+k8sDistribution: "k8s" # k8s, k3s, rke2, k0s, microk8s
+
+# Debug mode - enable for troubleshooting
+debug: true
+
+# Only enable Cloud Hypervisor for this POC
+shims:
+  # Disable all other hypervisors
+  clh:
+    enabled: false
+  dragonball:
+    enabled: false
+  qemu:
+    enabled: false
+  qemu-runtime-rs:
+    enabled: false
+  qemu-nvidia-gpu:
+    enabled: false
+  qemu-nvidia-gpu-snp:
+    enabled: false
+  qemu-nvidia-gpu-tdx:
+    enabled: false
+  qemu-snp:
+    enabled: false
+  qemu-tdx:
+    enabled: false
+  qemu-se:
+    enabled: false
+  qemu-se-runtime-rs:
+    enabled: false
+  qemu-cca:
+    enabled: false
+  qemu-coco-dev:
+    enabled: false
+  qemu-coco-dev-runtime-rs:
+    enabled: false
+  remote:
+    enabled: false
+  stratovirt:
+    enabled: false
+  fc:
+    enabled: false
+
+  # Enable Cloud Hypervisor (runtime-rs version)
+  cloud-hypervisor:
+    enabled: true
+    supportedArches:
+      - amd64
+    allowedHypervisorAnnotations:
+      # Allow custom annotations for snapshot control
+      - "io.katacontainers.hypervisor.*"
+
+# Default runtime class
+defaultShim:
+  amd64: cloud-hypervisor
+
+# Create runtime classes
+runtimeClasses:
+  enabled: true
+  createDefault: true
+  defaultName: "kata-cloud-hypervisor"
+
+# Optional: Add node selector to only deploy on specific nodes
+# nodeSelector:
+#   kata-enabled: "true"
+
+# Optional: Add tolerations if your nodes have taints
+# tolerations:
+#   - key: "dedicated"
+#     operator: "Equal"
+#     value: "kata"
+#     effect: "NoSchedule"
+
+env:
+  # Ubuntu nodes have writable /opt, no prefix needed
+  installationPrefix: ""
+  hostOS: ""
+
+# Only run kata-deploy on Ubuntu nodes
+nodeSelector:
+  cloud.google.com/gke-os-distribution: ubuntu
+
+# Disable NFD for simplicity
+node-feature-discovery:
+  enabled: false
+
+sandboxAgent:
+  enabled: true
+  image:
+    reference: gcr.io/cohere-artifacts/sandbox-agent
+    tag: "latest"
+
+  # Run in kata mode (Kata VMs with kata-agent exec via vsock)
+  mode: pod
+
+  # Sandbox pod configuration (managed by sandbox-agent)
+  sandboxNamespace: kata-system
+  runtimeClass: kata-cloud-hypervisor  # Must match available RuntimeClass
+  sandboxNodeSelector:
+    cloud.google.com/gke-os-distribution: ubuntu
+
+  # CRI socket auto-detected (containerd or CRI-O)
+  cri:
+    socket: ""
+    timeout: "30s"
+
+  # Host filesystem for emptyDir access
+  hostfs:
+    kubeletRoot: "/var/lib/kubelet"
+
+  # Storage configuration for snapshot save/restore
+  storage:
+    enabled: true
+    # Address of sandbox-service's storage gRPC server
+    addr: "kata-deploy-sandbox-service.kata-system:9090"
+    timeout: "30s"
+    # Init container image for snapshot restore (should have wget and tar)
+    initImage: "busybox:1.36"
+
+sandboxService:
+  enabled: true
+  image:
+    reference: gcr.io/cohere-artifacts/sandbox-service
+    tag: "latest"
+
+  defaultTTL: "3m"
+
+  # Default sandbox image (using public image to avoid GCR auth issues)
+  defaultImage: "python:3.11-slim"
+  defaultCommand: ["sleep", "infinity"]
+
+  # Storage configuration for snapshot save/restore (S3-compatible backend)
+  storage:
+    enabled: true
+    # S3-compatible endpoint URL (s3proxy in kata-system namespace)
+    endpoint: "http://s3proxy.kata-system:8080"
+    region: "us-east-1"
+    bucket: "snapshots"
+    # Credentials matching s3proxy.yaml
+    accessKeyId: "s3proxy-access-key"
+    secretAccessKey: "s3proxy-secret-key"
+    presignExpiry: "15m"
+    forcePathStyle: true

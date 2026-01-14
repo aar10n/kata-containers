@@ -77,8 +77,11 @@ func main() {
 			MaxOutputSize: cfg.Agent.MaxOutputSize,
 		})
 		shimClient := shim_mgmt.New(shim_mgmt.Config{DialTimeout: cfg.Agent.Timeout})
-		be = katabackend.NewFromClients(agentClient, shimClient)
-		log.Printf("initialized kata backend")
+		kataBackend := katabackend.NewFromClients(agentClient, shimClient)
+		// Set the resolver so the backend can look up sandbox ID from container ID
+		kataBackend.SetSandboxIDResolver(watcher.Store().SandboxIDForContainerID)
+		be = kataBackend
+		log.Printf("initialized kata backend with sandbox ID resolver")
 
 	case config.ModePod:
 		criClient, err := cri.New(cri.Config{
@@ -129,11 +132,18 @@ func main() {
 		})
 	}
 
-	svc := service.New(service.Config{
-		NodeName:    nodeName,
-		ExecTimeout: cfg.Exec.Timeout,
-		Mode:        string(cfg.Mode),
+	svc, err := service.New(service.Config{
+		NodeName:         nodeName,
+		ExecTimeout:      cfg.Exec.Timeout,
+		Mode:             string(cfg.Mode),
+		StorageEnabled:   cfg.Storage.Enabled,
+		StorageAddr:      cfg.Storage.Addr,
+		StorageTimeout:   cfg.Storage.Timeout,
+		StorageInitImage: cfg.Storage.InitImage,
 	}, watcher.Store(), manager, be, hfs)
+	if err != nil {
+		log.Fatalf("create service: %v", err)
+	}
 
 	grpcServer := grpc.NewServer()
 	apiCfg := api.Config{

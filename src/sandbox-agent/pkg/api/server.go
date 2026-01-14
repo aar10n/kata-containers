@@ -10,12 +10,12 @@ import (
 	"time"
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/api/pb"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/backend"
 	apierrors "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/errors"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/service"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -63,11 +63,12 @@ func (s *Server) CreateSandbox(ctx context.Context, req *pb.CreateSandboxRequest
 	}
 
 	info, err := s.svc.CreateSandbox(ctx, service.CreateSandboxRequest{
-		SessionID: req.GetSessionId(),
-		Image:     req.GetImage(),
-		Command:   req.GetCommand(),
-		Env:       req.GetEnv(),
-		Labels:    req.GetLabels(),
+		SessionID:   req.GetSessionId(),
+		Image:       req.GetImage(),
+		Command:     req.GetCommand(),
+		Env:         req.GetEnv(),
+		Labels:      req.GetLabels(),
+		DownloadURL: req.GetDownloadUrl(),
 	})
 	if err != nil {
 		if errors.Is(err, k8s.ErrSandboxAlreadyExists) {
@@ -140,6 +141,28 @@ func (s *Server) UpdateSandboxActivity(ctx context.Context, req *pb.UpdateSandbo
 	}
 
 	return &emptypb.Empty{}, nil
+}
+
+func (s *Server) SuspendSandbox(ctx context.Context, req *pb.SuspendSandboxRequest) (*pb.SuspendSandboxResponse, error) {
+	if req == nil || strings.TrimSpace(req.GetSessionId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	result, err := s.svc.SuspendSandbox(ctx, req.GetSessionId())
+	if err != nil {
+		if errors.Is(err, k8s.ErrSandboxNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		if errors.Is(err, apierrors.ErrNotSupported) {
+			return nil, status.Error(codes.Unimplemented, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, "suspend sandbox: %v", err)
+	}
+
+	return &pb.SuspendSandboxResponse{
+		SnapshotSize: result.SnapshotSize,
+		DurationMs:   result.Duration.Milliseconds(),
+	}, nil
 }
 
 func sandboxInfoToProto(info *k8s.SandboxInfo) *pb.SandboxInfo {
@@ -371,6 +394,64 @@ func (s *Server) ResizeTerminal(ctx context.Context, req *pb.ResizeTerminalReque
 	})
 }
 
+// StreamProcessOutput streams stdout and stderr from a process.
+// This is a server-side streaming RPC - it does not support cross-node forwarding.
+// The client should connect directly to the correct node's sandbox-agent.
+func (s *Server) StreamProcessOutput(req *pb.StreamProcessOutputRequest, stream pb.SandboxAgent_StreamProcessOutputServer) error {
+	if req == nil {
+		return status.Error(codes.InvalidArgument, "request is required")
+	}
+
+	sessionID := req.GetSessionId()
+	if sessionID == "" {
+		return status.Error(codes.InvalidArgument, "session_id is required")
+	}
+
+	processID := req.GetProcessId()
+	if processID == "" {
+		return status.Error(codes.InvalidArgument, "process_id is required")
+	}
+
+	// Check if sandbox is local
+	info, err := s.svc.GetSandbox(stream.Context(), sessionID)
+	if err != nil {
+		return toGRPCError(err)
+	}
+	if info.Node != "" && info.Node != s.cfg.NodeName {
+		// Not local - return error with redirect info
+		addr, ok := s.svc.SandboxAgentAddressForNode(info.Node)
+		if !ok {
+			return status.Error(codes.Unavailable, "target node address unavailable")
+		}
+		return redirectError(addr, s.grpcPort)
+	}
+
+	// Start streaming from backend
+	outCh, err := s.svc.StreamOutput(stream.Context(), sessionID, processID)
+	if err != nil {
+		return toGRPCError(err)
+	}
+
+	// Stream chunks to client
+	for chunk := range outCh {
+		if chunk.EOF {
+			return nil
+		}
+		pbStream := pb.ProcessOutputChunk_STDOUT
+		if chunk.Stream == backend.StreamStderr {
+			pbStream = pb.ProcessOutputChunk_STDERR
+		}
+		if err := stream.Send(&pb.ProcessOutputChunk{
+			Stream: pbStream,
+			Data:   chunk.Data,
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // File operations
 
 func (s *Server) ReadFile(ctx context.Context, req *pb.ReadFileRequest) (*pb.ReadFileResponse, error) {
@@ -430,31 +511,13 @@ func (s *Server) ReadArchive(req *pb.ReadArchiveRequest, stream pb.SandboxAgent_
 		return toGRPCError(err)
 	}
 
-	if info.Node != s.cfg.NodeName {
-		// Remote execution
-		client, conn, err := s.remoteClient(ctx, info.Node)
-		if err != nil {
-			return err
+	if info.Node != "" && info.Node != s.cfg.NodeName {
+		// Not local - return redirect error
+		addr, ok := s.svc.SandboxAgentAddressForNode(info.Node)
+		if !ok {
+			return status.Error(codes.Unavailable, "target node address unavailable")
 		}
-		defer conn.Close()
-
-		remoteStream, err := client.ReadArchive(ctx, req)
-		if err != nil {
-			return status.Errorf(codes.Internal, "failed to open remote stream: %v", err)
-		}
-
-		for {
-			chunk, err := remoteStream.Recv()
-			if err == io.EOF {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if err := stream.Send(chunk); err != nil {
-				return err
-			}
-		}
+		return redirectError(addr, s.grpcPort)
 	}
 
 	// Local execution
@@ -506,41 +569,13 @@ func (s *Server) WriteArchive(stream pb.SandboxAgent_WriteArchiveServer) error {
 		return toGRPCError(err)
 	}
 
-	if info.Node != s.cfg.NodeName {
-		// Remote execution - forward to correct node
-		client, conn, err := s.remoteClient(ctx, info.Node)
-		if err != nil {
-			return err
+	if info.Node != "" && info.Node != s.cfg.NodeName {
+		// Not local - return redirect error
+		addr, ok := s.svc.SandboxAgentAddressForNode(info.Node)
+		if !ok {
+			return status.Error(codes.Unavailable, "target node address unavailable")
 		}
-		defer conn.Close()
-
-		remoteStream, err := client.WriteArchive(ctx)
-		if err != nil {
-			return status.Errorf(codes.Internal, "failed to open remote stream: %v", err)
-		}
-
-		// Send header
-		if err := remoteStream.Send(first); err != nil {
-			return err
-		}
-
-		// Forward all data
-		for {
-			msg, err := stream.Recv()
-			if err == io.EOF {
-				resp, err := remoteStream.CloseAndRecv()
-				if err != nil {
-					return err
-				}
-				return stream.SendAndClose(resp)
-			}
-			if err != nil {
-				return err
-			}
-			if err := remoteStream.Send(msg); err != nil {
-				return err
-			}
-		}
+		return redirectError(addr, s.grpcPort)
 	}
 
 	// Local execution - create pipe and stream data
@@ -633,7 +668,7 @@ func callUnary[T any](ctx context.Context, s *Server, sessionID string, local fu
 	return call(ctx, s, sessionID, local, remote)
 }
 
-func call[T any](ctx context.Context, s *Server, sessionID string, local func(context.Context) (T, error), remote func(context.Context, pb.SandboxAgentClient) (T, error)) (T, error) {
+func call[T any](ctx context.Context, s *Server, sessionID string, local func(context.Context) (T, error), _ func(context.Context, pb.SandboxAgentClient) (T, error)) (T, error) {
 	var zero T
 	if strings.TrimSpace(sessionID) == "" {
 		return zero, status.Error(codes.InvalidArgument, "session_id is required")
@@ -648,51 +683,18 @@ func call[T any](ctx context.Context, s *Server, sessionID string, local func(co
 		return zero, status.Errorf(codes.Internal, "get sandbox: %v", err)
 	}
 
+	// If local, handle directly
 	if info.Node == "" || info.Node == s.cfg.NodeName {
 		return local(ctx)
 	}
 
-	if shouldRedirect(ctx) {
-		addr, ok := s.svc.SandboxAgentAddressForNode(info.Node)
-		if !ok {
-			return zero, status.Error(codes.Unavailable, "target node address unavailable")
-		}
-		return zero, redirectError(addr, s.httpPort)
-	}
-
-	client, conn, err := s.remoteClient(ctx, info.Node)
-	if err != nil {
-		return zero, err
-	}
-	defer conn.Close()
-
-	return remote(ctx, client)
-}
-
-func (s *Server) remoteClient(ctx context.Context, nodeName string) (pb.SandboxAgentClient, *grpc.ClientConn, error) {
-	addr, ok := s.svc.SandboxAgentAddressForNode(nodeName)
+	// Not local - return redirect error with target node info.
+	// The client is responsible for routing to the correct node.
+	addr, ok := s.svc.SandboxAgentAddressForNode(info.Node)
 	if !ok {
-		return nil, nil, status.Error(codes.Unavailable, "target node address unavailable")
+		return zero, status.Error(codes.Unavailable, "target node address unavailable")
 	}
-
-	target := addr
-	if s.grpcPort != 0 {
-		target = net.JoinHostPort(addr, strconv.Itoa(s.grpcPort))
-	}
-
-	dialCtx := ctx
-	if s.cfg.DialTimeout > 0 {
-		var cancel context.CancelFunc
-		dialCtx, cancel = context.WithTimeout(ctx, s.cfg.DialTimeout)
-		defer cancel()
-	}
-
-	conn, err := grpc.DialContext(dialCtx, target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, nil, status.Errorf(codes.Unavailable, "dial %s: %v", target, err)
-	}
-
-	return pb.NewSandboxAgentClient(conn), conn, nil
+	return zero, redirectError(addr, s.grpcPort)
 }
 
 func parseListenPort(listenAddr string) int {

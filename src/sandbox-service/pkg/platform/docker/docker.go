@@ -658,6 +658,82 @@ func (p *Platform) StreamStderr(ctx context.Context, req platform.StreamReadRequ
 	return ch, nil
 }
 
+// StreamOutput returns a channel that streams both stdout and stderr chunks.
+// For Docker, this uses polling to read from both buffers.
+func (p *Platform) StreamOutput(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.OutputChunk, error) {
+	proc := p.getProcess(req.ExecID)
+	if proc == nil {
+		return nil, fmt.Errorf("process not found: %s", req.ExecID)
+	}
+
+	pollInterval := defaultStreamPollInterval
+	if req.PollIntervalMs > 0 {
+		pollInterval = time.Duration(req.PollIntervalMs) * time.Millisecond
+	}
+
+	ch := make(chan platform.OutputChunk, 16)
+	go func() {
+		defer close(ch)
+		consecutiveEmpty := 0
+		const maxConsecutiveEmpty = 3
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			proc.mu.Lock()
+			if err := p.fillBuffers(proc); err != nil && !isTimeout(err) {
+				proc.mu.Unlock()
+				ch <- platform.OutputChunk{EOF: true, Err: err}
+				return
+			}
+			stdout := proc.stdoutBuffer
+			stderr := proc.stderrBuffer
+			proc.stdoutBuffer = nil
+			proc.stderrBuffer = nil
+			proc.mu.Unlock()
+
+			hasData := false
+			if len(stdout) > 0 {
+				hasData = true
+				select {
+				case ch <- platform.OutputChunk{Stream: platform.StreamStdout, Data: stdout}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if len(stderr) > 0 {
+				hasData = true
+				select {
+				case ch <- platform.OutputChunk{Stream: platform.StreamStderr, Data: stderr}:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			if hasData {
+				consecutiveEmpty = 0
+			} else {
+				consecutiveEmpty++
+				if consecutiveEmpty >= maxConsecutiveEmpty {
+					ch <- platform.OutputChunk{EOF: true}
+					return
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pollInterval):
+			}
+		}
+	}()
+	return ch, nil
+}
+
 func applyTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return ctx, func() {}

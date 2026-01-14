@@ -3,13 +3,16 @@ TAG ?= latest
 PUSH ?= false
 DOCKER_BUILDKIT ?= 1
 REMOTE ?= aaron@192.168.1.105:build/
+PROTOC ?= protoc
 REPO_ROOT := $(shell cd ../.. && pwd)
 REMOTE_HOST := $(shell printf '%s' "$(REMOTE)" | sed -E 's/:.*$$//')
 REMOTE_PATH := $(shell printf '%s' "$(REMOTE)" | sed -E 's/^[^:]+://')
 REMOTE_REPO := $(REMOTE_PATH)kata-containers
 REMOTE_BUILD_DIR := $(REMOTE_REPO)/src/sandbox-service
+PROTO_DIR := $(REPO_ROOT)/src/sandbox-service/proto
+PROTO_OUT := $(REPO_ROOT)/src/sandbox-service/pkg/api/pb
 
-.PHONY: build docker-build docker-push test run-local run-local-kata
+.PHONY: build docker-build docker-push test run-local run-local-kata proto-gen
 
 build:
 	go build -o bin/sandbox-service ./main.go
@@ -39,3 +42,10 @@ run-local:
 
 run-local-kata:
 	go run ./main.go --platform=kata --http-addr=:8080
+
+proto-gen:
+	@mkdir -p $(PROTO_OUT)
+	@PATH="$$(go env GOPATH)/bin:$$PATH" $(PROTOC) -I $(PROTO_DIR) \
+		--go_out=$(PROTO_OUT) --go_opt=paths=source_relative \
+		--go-grpc_out=$(PROTO_OUT) --go-grpc_opt=paths=source_relative \
+		$(PROTO_DIR)/storage.proto

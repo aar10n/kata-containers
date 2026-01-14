@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/api/pb"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -35,11 +38,21 @@ type cachedSandbox struct {
 
 const sandboxCacheTTL = 30 * time.Second
 
+// nodeConn holds a gRPC connection to a specific sandbox-agent node.
+type nodeConn struct {
+	conn   *grpc.ClientConn
+	client pb.SandboxAgentClient
+}
+
 // Platform implements the sandbox platform interface using the sandbox-agent gRPC API.
+// It maintains a pool of connections to different sandbox-agent nodes and routes
+// requests to the correct node based on session-to-node mapping.
 type Platform struct {
-	conn              *grpc.ClientConn
-	client            pb.SandboxAgentClient
+	defaultAddr string // default sandbox-agent address (for discovery)
+
 	mu                sync.RWMutex
+	nodeConns         map[string]*nodeConn      // node address -> connection
+	sessionNodes      map[string]string         // sessionID -> node address
 	processContainers map[string]string         // processID -> containerID
 	sandboxCache      map[string]*cachedSandbox // sessionID -> cached sandbox
 }
@@ -49,14 +62,47 @@ type Config struct {
 	SandboxAgentAddr string
 }
 
+// redirectTarget extracts host and port from a redirect error.
+func redirectTarget(err error) (string, int, bool) {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		return "", 0, false
+	}
+	for _, detail := range st.Details() {
+		info, ok := detail.(*errdetails.ErrorInfo)
+		if !ok || info.Reason != "REDIRECT" {
+			continue
+		}
+		host := strings.TrimSpace(info.Metadata["host"])
+		port, _ := strconv.Atoi(info.Metadata["port"])
+		if host == "" {
+			return "", 0, false
+		}
+		return host, port, true
+	}
+	return "", 0, false
+}
+
 // New creates a new Kata platform.
 func New(cfg Config) (*Platform, error) {
 	if strings.TrimSpace(cfg.SandboxAgentAddr) == "" {
 		return nil, errors.New("sandbox agent address is required")
 	}
 
-	// Remove http:// prefix if present and use gRPC port
-	addr := cfg.SandboxAgentAddr
+	// Normalize the default address
+	addr := normalizeAgentAddr(cfg.SandboxAgentAddr)
+
+	return &Platform{
+		defaultAddr:       addr,
+		nodeConns:         make(map[string]*nodeConn),
+		sessionNodes:      make(map[string]string),
+		processContainers: make(map[string]string),
+		sandboxCache:      make(map[string]*cachedSandbox),
+	}, nil
+}
+
+// normalizeAgentAddr converts HTTP URLs to gRPC addresses.
+func normalizeAgentAddr(addr string) string {
 	addr = strings.TrimPrefix(addr, "http://")
 	addr = strings.TrimPrefix(addr, "https://")
 
@@ -66,37 +112,130 @@ func New(cfg Config) (*Platform, error) {
 	} else if !strings.Contains(addr, ":") {
 		addr = addr + ":9090"
 	}
+	return addr
+}
+
+// Close closes all gRPC connections.
+func (p *Platform) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var lastErr error
+	for addr, nc := range p.nodeConns {
+		if err := nc.conn.Close(); err != nil {
+			lastErr = err
+			slog.Warn("failed to close connection", "addr", addr, "error", err)
+		}
+	}
+	p.nodeConns = make(map[string]*nodeConn)
+	return lastErr
+}
+
+// getClientForSession returns a gRPC client for the given session.
+// If the session's node is known, returns a direct connection to that node.
+// Otherwise, returns a connection to the default address.
+func (p *Platform) getClientForSession(sessionID string) pb.SandboxAgentClient {
+	p.mu.RLock()
+	nodeAddr := p.sessionNodes[sessionID]
+	p.mu.RUnlock()
+
+	if nodeAddr == "" {
+		nodeAddr = p.defaultAddr
+	}
+	return p.getClientForNode(nodeAddr)
+}
+
+// getClientForNode returns a gRPC client for the given node address.
+// It maintains a connection pool, creating new connections as needed.
+func (p *Platform) getClientForNode(addr string) pb.SandboxAgentClient {
+	p.mu.RLock()
+	nc := p.nodeConns[addr]
+	p.mu.RUnlock()
+
+	if nc != nil {
+		return nc.client
+	}
+
+	// Need to create a new connection
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if nc = p.nodeConns[addr]; nc != nil {
+		return nc.client
+	}
 
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return nil, fmt.Errorf("dial sandbox-agent: %w", err)
+		slog.Error("failed to dial sandbox-agent", "addr", addr, "error", err)
+		// Return a client anyway - the error will surface on first call
+		return nil
 	}
 
-	return &Platform{
-		conn:              conn,
-		client:            pb.NewSandboxAgentClient(conn),
-		processContainers: make(map[string]string),
-		sandboxCache:      make(map[string]*cachedSandbox),
-	}, nil
+	nc = &nodeConn{
+		conn:   conn,
+		client: pb.NewSandboxAgentClient(conn),
+	}
+	p.nodeConns[addr] = nc
+	slog.Debug("created new connection to sandbox-agent", "addr", addr)
+	return nc.client
 }
 
-// Close closes the gRPC connection.
-func (p *Platform) Close() error {
-	if p.conn != nil {
-		return p.conn.Close()
+// updateSessionNode updates the session-to-node mapping.
+func (p *Platform) updateSessionNode(sessionID, nodeAddr string) {
+	p.mu.Lock()
+	p.sessionNodes[sessionID] = nodeAddr
+	p.mu.Unlock()
+}
+
+// handleRedirect checks if the error is a redirect and updates routing.
+// Returns the new client to use and true if redirect was handled.
+func (p *Platform) handleRedirect(sessionID string, err error) (pb.SandboxAgentClient, bool) {
+	host, port, ok := redirectTarget(err)
+	if !ok {
+		return nil, false
 	}
-	return nil
+
+	// Build the new address
+	newAddr := host
+	if port > 0 {
+		newAddr = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+
+	slog.Debug("handling redirect", "session_id", sessionID, "new_addr", newAddr)
+	p.updateSessionNode(sessionID, newAddr)
+	return p.getClientForNode(newAddr), true
+}
+
+// client returns the default sandbox-agent client.
+// This is a helper for backward compatibility.
+func (p *Platform) client() pb.SandboxAgentClient {
+	return p.getClientForNode(p.defaultAddr)
 }
 
 // CreateSandbox creates a new sandbox via the agent.
 func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandboxRequest) (*platform.Sandbox, error) {
-	resp, err := p.client.CreateSandbox(ctx, &pb.CreateSandboxRequest{
-		SessionId: req.SessionID,
-		Image:     req.Image,
-		Command:   req.Command,
-		Env:       req.Env,
-		Labels:    req.Labels,
-	})
+	client := p.getClientForSession(req.SessionID)
+	if client == nil {
+		return nil, fmt.Errorf("no connection to sandbox-agent")
+	}
+
+	pbReq := &pb.CreateSandboxRequest{
+		SessionId:   req.SessionID,
+		Image:       req.Image,
+		Command:     req.Command,
+		Env:         req.Env,
+		Labels:      req.Labels,
+		DownloadUrl: req.DownloadURL,
+	}
+
+	resp, err := client.CreateSandbox(ctx, pbReq)
+	if err != nil {
+		// Handle redirect
+		if newClient, ok := p.handleRedirect(req.SessionID, err); ok && newClient != nil {
+			resp, err = newClient.CreateSandbox(ctx, pbReq)
+		}
+	}
 	if err != nil {
 		if status.Code(err) == codes.AlreadyExists {
 			return nil, platform.ErrAlreadyExists
@@ -104,14 +243,27 @@ func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandbox
 		return nil, fmt.Errorf("create sandbox: %w", err)
 	}
 
-	return protoToSandbox(resp), nil
+	// Cache the node from response
+	sandbox := protoToSandbox(resp)
+	if sandbox.Host != "" {
+		p.updateSessionNode(req.SessionID, normalizeAgentAddr(sandbox.Host))
+	}
+
+	return sandbox, nil
 }
 
 // GetSandbox retrieves sandbox info from the agent.
 func (p *Platform) GetSandbox(ctx context.Context, sessionID string) (*platform.Sandbox, error) {
-	resp, err := p.client.GetSandbox(ctx, &pb.GetSandboxRequest{
-		SessionId: sessionID,
-	})
+	client := p.getClientForSession(sessionID)
+	pbReq := &pb.GetSandboxRequest{SessionId: sessionID}
+
+	resp, err := client.GetSandbox(ctx, pbReq)
+	if err != nil {
+		// Handle redirect
+		if newClient, ok := p.handleRedirect(sessionID, err); ok && newClient != nil {
+			resp, err = newClient.GetSandbox(ctx, pbReq)
+		}
+	}
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			p.invalidateCache(sessionID)
@@ -121,6 +273,10 @@ func (p *Platform) GetSandbox(ctx context.Context, sessionID string) (*platform.
 	}
 
 	sandbox := protoToSandbox(resp)
+	// Update node routing cache
+	if sandbox.Host != "" {
+		p.updateSessionNode(sessionID, normalizeAgentAddr(sandbox.Host))
+	}
 	p.cacheUpdate(sessionID, sandbox)
 	return sandbox, nil
 }
@@ -159,7 +315,8 @@ func (p *Platform) invalidateCache(sessionID string) {
 
 // DeleteSandbox deletes a sandbox via the agent.
 func (p *Platform) DeleteSandbox(ctx context.Context, sessionID string) error {
-	_, err := p.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
+	client := p.getClientForSession(sessionID)
+	_, err := client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
 		SessionId: sessionID,
 	})
 	p.invalidateCache(sessionID)
@@ -174,7 +331,7 @@ func (p *Platform) DeleteSandbox(ctx context.Context, sessionID string) error {
 
 // ListSandboxes lists all sandboxes from the agent.
 func (p *Platform) ListSandboxes(ctx context.Context) ([]*platform.Sandbox, error) {
-	resp, err := p.client.ListSandboxes(ctx, &pb.ListSandboxesRequest{})
+	resp, err := p.client().ListSandboxes(ctx, &pb.ListSandboxesRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("list sandboxes: %w", err)
 	}
@@ -198,19 +355,27 @@ func (p *Platform) Exec(ctx context.Context, req platform.ExecRequest) (*platfor
 		timeoutMs = req.Timeout.Milliseconds()
 	}
 
-	resp, err := p.client.Exec(ctx, &pb.ExecRequest{
+	client := p.getClientForSession(req.SessionID)
+	pbReq := &pb.ExecRequest{
 		SessionId: req.SessionID,
 		Args:      req.Command,
 		Env:       mapToEnv(req.Env),
 		Cwd:       req.WorkingDir,
 		TimeoutMs: timeoutMs,
-	})
+	}
+
+	resp, err := client.Exec(ctx, pbReq)
+	if err != nil {
+		if newClient, ok := p.handleRedirect(req.SessionID, err); ok && newClient != nil {
+			resp, err = newClient.Exec(ctx, pbReq)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("exec: %w", err)
 	}
 
-	// Update activity
-	p.updateActivity(ctx, req.SessionID)
+	// Update activity - disabled temporarily to reduce K8s API load
+	// p.updateActivity(ctx, req.SessionID)
 
 	return &platform.ExecResult{
 		ExitCode: int(resp.GetExitCode()),
@@ -226,12 +391,20 @@ func (p *Platform) StartProcess(ctx context.Context, req platform.StartProcessRe
 		return nil, err
 	}
 
-	resp, err := p.client.StartProcess(ctx, &pb.StartProcessRequest{
+	client := p.getClientForSession(req.SessionID)
+	pbReq := &pb.StartProcessRequest{
 		SessionId: req.SessionID,
 		Command:   req.Command,
 		Env:       req.Env,
 		Tty:       req.Terminal,
-	})
+	}
+
+	resp, err := client.StartProcess(ctx, pbReq)
+	if err != nil {
+		if newClient, ok := p.handleRedirect(req.SessionID, err); ok && newClient != nil {
+			resp, err = newClient.StartProcess(ctx, pbReq)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("start process: %w", err)
 	}
@@ -252,16 +425,24 @@ func (p *Platform) StartProcess(ctx context.Context, req platform.StartProcessRe
 
 // WriteToProcess writes data to a process stdin.
 func (p *Platform) WriteToProcess(ctx context.Context, sessionID, execID string, data []byte) error {
-	_, err := p.client.WriteToProcess(ctx, &pb.WriteToProcessRequest{
+	client := p.getClientForSession(sessionID)
+	pbReq := &pb.WriteToProcessRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
 		Data:      data,
-	})
+	}
+
+	_, err := client.WriteToProcess(ctx, pbReq)
+	if err != nil {
+		if newClient, ok := p.handleRedirect(sessionID, err); ok && newClient != nil {
+			_, err = newClient.WriteToProcess(ctx, pbReq)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("write to process: %w", err)
 	}
 
-	p.updateActivity(ctx, sessionID)
+	// p.updateActivity(ctx, sessionID)  // disabled temporarily
 	return nil
 }
 
@@ -281,7 +462,7 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 	stderrCh := make(chan readResult, 1)
 
 	go func() {
-		resp, err := p.client.ReadProcessStdout(readCtx, &pb.ReadProcessOutputRequest{
+		resp, err := p.getClientForSession(sessionID).ReadProcessStdout(readCtx, &pb.ReadProcessOutputRequest{
 			SessionId: sessionID,
 			ProcessId: execID,
 			MaxBytes:  4096,
@@ -294,7 +475,7 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 	}()
 
 	go func() {
-		resp, err := p.client.ReadProcessStderr(readCtx, &pb.ReadProcessOutputRequest{
+		resp, err := p.getClientForSession(sessionID).ReadProcessStderr(readCtx, &pb.ReadProcessOutputRequest{
 			SessionId: sessionID,
 			ProcessId: execID,
 			MaxBytes:  4096,
@@ -328,7 +509,7 @@ func (p *Platform) ReadStdout(ctx context.Context, sessionID, execID string) ([]
 	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
 	defer cancel()
 
-	resp, err := p.client.ReadProcessStdout(readCtx, &pb.ReadProcessOutputRequest{
+	resp, err := p.getClientForSession(sessionID).ReadProcessStdout(readCtx, &pb.ReadProcessOutputRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
 		MaxBytes:  4096,
@@ -347,7 +528,7 @@ func (p *Platform) ReadStderr(ctx context.Context, sessionID, execID string) ([]
 	readCtx, cancel := context.WithTimeout(ctx, agentReadTimeout)
 	defer cancel()
 
-	resp, err := p.client.ReadProcessStderr(readCtx, &pb.ReadProcessOutputRequest{
+	resp, err := p.getClientForSession(sessionID).ReadProcessStderr(readCtx, &pb.ReadProcessOutputRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
 		MaxBytes:  4096,
@@ -363,8 +544,9 @@ func (p *Platform) ReadStderr(ctx context.Context, sessionID, execID string) ([]
 
 // KillProcess kills a process.
 func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) error {
+	client := p.getClientForSession(sessionID)
 	// Send SIGKILL
-	_, err := p.client.KillProcess(ctx, &pb.KillProcessRequest{
+	_, err := client.KillProcess(ctx, &pb.KillProcessRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
 		Signal:    9,
@@ -377,7 +559,7 @@ func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) er
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	_, _ = p.client.WaitProcess(waitCtx, &pb.WaitProcessRequest{
+	_, _ = client.WaitProcess(waitCtx, &pb.WaitProcessRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
 	})
@@ -391,8 +573,9 @@ func (p *Platform) KillProcess(ctx context.Context, sessionID, execID string) er
 
 // IsProcessAlive checks if a process is still running.
 func (p *Platform) IsProcessAlive(ctx context.Context, sessionID, execID string) (bool, error) {
+	client := p.getClientForSession(sessionID)
 	// Send signal 0 to check if alive
-	_, err := p.client.KillProcess(ctx, &pb.KillProcessRequest{
+	_, err := client.KillProcess(ctx, &pb.KillProcessRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
 		Signal:    0,
@@ -405,7 +588,8 @@ func (p *Platform) IsProcessAlive(ctx context.Context, sessionID, execID string)
 
 // ResizeProcess resizes a process TTY.
 func (p *Platform) ResizeProcess(ctx context.Context, sessionID, execID string, rows, columns uint32) error {
-	_, err := p.client.ResizeTerminal(ctx, &pb.ResizeTerminalRequest{
+	client := p.getClientForSession(sessionID)
+	_, err := client.ResizeTerminal(ctx, &pb.ResizeTerminalRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
 		Rows:      rows,
@@ -501,6 +685,75 @@ func (p *Platform) StreamStderr(ctx context.Context, req platform.StreamReadRequ
 	return ch, nil
 }
 
+// StreamOutput returns a channel that streams both stdout and stderr using gRPC streaming.
+// This is more efficient than polling ReadStdout/ReadStderr.
+func (p *Platform) StreamOutput(ctx context.Context, req platform.StreamReadRequest) (<-chan platform.OutputChunk, error) {
+	ch := make(chan platform.OutputChunk, 16)
+
+	// Get the client for this session
+	client := p.getClientForSession(req.SessionID)
+	if client == nil {
+		close(ch)
+		return nil, fmt.Errorf("no connection to sandbox-agent")
+	}
+
+	pbReq := &pb.StreamProcessOutputRequest{
+		SessionId: req.SessionID,
+		ProcessId: req.ExecID,
+	}
+
+	// Start the streaming call
+	stream, err := client.StreamProcessOutput(ctx, pbReq)
+	if err != nil {
+		// Handle redirect
+		if newClient, ok := p.handleRedirect(req.SessionID, err); ok && newClient != nil {
+			stream, err = newClient.StreamProcessOutput(ctx, pbReq)
+		}
+	}
+	if err != nil {
+		close(ch)
+		return nil, fmt.Errorf("stream process output: %w", err)
+	}
+
+	go func() {
+		defer close(ch)
+		for {
+			chunk, err := stream.Recv()
+			if err != nil {
+				// Check for normal stream end
+				if err.Error() == "EOF" || status.Code(err) == codes.Canceled {
+					ch <- platform.OutputChunk{EOF: true}
+					return
+				}
+				// Check for redirect and retry
+				if newClient, ok := p.handleRedirect(req.SessionID, err); ok && newClient != nil {
+					newStream, retryErr := newClient.StreamProcessOutput(ctx, pbReq)
+					if retryErr == nil {
+						stream = newStream
+						continue
+					}
+				}
+				ch <- platform.OutputChunk{EOF: true, Err: err}
+				return
+			}
+
+			// Convert proto stream type to platform type
+			streamType := platform.StreamStdout
+			if chunk.GetStream() == pb.ProcessOutputChunk_STDERR {
+				streamType = platform.StreamStderr
+			}
+
+			select {
+			case ch <- platform.OutputChunk{Stream: streamType, Data: chunk.GetData()}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return ch, nil
+}
+
 // waitForSandboxReady waits for a sandbox to be ready using exponential backoff with jitter.
 func (p *Platform) waitForSandboxReady(ctx context.Context, sessionID, containerName string) (*platform.Sandbox, error) {
 	ctx, cancel := context.WithTimeout(ctx, sandboxReadyTimeout)
@@ -539,7 +792,7 @@ func addJitter(d time.Duration) time.Duration {
 }
 
 func (p *Platform) updateActivity(ctx context.Context, sessionID string) {
-	_, err := p.client.UpdateSandboxActivity(ctx, &pb.UpdateSandboxActivityRequest{
+	_, err := p.client().UpdateSandboxActivity(ctx, &pb.UpdateSandboxActivityRequest{
 		SessionId: sessionID,
 	})
 	if err != nil {

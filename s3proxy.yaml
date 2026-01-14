@@ -1,0 +1,137 @@
+# S3Proxy Kubernetes Deployment
+# Deploy to any namespace with: kubectl apply -f s3proxy.yaml -n <namespace>
+#
+# S3Proxy implements the S3 API and proxies requests to various storage backends.
+# This manifest configures it with local filesystem storage.
+#
+# Default credentials:
+#   Access Key ID: s3proxy-access-key
+#   Secret Access Key: s3proxy-secret-key
+#
+# Test with:
+#   aws --endpoint-url http://s3proxy:8080 s3 mb s3://test-bucket
+#   aws --endpoint-url http://s3proxy:8080 s3 ls
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3proxy-credentials
+  labels:
+    app: s3proxy
+type: Opaque
+stringData:
+  # S3Proxy identity/credential (what clients use to authenticate)
+  S3PROXY_IDENTITY: "s3proxy-access-key"
+  S3PROXY_CREDENTIAL: "s3proxy-secret-key"
+  # jclouds identity/credential (for backend storage - not used with filesystem)
+  JCLOUDS_IDENTITY: "remote-identity"
+  JCLOUDS_CREDENTIAL: "remote-credential"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3proxy-config
+  labels:
+    app: s3proxy
+data:
+  # Logging level: trace, debug, info, warn, error
+  LOG_LEVEL: "info"
+  # S3 API endpoint configuration
+  S3PROXY_ENDPOINT: "http://0.0.0.0:8080"
+  # Authorization mode: aws-v2, aws-v4, aws-v2-or-v4, or none
+  S3PROXY_AUTHORIZATION: "aws-v2-or-v4"
+  # Storage backend: filesystem-nio2 for local disk storage
+  JCLOUDS_PROVIDER: "filesystem-nio2"
+  # Base directory for filesystem storage (inside the container)
+  JCLOUDS_FILESYSTEM_BASEDIR: "/data"
+  # Default region for S3 API responses
+  JCLOUDS_REGIONS: "us-east-1"
+  # CORS settings (set to "true" to allow all origins)
+  S3PROXY_CORS_ALLOW_ALL: "false"
+  # Read-only mode (set to "true" to disable writes)
+  S3PROXY_READ_ONLY_BLOBSTORE: "false"
+  # Ignore unknown headers (useful for compatibility)
+  S3PROXY_IGNORE_UNKNOWN_HEADERS: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3proxy
+  labels:
+    app: s3proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s3proxy
+  strategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: s3proxy
+    spec:
+      containers:
+        - name: s3proxy
+          image: andrewgaul/s3proxy:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: s3proxy-config
+            - secretRef:
+                name: s3proxy-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+      volumes:
+        - name: data
+          emptyDir: {}
+      # Optional: Use a PVC for persistent storage
+      # volumes:
+      #   - name: data
+      #     persistentVolumeClaim:
+      #       claimName: s3proxy-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3proxy
+  labels:
+    app: s3proxy
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: s3proxy

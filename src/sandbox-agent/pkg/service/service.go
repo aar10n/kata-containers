@@ -1,9 +1,13 @@
 package service
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -13,13 +17,23 @@ import (
 	apierrors "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/errors"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/hostfs"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/storage"
 )
+
+// SnapshotFileName is the default name for sandbox snapshot files.
+const SnapshotFileName = "snapshot.tar.gz"
 
 // Config holds service configuration.
 type Config struct {
 	NodeName    string
 	ExecTimeout time.Duration
 	Mode        string // "kata" or "pod"
+
+	// Storage configuration
+	StorageEnabled   bool
+	StorageAddr      string
+	StorageTimeout   time.Duration
+	StorageInitImage string
 }
 
 // Service defines the sandbox agent service interface.
@@ -30,6 +44,9 @@ type Service interface {
 	DeleteSandbox(ctx context.Context, sessionID string) error
 	ListSandboxes(ctx context.Context, nodeName string) []*k8s.SandboxInfo
 	UpdateSandboxActivity(ctx context.Context, sessionID string) error
+	// SuspendSandbox snapshots the sandbox's /data directory, uploads to S3, and deletes the pod.
+	// Only supported in pod mode with storage enabled.
+	SuspendSandbox(ctx context.Context, sessionID string) (*SuspendSandboxResult, error)
 
 	// Routing helpers
 	NodeForVM(vmID string) (string, bool)
@@ -46,6 +63,7 @@ type Service interface {
 	ReadStderr(ctx context.Context, sessionID, processID string, maxBytes int) ([]byte, error)
 	StreamStdout(ctx context.Context, sessionID, processID string) (<-chan backend.StreamChunk, error)
 	StreamStderr(ctx context.Context, sessionID, processID string) (<-chan backend.StreamChunk, error)
+	StreamOutput(ctx context.Context, sessionID, processID string) (<-chan backend.OutputChunk, error)
 	CloseStdin(ctx context.Context, sessionID, processID string) error
 	KillProcess(ctx context.Context, sessionID, processID string, signal int) error
 	WaitProcess(ctx context.Context, sessionID, processID string) (int32, error)
@@ -76,6 +94,18 @@ type CreateSandboxRequest struct {
 	Command   []string
 	Env       map[string]string
 	Labels    map[string]string
+	// DownloadURL is a presigned GET URL for downloading a snapshot to restore.
+	// If set, an init container will download and extract the snapshot before
+	// the main container starts. Only used in pod mode with storage enabled.
+	DownloadURL string
+}
+
+// SuspendSandboxResult holds the result of a suspend operation.
+type SuspendSandboxResult struct {
+	// SnapshotSize is the size of the uploaded snapshot in bytes.
+	SnapshotSize int64
+	// Duration is the time taken to create and upload the snapshot.
+	Duration time.Duration
 }
 
 // ExecRequest holds parameters for command execution.
@@ -110,22 +140,47 @@ type ProcessInfo struct {
 }
 
 type service struct {
-	config  Config
-	store   *k8s.Store
-	manager *k8s.Manager
-	backend backend.ExecutionBackend
-	hostfs  *hostfs.HostFS
+	config        Config
+	store         *k8s.Store
+	manager       *k8s.Manager
+	backend       backend.ExecutionBackend
+	hostfs        *hostfs.HostFS
+	storageClient *storage.Client
 }
 
 // New creates a new service instance.
-func New(cfg Config, store *k8s.Store, manager *k8s.Manager, be backend.ExecutionBackend, hfs *hostfs.HostFS) Service {
-	return &service{
+func New(cfg Config, store *k8s.Store, manager *k8s.Manager, be backend.ExecutionBackend, hfs *hostfs.HostFS) (Service, error) {
+	svc := &service{
 		config:  cfg,
 		store:   store,
 		manager: manager,
 		backend: be,
 		hostfs:  hfs,
 	}
+
+	// Set local node name for filtering finalizer handling
+	// Only the agent on the pod's node should handle the finalizer
+	if cfg.NodeName != "" {
+		store.SetLocalNodeName(cfg.NodeName)
+	}
+
+	// Initialize storage client if enabled
+	if cfg.StorageEnabled {
+		client, err := storage.NewClient(storage.ClientConfig{
+			Addr:    cfg.StorageAddr,
+			Timeout: cfg.StorageTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create storage client: %w", err)
+		}
+		svc.storageClient = client
+
+		// Register callback to auto-save snapshots when pods are deleted
+		store.SetPodDeletingCallback(svc.handlePodDeleting)
+		slog.Info("registered auto-save callback for pod deletions", "node", cfg.NodeName)
+	}
+
+	return svc, nil
 }
 
 func (s *service) Mode() string {
@@ -133,8 +188,19 @@ func (s *service) Mode() string {
 }
 
 func (s *service) Close() error {
+	var errs []error
+	if s.storageClient != nil {
+		if err := s.storageClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if s.backend != nil {
-		return s.backend.Close()
+		if err := s.backend.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errs[0]
 	}
 	return nil
 }
@@ -143,11 +209,14 @@ func (s *service) Close() error {
 
 func (s *service) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*k8s.SandboxInfo, error) {
 	return s.manager.CreateSandbox(ctx, k8s.CreateSandboxRequest{
-		SessionID: req.SessionID,
-		Image:     req.Image,
-		Command:   req.Command,
-		Env:       req.Env,
-		Labels:    req.Labels,
+		SessionID:               req.SessionID,
+		Image:                   req.Image,
+		Command:                 req.Command,
+		Env:                     req.Env,
+		Labels:                  req.Labels,
+		DownloadURL:             req.DownloadURL,
+		InitImage:               s.config.StorageInitImage,
+		EnableSnapshotFinalizer: s.storageClient != nil, // Enable finalizer when storage is enabled
 	})
 }
 
@@ -176,6 +245,142 @@ func (s *service) ListSandboxes(ctx context.Context, nodeName string) []*k8s.San
 
 func (s *service) UpdateSandboxActivity(ctx context.Context, sessionID string) error {
 	return s.manager.UpdateSandboxActivity(ctx, sessionID)
+}
+
+func (s *service) SuspendSandbox(ctx context.Context, sessionID string) (*SuspendSandboxResult, error) {
+	start := time.Now()
+
+	// Validate prerequisites
+	if s.config.Mode != "pod" {
+		return nil, fmt.Errorf("%w: suspend is only supported in pod mode", apierrors.ErrNotSupported)
+	}
+	if s.storageClient == nil {
+		return nil, fmt.Errorf("%w: storage is not enabled", apierrors.ErrNotSupported)
+	}
+	if s.hostfs == nil {
+		return nil, fmt.Errorf("%w: hostfs is not available", apierrors.ErrNotSupported)
+	}
+
+	// Save snapshot
+	archiveSize, err := s.saveSnapshot(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Remove finalizer first so the pod can be deleted
+	if err := s.manager.RemoveSnapshotFinalizer(ctx, sessionID); err != nil && err != k8s.ErrSandboxNotFound {
+		slog.Warn("failed to remove finalizer after suspend", "session_id", sessionID, "error", err)
+	}
+
+	// Delete the pod
+	if err := s.manager.DeleteSandbox(ctx, sessionID); err != nil {
+		slog.Warn("failed to delete pod after suspend", "session_id", sessionID, "error", err)
+		// Don't fail - snapshot was uploaded successfully
+	}
+
+	return &SuspendSandboxResult{
+		SnapshotSize: archiveSize,
+		Duration:     time.Since(start),
+	}, nil
+}
+
+// saveSnapshot creates and uploads a snapshot for the given session.
+// Returns the size of the uploaded snapshot in bytes.
+func (s *service) saveSnapshot(ctx context.Context, sessionID string) (int64, error) {
+	// Get sandbox info
+	info, ok := s.store.GetSandbox(sessionID)
+	if !ok {
+		return 0, fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
+	}
+	if info.PodUID == "" {
+		return 0, fmt.Errorf("%w: pod UID not available", apierrors.ErrNotFound)
+	}
+
+	// Step 1: Create tar archive of /data directory
+	slog.Info("creating snapshot", "session_id", sessionID, "pod_uid", info.PodUID)
+	archiveReader, err := s.hostfs.ReadArchive(ctx, info.PodUID, ".")
+	if err != nil {
+		return 0, fmt.Errorf("create archive: %w", err)
+	}
+
+	// Read archive and gzip-compress it for upload
+	var archiveBuf bytes.Buffer
+	gzWriter := gzip.NewWriter(&archiveBuf)
+	if _, err := io.Copy(gzWriter, archiveReader); err != nil {
+		archiveReader.Close()
+		gzWriter.Close()
+		return 0, fmt.Errorf("compress archive: %w", err)
+	}
+	archiveReader.Close()
+	if err := gzWriter.Close(); err != nil {
+		return 0, fmt.Errorf("finalize gzip: %w", err)
+	}
+	archiveSize := int64(archiveBuf.Len())
+
+	slog.Info("snapshot created", "session_id", sessionID, "size_bytes", archiveSize)
+
+	// Step 2: Get presigned upload URL from storage service
+	uploadResult, err := s.storageClient.GetUploadURL(ctx, sessionID, SnapshotFileName)
+	if err != nil {
+		return 0, fmt.Errorf("get upload URL: %w", err)
+	}
+
+	// Step 3: Upload archive to S3
+	slog.Info("uploading snapshot", "session_id", sessionID, "key", uploadResult.Key)
+	if err := uploadToPresignedURL(ctx, uploadResult.URL, archiveBuf.Bytes()); err != nil {
+		return 0, fmt.Errorf("upload snapshot: %w", err)
+	}
+
+	slog.Info("snapshot uploaded", "session_id", sessionID, "size_bytes", archiveSize)
+	return archiveSize, nil
+}
+
+// handlePodDeleting is called when a pod with our finalizer is being deleted.
+// It saves a snapshot and removes the finalizer to allow deletion to proceed.
+func (s *service) handlePodDeleting(sessionID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	slog.Info("auto-saving snapshot on pod deletion", "session_id", sessionID)
+
+	// Clear the pending state when done (success or failure)
+	defer s.store.ClearPendingSnapshotSave(sessionID)
+
+	// Try to save the snapshot
+	if _, err := s.saveSnapshot(ctx, sessionID); err != nil {
+		slog.Error("failed to auto-save snapshot", "session_id", sessionID, "error", err)
+		// Still remove the finalizer so the pod can be deleted
+	}
+
+	// Remove finalizer to allow pod deletion to proceed
+	if err := s.manager.RemoveSnapshotFinalizer(ctx, sessionID); err != nil {
+		slog.Error("failed to remove finalizer", "session_id", sessionID, "error", err)
+	} else {
+		slog.Info("removed finalizer, pod will be deleted", "session_id", sessionID)
+	}
+}
+
+// uploadToPresignedURL uploads data to a presigned PUT URL.
+func uploadToPresignedURL(ctx context.Context, url string, data []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/gzip")
+	req.ContentLength = int64(len(data))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 // Routing helpers
@@ -276,6 +481,14 @@ func (s *service) StreamStderr(ctx context.Context, sessionID, processID string)
 		return nil, err
 	}
 	return s.backend.StreamStderr(ctx, containerID, processID)
+}
+
+func (s *service) StreamOutput(ctx context.Context, sessionID, processID string) (<-chan backend.OutputChunk, error) {
+	containerID, err := s.resolveContainerID(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.backend.StreamOutput(ctx, containerID, processID)
 }
 
 func (s *service) CloseStdin(ctx context.Context, sessionID, processID string) error {
@@ -411,21 +624,14 @@ func (s *service) resolveContainerID(sessionID string) (string, error) {
 		return "", fmt.Errorf("%w: session id is required", apierrors.ErrInvalidArgument)
 	}
 
-	// In pod mode, use container ID from pod status
-	if s.config.Mode == "pod" {
-		containerID, ok := s.store.ContainerIDForSession(sessionID)
-		if !ok {
-			return "", fmt.Errorf("%w: container not found for session", apierrors.ErrNotFound)
-		}
-		return containerID, nil
+	// In both pod and kata modes, use container ID from pod status.
+	// For kata mode, the backend will resolve the sandbox ID separately
+	// using the SandboxIDResolver to connect to the correct shim.
+	containerID, ok := s.store.ContainerIDForSession(sessionID)
+	if !ok {
+		return "", fmt.Errorf("%w: container not found for session", apierrors.ErrNotFound)
 	}
-
-	// In kata mode, use sandbox ID
-	sandboxID, err := s.resolveSandboxID(sessionID)
-	if err != nil {
-		return "", err
-	}
-	return sandboxID, nil
+	return containerID, nil
 }
 
 func (s *service) resolveSandboxID(sessionID string) (string, error) {

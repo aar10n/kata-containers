@@ -22,6 +22,9 @@ const (
 	SandboxDataVolumeName = "sandbox-data"
 	// SandboxDataMountPath is the mount path inside the container for the data volume.
 	SandboxDataMountPath = "/data"
+	// SnapshotFinalizer is added to pods when storage is enabled to ensure
+	// snapshots are saved before pod deletion.
+	SnapshotFinalizer = "sandbox.cohere.com/snapshot"
 )
 
 var (
@@ -65,6 +68,15 @@ type CreateSandboxRequest struct {
 	Command   []string
 	Env       map[string]string
 	Labels    map[string]string
+	// DownloadURL is a presigned GET URL for downloading a snapshot to restore.
+	// If set, an init container will download and extract the snapshot into /data.
+	DownloadURL string
+	// InitImage is the container image for the init container.
+	// Should contain wget/curl and tar. Defaults to busybox:1.36.
+	InitImage string
+	// EnableSnapshotFinalizer adds a finalizer to the pod that blocks deletion
+	// until a snapshot is saved. This ensures data is preserved on pod eviction.
+	EnableSnapshotFinalizer bool
 }
 
 // CreateSandbox creates a new sandbox pod.
@@ -135,9 +147,46 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 				MountPath: SandboxDataMountPath,
 			},
 		}
+
+		// Add init container if restoring from snapshot
+		if downloadURL := strings.TrimSpace(req.DownloadURL); downloadURL != "" {
+			initImage := strings.TrimSpace(req.InitImage)
+			if initImage == "" {
+				initImage = "busybox:1.36"
+			}
+
+			// Init container downloads and extracts the snapshot into /data
+			// Uses wget (busybox) to download and tar to extract
+			podSpec.InitContainers = []corev1.Container{
+				{
+					Name:  "restore-snapshot",
+					Image: initImage,
+					Command: []string{
+						"/bin/sh",
+						"-c",
+						fmt.Sprintf("wget -q -O - '%s' | tar -xzf - --strip-components=1 -C %s", downloadURL, SandboxDataMountPath),
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      SandboxDataVolumeName,
+							MountPath: SandboxDataMountPath,
+						},
+					},
+				},
+			}
+
+			// Add annotation to track that this pod was restored from snapshot
+			annotations["sandbox.cohere.com/restored-from-snapshot"] = "true"
+		}
 	} else {
 		// Kata mode: set RuntimeClassName if configured
 		podSpec.RuntimeClassName = runtimeClassName(m.config.RuntimeClassName)
+	}
+
+	// Build finalizers list if snapshot finalizer is enabled
+	var finalizers []string
+	if req.EnableSnapshotFinalizer {
+		finalizers = []string{SnapshotFinalizer}
 	}
 
 	pod := &corev1.Pod{
@@ -146,6 +195,7 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 			Namespace:   m.config.Namespace,
 			Labels:      labels,
 			Annotations: annotations,
+			Finalizers:  finalizers,
 		},
 		Spec: podSpec,
 	}
@@ -195,6 +245,65 @@ func (m *Manager) DeleteSandbox(ctx context.Context, sessionID string) error {
 		}
 		return fmt.Errorf("delete pod: %w", err)
 	}
+	return nil
+}
+
+// RemoveSnapshotFinalizer removes the snapshot finalizer from a pod, allowing it to be deleted.
+// This should be called after the snapshot has been saved successfully.
+func (m *Manager) RemoveSnapshotFinalizer(ctx context.Context, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("session_id is required")
+	}
+
+	podName, ok := m.store.PodNameForSession(sessionID)
+	if !ok {
+		return ErrSandboxNotFound
+	}
+
+	// Get current pod to find existing finalizers
+	pod, err := m.client.CoreV1().Pods(m.config.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ErrSandboxNotFound
+		}
+		return fmt.Errorf("get pod: %w", err)
+	}
+
+	// Filter out our finalizer
+	var newFinalizers []string
+	for _, f := range pod.Finalizers {
+		if f != SnapshotFinalizer {
+			newFinalizers = append(newFinalizers, f)
+		}
+	}
+
+	// If finalizer wasn't present, nothing to do
+	if len(newFinalizers) == len(pod.Finalizers) {
+		return nil
+	}
+
+	// Patch to remove finalizer
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"finalizers": newFinalizers,
+		},
+	}
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("marshal patch: %w", err)
+	}
+
+	_, err = m.client.CoreV1().Pods(m.config.Namespace).Patch(
+		ctx, podName, types.MergePatchType, data, metav1.PatchOptions{},
+	)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ErrSandboxNotFound
+		}
+		return fmt.Errorf("patch pod: %w", err)
+	}
+
 	return nil
 }
 

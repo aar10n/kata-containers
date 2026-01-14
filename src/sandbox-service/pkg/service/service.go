@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
+	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/storage"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -158,6 +159,12 @@ type LeaderElectionConfig struct {
 	RetryPeriod   time.Duration
 }
 
+// StorageClient provides S3 storage operations for snapshot save/restore.
+type StorageClient interface {
+	GenerateDownloadURL(ctx context.Context, key string) (string, error)
+	HeadFile(ctx context.Context, sessionID, fileName string) (*storage.FileInfo, error)
+}
+
 type Service struct {
 	platform        platform.Platform
 	defaultImage    string
@@ -173,8 +180,9 @@ type Service struct {
 	leaderElection  LeaderElectionConfig
 	stopCh          chan struct{}
 	stopOnce        sync.Once
-	mu              sync.Mutex
-	sessions        map[string]*Session
+	mu            sync.Mutex
+	sessions      map[string]*Session
+	storageClient StorageClient // Optional storage client for snapshot restore
 }
 
 type ExecInput struct {
@@ -272,6 +280,11 @@ func New(p platform.Platform, defaultImage string, defaultCommand []string, main
 		}
 	}
 	return svc
+}
+
+// SetStorageClient sets the storage client for snapshot restore functionality.
+func (s *Service) SetStorageClient(client StorageClient) {
+	s.storageClient = client
 }
 
 func (s *Service) getSession(sessionID string) *Session {
@@ -1463,10 +1476,31 @@ func (s *Service) ensureReady(ctx context.Context, sessionID string, image strin
 		if image == "" {
 			image = s.defaultImage
 		}
+
+		// Check if there's a snapshot to restore
+		var downloadURL string
+		if s.storageClient != nil {
+			const snapshotFileName = "snapshot.tar.gz"
+			info, err := s.storageClient.HeadFile(ctx, sessionID, snapshotFileName)
+			if err != nil {
+				slog.Warn("failed to check for snapshot", "session_id", sessionID, "error", err)
+			} else if info.Exists {
+				key := storage.FileKey(sessionID, snapshotFileName)
+				url, err := s.storageClient.GenerateDownloadURL(ctx, key)
+				if err != nil {
+					slog.Warn("failed to generate download URL", "session_id", sessionID, "error", err)
+				} else {
+					downloadURL = url
+					slog.Info("restoring from snapshot", "session_id", sessionID)
+				}
+			}
+		}
+
 		_, err := s.platform.CreateSandbox(ctx, platform.CreateSandboxRequest{
-			SessionID: sessionID,
-			Image:     image,
-			Command:   append([]string{}, s.defaultCommand...),
+			SessionID:   sessionID,
+			Image:       image,
+			Command:     append([]string{}, s.defaultCommand...),
+			DownloadURL: downloadURL,
 		})
 		if err != nil && !errors.Is(err, platform.ErrAlreadyExists) {
 			return err

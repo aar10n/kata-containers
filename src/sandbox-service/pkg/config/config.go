@@ -12,16 +12,44 @@ import (
 // Config holds all configuration for sandbox-service.
 type Config struct {
 	HTTP     HTTPConfig    `mapstructure:"http"`
+	GRPC     GRPCConfig    `mapstructure:"grpc"`
 	MCP      MCPConfig     `mapstructure:"mcp"`
 	Platform string        `mapstructure:"platform"`
 	Kata     KataConfig    `mapstructure:"kata"`
 	Exec     ExecConfig    `mapstructure:"exec"`
 	Sandbox  SandboxConfig `mapstructure:"sandbox"`
+	Storage  StorageConfig `mapstructure:"storage"`
 }
 
 // HTTPConfig holds HTTP server configuration.
 type HTTPConfig struct {
 	Addr string `mapstructure:"addr"`
+}
+
+// GRPCConfig holds gRPC server configuration for internal services.
+type GRPCConfig struct {
+	// Addr is the listen address for the storage gRPC server
+	Addr string `mapstructure:"addr"`
+}
+
+// StorageConfig holds S3-compatible storage configuration.
+type StorageConfig struct {
+	// Enabled indicates whether storage/snapshot functionality is enabled
+	Enabled bool `mapstructure:"enabled"`
+	// Endpoint is the S3-compatible endpoint URL (e.g., "http://s3proxy.kata-system:80")
+	Endpoint string `mapstructure:"endpoint"`
+	// Region is the AWS region (required but may be ignored by s3proxy)
+	Region string `mapstructure:"region"`
+	// Bucket is the bucket name for snapshot storage
+	Bucket string `mapstructure:"bucket"`
+	// AccessKeyID for authentication
+	AccessKeyID string `mapstructure:"access_key_id"`
+	// SecretAccessKey for authentication
+	SecretAccessKey string `mapstructure:"secret_access_key"`
+	// PresignExpiry is the duration for presigned URL validity
+	PresignExpiry time.Duration `mapstructure:"presign_expiry"`
+	// ForcePathStyle forces path-style URLs (required for s3proxy)
+	ForcePathStyle bool `mapstructure:"force_path_style"`
 }
 
 // MCPConfig holds MCP server configuration.
@@ -89,6 +117,9 @@ func DefaultConfig() Config {
 		HTTP: HTTPConfig{
 			Addr: ":8080",
 		},
+		GRPC: GRPCConfig{
+			Addr: ":9090",
+		},
 		MCP: MCPConfig{
 			Enabled: true,
 			Addr:    ":8081",
@@ -115,6 +146,12 @@ func DefaultConfig() Config {
 			DefaultImage:    "python:3.11-slim",
 			DefaultCommand:  []string{"sleep", "infinity"},
 		},
+		Storage: StorageConfig{
+			Enabled:        false,
+			Region:         "us-east-1",
+			PresignExpiry:  15 * time.Minute,
+			ForcePathStyle: true,
+		},
 	}
 }
 
@@ -140,6 +177,7 @@ func Load(flags *Flags) (Config, error) {
 	// Set defaults
 	defaults := DefaultConfig()
 	v.SetDefault("http.addr", defaults.HTTP.Addr)
+	v.SetDefault("grpc.addr", defaults.GRPC.Addr)
 	v.SetDefault("mcp.enabled", defaults.MCP.Enabled)
 	v.SetDefault("mcp.addr", defaults.MCP.Addr)
 	v.SetDefault("platform", defaults.Platform)
@@ -156,6 +194,10 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("sandbox.cleanup_interval", defaults.Sandbox.CleanupInterval)
 	v.SetDefault("sandbox.default_image", defaults.Sandbox.DefaultImage)
 	v.SetDefault("sandbox.default_command", defaults.Sandbox.DefaultCommand)
+	v.SetDefault("storage.enabled", defaults.Storage.Enabled)
+	v.SetDefault("storage.region", defaults.Storage.Region)
+	v.SetDefault("storage.presign_expiry", defaults.Storage.PresignExpiry)
+	v.SetDefault("storage.force_path_style", defaults.Storage.ForcePathStyle)
 
 	// Enable environment variable overrides
 	// Environment variables use SANDBOX_SERVICE_ prefix with underscores

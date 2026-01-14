@@ -26,6 +26,7 @@ const (
 	SandboxAgent_DeleteSandbox_FullMethodName         = "/sandbox.v1.SandboxAgent/DeleteSandbox"
 	SandboxAgent_ListSandboxes_FullMethodName         = "/sandbox.v1.SandboxAgent/ListSandboxes"
 	SandboxAgent_UpdateSandboxActivity_FullMethodName = "/sandbox.v1.SandboxAgent/UpdateSandboxActivity"
+	SandboxAgent_SuspendSandbox_FullMethodName        = "/sandbox.v1.SandboxAgent/SuspendSandbox"
 	SandboxAgent_Exec_FullMethodName                  = "/sandbox.v1.SandboxAgent/Exec"
 	SandboxAgent_StartProcess_FullMethodName          = "/sandbox.v1.SandboxAgent/StartProcess"
 	SandboxAgent_WriteToProcess_FullMethodName        = "/sandbox.v1.SandboxAgent/WriteToProcess"
@@ -35,6 +36,7 @@ const (
 	SandboxAgent_KillProcess_FullMethodName           = "/sandbox.v1.SandboxAgent/KillProcess"
 	SandboxAgent_WaitProcess_FullMethodName           = "/sandbox.v1.SandboxAgent/WaitProcess"
 	SandboxAgent_ResizeTerminal_FullMethodName        = "/sandbox.v1.SandboxAgent/ResizeTerminal"
+	SandboxAgent_StreamProcessOutput_FullMethodName   = "/sandbox.v1.SandboxAgent/StreamProcessOutput"
 	SandboxAgent_ReadFile_FullMethodName              = "/sandbox.v1.SandboxAgent/ReadFile"
 	SandboxAgent_WriteFile_FullMethodName             = "/sandbox.v1.SandboxAgent/WriteFile"
 	SandboxAgent_ReadArchive_FullMethodName           = "/sandbox.v1.SandboxAgent/ReadArchive"
@@ -54,6 +56,9 @@ type SandboxAgentClient interface {
 	DeleteSandbox(ctx context.Context, in *DeleteSandboxRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListSandboxes(ctx context.Context, in *ListSandboxesRequest, opts ...grpc.CallOption) (*ListSandboxesResponse, error)
 	UpdateSandboxActivity(ctx context.Context, in *UpdateSandboxActivityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// SuspendSandbox snapshots the sandbox's /data directory, uploads to S3, and deletes the pod.
+	// Only supported in pod mode with storage enabled.
+	SuspendSandbox(ctx context.Context, in *SuspendSandboxRequest, opts ...grpc.CallOption) (*SuspendSandboxResponse, error)
 	// Command execution
 	Exec(ctx context.Context, in *ExecRequest, opts ...grpc.CallOption) (*ExecResponse, error)
 	// Process management (interactive/streaming)
@@ -65,6 +70,9 @@ type SandboxAgentClient interface {
 	KillProcess(ctx context.Context, in *KillProcessRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	WaitProcess(ctx context.Context, in *WaitProcessRequest, opts ...grpc.CallOption) (*WaitProcessResponse, error)
 	ResizeTerminal(ctx context.Context, in *ResizeTerminalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// StreamProcessOutput streams stdout and stderr from a process in real-time.
+	// This is more efficient than polling ReadProcessStdout/ReadProcessStderr.
+	StreamProcessOutput(ctx context.Context, in *StreamProcessOutputRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ProcessOutputChunk], error)
 	// File operations
 	ReadFile(ctx context.Context, in *ReadFileRequest, opts ...grpc.CallOption) (*ReadFileResponse, error)
 	WriteFile(ctx context.Context, in *WriteFileRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -137,6 +145,16 @@ func (c *sandboxAgentClient) UpdateSandboxActivity(ctx context.Context, in *Upda
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, SandboxAgent_UpdateSandboxActivity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxAgentClient) SuspendSandbox(ctx context.Context, in *SuspendSandboxRequest, opts ...grpc.CallOption) (*SuspendSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SuspendSandboxResponse)
+	err := c.cc.Invoke(ctx, SandboxAgent_SuspendSandbox_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -233,6 +251,25 @@ func (c *sandboxAgentClient) ResizeTerminal(ctx context.Context, in *ResizeTermi
 	return out, nil
 }
 
+func (c *sandboxAgentClient) StreamProcessOutput(ctx context.Context, in *StreamProcessOutputRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ProcessOutputChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxAgent_ServiceDesc.Streams[0], SandboxAgent_StreamProcessOutput_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamProcessOutputRequest, ProcessOutputChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxAgent_StreamProcessOutputClient = grpc.ServerStreamingClient[ProcessOutputChunk]
+
 func (c *sandboxAgentClient) ReadFile(ctx context.Context, in *ReadFileRequest, opts ...grpc.CallOption) (*ReadFileResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReadFileResponse)
@@ -255,7 +292,7 @@ func (c *sandboxAgentClient) WriteFile(ctx context.Context, in *WriteFileRequest
 
 func (c *sandboxAgentClient) ReadArchive(ctx context.Context, in *ReadArchiveRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ArchiveChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxAgent_ServiceDesc.Streams[0], SandboxAgent_ReadArchive_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxAgent_ServiceDesc.Streams[1], SandboxAgent_ReadArchive_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +311,7 @@ type SandboxAgent_ReadArchiveClient = grpc.ServerStreamingClient[ArchiveChunk]
 
 func (c *sandboxAgentClient) WriteArchive(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WriteArchiveRequest, WriteArchiveResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SandboxAgent_ServiceDesc.Streams[1], SandboxAgent_WriteArchive_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxAgent_ServiceDesc.Streams[2], SandboxAgent_WriteArchive_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +353,9 @@ type SandboxAgentServer interface {
 	DeleteSandbox(context.Context, *DeleteSandboxRequest) (*emptypb.Empty, error)
 	ListSandboxes(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error)
 	UpdateSandboxActivity(context.Context, *UpdateSandboxActivityRequest) (*emptypb.Empty, error)
+	// SuspendSandbox snapshots the sandbox's /data directory, uploads to S3, and deletes the pod.
+	// Only supported in pod mode with storage enabled.
+	SuspendSandbox(context.Context, *SuspendSandboxRequest) (*SuspendSandboxResponse, error)
 	// Command execution
 	Exec(context.Context, *ExecRequest) (*ExecResponse, error)
 	// Process management (interactive/streaming)
@@ -327,6 +367,9 @@ type SandboxAgentServer interface {
 	KillProcess(context.Context, *KillProcessRequest) (*emptypb.Empty, error)
 	WaitProcess(context.Context, *WaitProcessRequest) (*WaitProcessResponse, error)
 	ResizeTerminal(context.Context, *ResizeTerminalRequest) (*emptypb.Empty, error)
+	// StreamProcessOutput streams stdout and stderr from a process in real-time.
+	// This is more efficient than polling ReadProcessStdout/ReadProcessStderr.
+	StreamProcessOutput(*StreamProcessOutputRequest, grpc.ServerStreamingServer[ProcessOutputChunk]) error
 	// File operations
 	ReadFile(context.Context, *ReadFileRequest) (*ReadFileResponse, error)
 	WriteFile(context.Context, *WriteFileRequest) (*emptypb.Empty, error)
@@ -363,6 +406,9 @@ func (UnimplementedSandboxAgentServer) ListSandboxes(context.Context, *ListSandb
 func (UnimplementedSandboxAgentServer) UpdateSandboxActivity(context.Context, *UpdateSandboxActivityRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateSandboxActivity not implemented")
 }
+func (UnimplementedSandboxAgentServer) SuspendSandbox(context.Context, *SuspendSandboxRequest) (*SuspendSandboxResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SuspendSandbox not implemented")
+}
 func (UnimplementedSandboxAgentServer) Exec(context.Context, *ExecRequest) (*ExecResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Exec not implemented")
 }
@@ -389,6 +435,9 @@ func (UnimplementedSandboxAgentServer) WaitProcess(context.Context, *WaitProcess
 }
 func (UnimplementedSandboxAgentServer) ResizeTerminal(context.Context, *ResizeTerminalRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResizeTerminal not implemented")
+}
+func (UnimplementedSandboxAgentServer) StreamProcessOutput(*StreamProcessOutputRequest, grpc.ServerStreamingServer[ProcessOutputChunk]) error {
+	return status.Errorf(codes.Unimplemented, "method StreamProcessOutput not implemented")
 }
 func (UnimplementedSandboxAgentServer) ReadFile(context.Context, *ReadFileRequest) (*ReadFileResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReadFile not implemented")
@@ -533,6 +582,24 @@ func _SandboxAgent_UpdateSandboxActivity_Handler(srv interface{}, ctx context.Co
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxAgentServer).UpdateSandboxActivity(ctx, req.(*UpdateSandboxActivityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxAgent_SuspendSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SuspendSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxAgentServer).SuspendSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxAgent_SuspendSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxAgentServer).SuspendSandbox(ctx, req.(*SuspendSandboxRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -699,6 +766,17 @@ func _SandboxAgent_ResizeTerminal_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxAgent_StreamProcessOutput_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamProcessOutputRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(SandboxAgentServer).StreamProcessOutput(m, &grpc.GenericServerStream[StreamProcessOutputRequest, ProcessOutputChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxAgent_StreamProcessOutputServer = grpc.ServerStreamingServer[ProcessOutputChunk]
+
 func _SandboxAgent_ReadFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReadFileRequest)
 	if err := dec(in); err != nil {
@@ -821,6 +899,10 @@ var SandboxAgent_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _SandboxAgent_UpdateSandboxActivity_Handler,
 		},
 		{
+			MethodName: "SuspendSandbox",
+			Handler:    _SandboxAgent_SuspendSandbox_Handler,
+		},
+		{
 			MethodName: "Exec",
 			Handler:    _SandboxAgent_Exec_Handler,
 		},
@@ -874,6 +956,11 @@ var SandboxAgent_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamProcessOutput",
+			Handler:       _SandboxAgent_StreamProcessOutput_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "ReadArchive",
 			Handler:       _SandboxAgent_ReadArchive_Handler,

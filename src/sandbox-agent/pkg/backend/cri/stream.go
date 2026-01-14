@@ -38,7 +38,8 @@ type streamConn struct {
 	bufMu     sync.Mutex
 
 	// Signals
-	done chan struct{}
+	done      chan struct{}
+	dataReady chan struct{} // signaled when new data arrives
 }
 
 // newStreamConn connects to a CRI streaming URL and returns a managed connection.
@@ -71,8 +72,9 @@ func newStreamConn(ctx context.Context, streamURL string) (*streamConn, error) {
 	}
 
 	conn := &streamConn{
-		ws:   ws,
-		done: make(chan struct{}),
+		ws:        ws,
+		done:      make(chan struct{}),
+		dataReady: make(chan struct{}, 1), // buffered to avoid blocking
 	}
 
 	// Start reading in background
@@ -107,6 +109,12 @@ func (c *streamConn) readLoop() {
 			c.stderrBuf = append(c.stderrBuf, payload...)
 		}
 		c.bufMu.Unlock()
+
+		// Signal that new data is available (non-blocking)
+		select {
+		case c.dataReady <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -221,4 +229,9 @@ func (c *streamConn) Close() error {
 // Done returns a channel that's closed when the connection ends.
 func (c *streamConn) Done() <-chan struct{} {
 	return c.done
+}
+
+// DataReady returns a channel that receives when new data is available.
+func (c *streamConn) DataReady() <-chan struct{} {
+	return c.dataReady
 }

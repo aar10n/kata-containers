@@ -28,6 +28,11 @@ service SandboxAgent {
   rpc UpdateSandboxActivity(UpdateSandboxActivityRequest) returns (google.protobuf.Empty) {
     option (google.api.http) = { post: "/v1/sandboxes/{session_id}/activity" };
   }
+  // SuspendSandbox snapshots the sandbox's /data directory, uploads to S3, and deletes the pod.
+  // Only supported in pod mode with storage enabled.
+  rpc SuspendSandbox(SuspendSandboxRequest) returns (SuspendSandboxResponse) {
+    option (google.api.http) = { post: "/v1/sandboxes/{session_id}/suspend" body: "*" };
+  }
 
   // Command execution
   rpc Exec(ExecRequest) returns (ExecResponse) {
@@ -59,6 +64,9 @@ service SandboxAgent {
   rpc ResizeTerminal(ResizeTerminalRequest) returns (google.protobuf.Empty) {
     option (google.api.http) = { post: "/v1/process/resize" body: "*" };
   }
+  // StreamProcessOutput streams stdout and stderr from a process in real-time.
+  // This is more efficient than polling ReadProcessStdout/ReadProcessStderr.
+  rpc StreamProcessOutput(StreamProcessOutputRequest) returns (stream ProcessOutputChunk);
 
   // File operations
   rpc ReadFile(ReadFileRequest) returns (ReadFileResponse) {
@@ -91,6 +99,9 @@ message CreateSandboxRequest {
   repeated string command = 3;
   map<string, string> env = 4;
   map<string, string> labels = 5;
+  // Presigned GET URL for downloading a snapshot to restore (pod mode only).
+  // If set, an init container will download and extract the snapshot into /data.
+  string download_url = 6;
 }
 
 message GetSandboxRequest {
@@ -202,6 +213,21 @@ message ResizeTerminalRequest {
   uint32 cols = 4;
 }
 
+// Streaming process output
+message StreamProcessOutputRequest {
+  string session_id = 1;
+  string process_id = 2;
+}
+
+message ProcessOutputChunk {
+  enum Stream {
+    STDOUT = 0;
+    STDERR = 1;
+  }
+  Stream stream = 1;
+  bytes data = 2;
+}
+
 // File operations
 message ReadFileRequest {
   string session_id = 1;
@@ -255,4 +281,16 @@ message RestoreVMStateRequest {
   string session_id = 1;
   string vm_id = 2;  // deprecated, use session_id
   string path = 3;
+}
+
+// Suspend/snapshot messages (pod mode only)
+message SuspendSandboxRequest {
+  string session_id = 1;
+}
+
+message SuspendSandboxResponse {
+  // Size of the uploaded snapshot in bytes
+  int64 snapshot_size = 1;
+  // Time taken to create and upload snapshot in milliseconds
+  int64 duration_ms = 2;
 }

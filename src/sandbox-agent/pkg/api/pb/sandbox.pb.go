@@ -23,6 +23,52 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type ProcessOutputChunk_Stream int32
+
+const (
+	ProcessOutputChunk_STDOUT ProcessOutputChunk_Stream = 0
+	ProcessOutputChunk_STDERR ProcessOutputChunk_Stream = 1
+)
+
+// Enum value maps for ProcessOutputChunk_Stream.
+var (
+	ProcessOutputChunk_Stream_name = map[int32]string{
+		0: "STDOUT",
+		1: "STDERR",
+	}
+	ProcessOutputChunk_Stream_value = map[string]int32{
+		"STDOUT": 0,
+		"STDERR": 1,
+	}
+)
+
+func (x ProcessOutputChunk_Stream) Enum() *ProcessOutputChunk_Stream {
+	p := new(ProcessOutputChunk_Stream)
+	*p = x
+	return p
+}
+
+func (x ProcessOutputChunk_Stream) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ProcessOutputChunk_Stream) Descriptor() protoreflect.EnumDescriptor {
+	return file_sandbox_proto_enumTypes[0].Descriptor()
+}
+
+func (ProcessOutputChunk_Stream) Type() protoreflect.EnumType {
+	return &file_sandbox_proto_enumTypes[0]
+}
+
+func (x ProcessOutputChunk_Stream) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ProcessOutputChunk_Stream.Descriptor instead.
+func (ProcessOutputChunk_Stream) EnumDescriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{22, 0}
+}
+
 type HealthResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
@@ -77,12 +123,15 @@ func (x *HealthResponse) GetMode() string {
 
 // Sandbox lifecycle messages
 type CreateSandboxRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	Image         string                 `protobuf:"bytes,2,opt,name=image,proto3" json:"image,omitempty"`
-	Command       []string               `protobuf:"bytes,3,rep,name=command,proto3" json:"command,omitempty"`
-	Env           map[string]string      `protobuf:"bytes,4,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Labels        map[string]string      `protobuf:"bytes,5,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Image     string                 `protobuf:"bytes,2,opt,name=image,proto3" json:"image,omitempty"`
+	Command   []string               `protobuf:"bytes,3,rep,name=command,proto3" json:"command,omitempty"`
+	Env       map[string]string      `protobuf:"bytes,4,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Labels    map[string]string      `protobuf:"bytes,5,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Presigned GET URL for downloading a snapshot to restore (pod mode only).
+	// If set, an init container will download and extract the snapshot into /data.
+	DownloadUrl   string `protobuf:"bytes,6,opt,name=download_url,json=downloadUrl,proto3" json:"download_url,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -150,6 +199,13 @@ func (x *CreateSandboxRequest) GetLabels() map[string]string {
 		return x.Labels
 	}
 	return nil
+}
+
+func (x *CreateSandboxRequest) GetDownloadUrl() string {
+	if x != nil {
+		return x.DownloadUrl
+	}
+	return ""
 }
 
 type GetSandboxRequest struct {
@@ -1238,6 +1294,111 @@ func (x *ResizeTerminalRequest) GetCols() uint32 {
 	return 0
 }
 
+// Streaming process output
+type StreamProcessOutputRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	ProcessId     string                 `protobuf:"bytes,2,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamProcessOutputRequest) Reset() {
+	*x = StreamProcessOutputRequest{}
+	mi := &file_sandbox_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamProcessOutputRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamProcessOutputRequest) ProtoMessage() {}
+
+func (x *StreamProcessOutputRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamProcessOutputRequest.ProtoReflect.Descriptor instead.
+func (*StreamProcessOutputRequest) Descriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *StreamProcessOutputRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *StreamProcessOutputRequest) GetProcessId() string {
+	if x != nil {
+		return x.ProcessId
+	}
+	return ""
+}
+
+type ProcessOutputChunk struct {
+	state         protoimpl.MessageState    `protogen:"open.v1"`
+	Stream        ProcessOutputChunk_Stream `protobuf:"varint,1,opt,name=stream,proto3,enum=sandbox.v1.ProcessOutputChunk_Stream" json:"stream,omitempty"`
+	Data          []byte                    `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProcessOutputChunk) Reset() {
+	*x = ProcessOutputChunk{}
+	mi := &file_sandbox_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProcessOutputChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProcessOutputChunk) ProtoMessage() {}
+
+func (x *ProcessOutputChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProcessOutputChunk.ProtoReflect.Descriptor instead.
+func (*ProcessOutputChunk) Descriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ProcessOutputChunk) GetStream() ProcessOutputChunk_Stream {
+	if x != nil {
+		return x.Stream
+	}
+	return ProcessOutputChunk_STDOUT
+}
+
+func (x *ProcessOutputChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
 // File operations
 type ReadFileRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1249,7 +1410,7 @@ type ReadFileRequest struct {
 
 func (x *ReadFileRequest) Reset() {
 	*x = ReadFileRequest{}
-	mi := &file_sandbox_proto_msgTypes[21]
+	mi := &file_sandbox_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1261,7 +1422,7 @@ func (x *ReadFileRequest) String() string {
 func (*ReadFileRequest) ProtoMessage() {}
 
 func (x *ReadFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[21]
+	mi := &file_sandbox_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1274,7 +1435,7 @@ func (x *ReadFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFileRequest.ProtoReflect.Descriptor instead.
 func (*ReadFileRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{21}
+	return file_sandbox_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ReadFileRequest) GetSessionId() string {
@@ -1300,7 +1461,7 @@ type ReadFileResponse struct {
 
 func (x *ReadFileResponse) Reset() {
 	*x = ReadFileResponse{}
-	mi := &file_sandbox_proto_msgTypes[22]
+	mi := &file_sandbox_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1312,7 +1473,7 @@ func (x *ReadFileResponse) String() string {
 func (*ReadFileResponse) ProtoMessage() {}
 
 func (x *ReadFileResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[22]
+	mi := &file_sandbox_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1325,7 +1486,7 @@ func (x *ReadFileResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFileResponse.ProtoReflect.Descriptor instead.
 func (*ReadFileResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{22}
+	return file_sandbox_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ReadFileResponse) GetContent() []byte {
@@ -1347,7 +1508,7 @@ type WriteFileRequest struct {
 
 func (x *WriteFileRequest) Reset() {
 	*x = WriteFileRequest{}
-	mi := &file_sandbox_proto_msgTypes[23]
+	mi := &file_sandbox_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1359,7 +1520,7 @@ func (x *WriteFileRequest) String() string {
 func (*WriteFileRequest) ProtoMessage() {}
 
 func (x *WriteFileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[23]
+	mi := &file_sandbox_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1372,7 +1533,7 @@ func (x *WriteFileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteFileRequest.ProtoReflect.Descriptor instead.
 func (*WriteFileRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{23}
+	return file_sandbox_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *WriteFileRequest) GetSessionId() string {
@@ -1413,7 +1574,7 @@ type ReadArchiveRequest struct {
 
 func (x *ReadArchiveRequest) Reset() {
 	*x = ReadArchiveRequest{}
-	mi := &file_sandbox_proto_msgTypes[24]
+	mi := &file_sandbox_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1425,7 +1586,7 @@ func (x *ReadArchiveRequest) String() string {
 func (*ReadArchiveRequest) ProtoMessage() {}
 
 func (x *ReadArchiveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[24]
+	mi := &file_sandbox_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1438,7 +1599,7 @@ func (x *ReadArchiveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadArchiveRequest.ProtoReflect.Descriptor instead.
 func (*ReadArchiveRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{24}
+	return file_sandbox_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ReadArchiveRequest) GetSessionId() string {
@@ -1464,7 +1625,7 @@ type ArchiveChunk struct {
 
 func (x *ArchiveChunk) Reset() {
 	*x = ArchiveChunk{}
-	mi := &file_sandbox_proto_msgTypes[25]
+	mi := &file_sandbox_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1476,7 +1637,7 @@ func (x *ArchiveChunk) String() string {
 func (*ArchiveChunk) ProtoMessage() {}
 
 func (x *ArchiveChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[25]
+	mi := &file_sandbox_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1489,7 +1650,7 @@ func (x *ArchiveChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ArchiveChunk.ProtoReflect.Descriptor instead.
 func (*ArchiveChunk) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{25}
+	return file_sandbox_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ArchiveChunk) GetData() []byte {
@@ -1512,7 +1673,7 @@ type WriteArchiveRequest struct {
 
 func (x *WriteArchiveRequest) Reset() {
 	*x = WriteArchiveRequest{}
-	mi := &file_sandbox_proto_msgTypes[26]
+	mi := &file_sandbox_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1524,7 +1685,7 @@ func (x *WriteArchiveRequest) String() string {
 func (*WriteArchiveRequest) ProtoMessage() {}
 
 func (x *WriteArchiveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[26]
+	mi := &file_sandbox_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1537,7 +1698,7 @@ func (x *WriteArchiveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteArchiveRequest.ProtoReflect.Descriptor instead.
 func (*WriteArchiveRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{26}
+	return file_sandbox_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *WriteArchiveRequest) GetRequest() isWriteArchiveRequest_Request {
@@ -1591,7 +1752,7 @@ type WriteArchiveHeader struct {
 
 func (x *WriteArchiveHeader) Reset() {
 	*x = WriteArchiveHeader{}
-	mi := &file_sandbox_proto_msgTypes[27]
+	mi := &file_sandbox_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1603,7 +1764,7 @@ func (x *WriteArchiveHeader) String() string {
 func (*WriteArchiveHeader) ProtoMessage() {}
 
 func (x *WriteArchiveHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[27]
+	mi := &file_sandbox_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1616,7 +1777,7 @@ func (x *WriteArchiveHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteArchiveHeader.ProtoReflect.Descriptor instead.
 func (*WriteArchiveHeader) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{27}
+	return file_sandbox_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *WriteArchiveHeader) GetSessionId() string {
@@ -1642,7 +1803,7 @@ type WriteArchiveResponse struct {
 
 func (x *WriteArchiveResponse) Reset() {
 	*x = WriteArchiveResponse{}
-	mi := &file_sandbox_proto_msgTypes[28]
+	mi := &file_sandbox_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1654,7 +1815,7 @@ func (x *WriteArchiveResponse) String() string {
 func (*WriteArchiveResponse) ProtoMessage() {}
 
 func (x *WriteArchiveResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[28]
+	mi := &file_sandbox_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1667,7 +1828,7 @@ func (x *WriteArchiveResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteArchiveResponse.ProtoReflect.Descriptor instead.
 func (*WriteArchiveResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{28}
+	return file_sandbox_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *WriteArchiveResponse) GetBytesWritten() int64 {
@@ -1689,7 +1850,7 @@ type SaveVMStateRequest struct {
 
 func (x *SaveVMStateRequest) Reset() {
 	*x = SaveVMStateRequest{}
-	mi := &file_sandbox_proto_msgTypes[29]
+	mi := &file_sandbox_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1701,7 +1862,7 @@ func (x *SaveVMStateRequest) String() string {
 func (*SaveVMStateRequest) ProtoMessage() {}
 
 func (x *SaveVMStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[29]
+	mi := &file_sandbox_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1714,7 +1875,7 @@ func (x *SaveVMStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SaveVMStateRequest.ProtoReflect.Descriptor instead.
 func (*SaveVMStateRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{29}
+	return file_sandbox_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *SaveVMStateRequest) GetSessionId() string {
@@ -1749,7 +1910,7 @@ type RestoreVMStateRequest struct {
 
 func (x *RestoreVMStateRequest) Reset() {
 	*x = RestoreVMStateRequest{}
-	mi := &file_sandbox_proto_msgTypes[30]
+	mi := &file_sandbox_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1761,7 +1922,7 @@ func (x *RestoreVMStateRequest) String() string {
 func (*RestoreVMStateRequest) ProtoMessage() {}
 
 func (x *RestoreVMStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[30]
+	mi := &file_sandbox_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1774,7 +1935,7 @@ func (x *RestoreVMStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreVMStateRequest.ProtoReflect.Descriptor instead.
 func (*RestoreVMStateRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{30}
+	return file_sandbox_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *RestoreVMStateRequest) GetSessionId() string {
@@ -1798,6 +1959,105 @@ func (x *RestoreVMStateRequest) GetPath() string {
 	return ""
 }
 
+// Suspend/snapshot messages (pod mode only)
+type SuspendSandboxRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SuspendSandboxRequest) Reset() {
+	*x = SuspendSandboxRequest{}
+	mi := &file_sandbox_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SuspendSandboxRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SuspendSandboxRequest) ProtoMessage() {}
+
+func (x *SuspendSandboxRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SuspendSandboxRequest.ProtoReflect.Descriptor instead.
+func (*SuspendSandboxRequest) Descriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *SuspendSandboxRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+type SuspendSandboxResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Size of the uploaded snapshot in bytes
+	SnapshotSize int64 `protobuf:"varint,1,opt,name=snapshot_size,json=snapshotSize,proto3" json:"snapshot_size,omitempty"`
+	// Time taken to create and upload snapshot in milliseconds
+	DurationMs    int64 `protobuf:"varint,2,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SuspendSandboxResponse) Reset() {
+	*x = SuspendSandboxResponse{}
+	mi := &file_sandbox_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SuspendSandboxResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SuspendSandboxResponse) ProtoMessage() {}
+
+func (x *SuspendSandboxResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SuspendSandboxResponse.ProtoReflect.Descriptor instead.
+func (*SuspendSandboxResponse) Descriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *SuspendSandboxResponse) GetSnapshotSize() int64 {
+	if x != nil {
+		return x.SnapshotSize
+	}
+	return 0
+}
+
+func (x *SuspendSandboxResponse) GetDurationMs() int64 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
 var File_sandbox_proto protoreflect.FileDescriptor
 
 const file_sandbox_proto_rawDesc = "" +
@@ -1806,14 +2066,15 @@ const file_sandbox_proto_rawDesc = "" +
 	"sandbox.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1bgoogle/protobuf/empty.proto\"<\n" +
 	"\x0eHealthResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x12\n" +
-	"\x04mode\x18\x02 \x01(\tR\x04mode\"\xdb\x02\n" +
+	"\x04mode\x18\x02 \x01(\tR\x04mode\"\xfe\x02\n" +
 	"\x14CreateSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x14\n" +
 	"\x05image\x18\x02 \x01(\tR\x05image\x12\x18\n" +
 	"\acommand\x18\x03 \x03(\tR\acommand\x12;\n" +
 	"\x03env\x18\x04 \x03(\v2).sandbox.v1.CreateSandboxRequest.EnvEntryR\x03env\x12D\n" +
-	"\x06labels\x18\x05 \x03(\v2,.sandbox.v1.CreateSandboxRequest.LabelsEntryR\x06labels\x1a6\n" +
+	"\x06labels\x18\x05 \x03(\v2,.sandbox.v1.CreateSandboxRequest.LabelsEntryR\x06labels\x12!\n" +
+	"\fdownload_url\x18\x06 \x01(\tR\vdownloadUrl\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +
@@ -1914,7 +2175,20 @@ const file_sandbox_proto_rawDesc = "" +
 	"\n" +
 	"process_id\x18\x02 \x01(\tR\tprocessId\x12\x12\n" +
 	"\x04rows\x18\x03 \x01(\rR\x04rows\x12\x12\n" +
-	"\x04cols\x18\x04 \x01(\rR\x04cols\"D\n" +
+	"\x04cols\x18\x04 \x01(\rR\x04cols\"Z\n" +
+	"\x1aStreamProcessOutputRequest\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1d\n" +
+	"\n" +
+	"process_id\x18\x02 \x01(\tR\tprocessId\"\x89\x01\n" +
+	"\x12ProcessOutputChunk\x12=\n" +
+	"\x06stream\x18\x01 \x01(\x0e2%.sandbox.v1.ProcessOutputChunk.StreamR\x06stream\x12\x12\n" +
+	"\x04data\x18\x02 \x01(\fR\x04data\" \n" +
+	"\x06Stream\x12\n" +
+	"\n" +
+	"\x06STDOUT\x10\x00\x12\n" +
+	"\n" +
+	"\x06STDERR\x10\x01\"D\n" +
 	"\x0fReadFileRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x12\n" +
@@ -1952,7 +2226,14 @@ const file_sandbox_proto_rawDesc = "" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x13\n" +
 	"\x05vm_id\x18\x02 \x01(\tR\x04vmId\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path2\xb5\x11\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"6\n" +
+	"\x15SuspendSandboxRequest\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\"^\n" +
+	"\x16SuspendSandboxResponse\x12#\n" +
+	"\rsnapshot_size\x18\x01 \x01(\x03R\fsnapshotSize\x12\x1f\n" +
+	"\vduration_ms\x18\x02 \x01(\x03R\n" +
+	"durationMs2\x9f\x13\n" +
 	"\fSandboxAgent\x12N\n" +
 	"\x06Health\x12\x16.google.protobuf.Empty\x1a\x1a.sandbox.v1.HealthResponse\"\x10\x82\xd3\xe4\x93\x02\n" +
 	"\x12\b/healthz\x12d\n" +
@@ -1961,7 +2242,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"GetSandbox\x12\x1d.sandbox.v1.GetSandboxRequest\x1a\x17.sandbox.v1.SandboxInfo\"\"\x82\xd3\xe4\x93\x02\x1c\x12\x1a/v1/sandboxes/{session_id}\x12m\n" +
 	"\rDeleteSandbox\x12 .sandbox.v1.DeleteSandboxRequest\x1a\x16.google.protobuf.Empty\"\"\x82\xd3\xe4\x93\x02\x1c*\x1a/v1/sandboxes/{session_id}\x12k\n" +
 	"\rListSandboxes\x12 .sandbox.v1.ListSandboxesRequest\x1a!.sandbox.v1.ListSandboxesResponse\"\x15\x82\xd3\xe4\x93\x02\x0f\x12\r/v1/sandboxes\x12\x86\x01\n" +
-	"\x15UpdateSandboxActivity\x12(.sandbox.v1.UpdateSandboxActivityRequest\x1a\x16.google.protobuf.Empty\"+\x82\xd3\xe4\x93\x02%\"#/v1/sandboxes/{session_id}/activity\x12N\n" +
+	"\x15UpdateSandboxActivity\x12(.sandbox.v1.UpdateSandboxActivityRequest\x1a\x16.google.protobuf.Empty\"+\x82\xd3\xe4\x93\x02%\"#/v1/sandboxes/{session_id}/activity\x12\x86\x01\n" +
+	"\x0eSuspendSandbox\x12!.sandbox.v1.SuspendSandboxRequest\x1a\".sandbox.v1.SuspendSandboxResponse\"-\x82\xd3\xe4\x93\x02':\x01*\"\"/v1/sandboxes/{session_id}/suspend\x12N\n" +
 	"\x04Exec\x12\x17.sandbox.v1.ExecRequest\x1a\x18.sandbox.v1.ExecResponse\"\x13\x82\xd3\xe4\x93\x02\r:\x01*\"\b/v1/exec\x12o\n" +
 	"\fStartProcess\x12\x1f.sandbox.v1.StartProcessRequest\x1a .sandbox.v1.StartProcessResponse\"\x1c\x82\xd3\xe4\x93\x02\x16:\x01*\"\x11/v1/process/start\x12i\n" +
 	"\x0eWriteToProcess\x12!.sandbox.v1.WriteToProcessRequest\x1a\x16.google.protobuf.Empty\"\x1c\x82\xd3\xe4\x93\x02\x16:\x01*\"\x11/v1/process/write\x12\x84\x01\n" +
@@ -1970,7 +2252,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x11CloseProcessStdin\x12$.sandbox.v1.CloseProcessStdinRequest\x1a\x16.google.protobuf.Empty\"\"\x82\xd3\xe4\x93\x02\x1c:\x01*\"\x17/v1/process/close-stdin\x12b\n" +
 	"\vKillProcess\x12\x1e.sandbox.v1.KillProcessRequest\x1a\x16.google.protobuf.Empty\"\x1b\x82\xd3\xe4\x93\x02\x15:\x01*\"\x10/v1/process/kill\x12k\n" +
 	"\vWaitProcess\x12\x1e.sandbox.v1.WaitProcessRequest\x1a\x1f.sandbox.v1.WaitProcessResponse\"\x1b\x82\xd3\xe4\x93\x02\x15:\x01*\"\x10/v1/process/wait\x12j\n" +
-	"\x0eResizeTerminal\x12!.sandbox.v1.ResizeTerminalRequest\x1a\x16.google.protobuf.Empty\"\x1d\x82\xd3\xe4\x93\x02\x17:\x01*\"\x12/v1/process/resize\x12`\n" +
+	"\x0eResizeTerminal\x12!.sandbox.v1.ResizeTerminalRequest\x1a\x16.google.protobuf.Empty\"\x1d\x82\xd3\xe4\x93\x02\x17:\x01*\"\x12/v1/process/resize\x12_\n" +
+	"\x13StreamProcessOutput\x12&.sandbox.v1.StreamProcessOutputRequest\x1a\x1e.sandbox.v1.ProcessOutputChunk0\x01\x12`\n" +
 	"\bReadFile\x12\x1b.sandbox.v1.ReadFileRequest\x1a\x1c.sandbox.v1.ReadFileResponse\"\x19\x82\xd3\xe4\x93\x02\x13:\x01*\"\x0e/v1/files/read\x12]\n" +
 	"\tWriteFile\x12\x1c.sandbox.v1.WriteFileRequest\x1a\x16.google.protobuf.Empty\"\x1a\x82\xd3\xe4\x93\x02\x14:\x01*\"\x0f/v1/files/write\x12I\n" +
 	"\vReadArchive\x12\x1e.sandbox.v1.ReadArchiveRequest\x1a\x18.sandbox.v1.ArchiveChunk0\x01\x12S\n" +
@@ -1990,98 +2273,109 @@ func file_sandbox_proto_rawDescGZIP() []byte {
 	return file_sandbox_proto_rawDescData
 }
 
-var file_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 34)
+var file_sandbox_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
 var file_sandbox_proto_goTypes = []any{
-	(*HealthResponse)(nil),               // 0: sandbox.v1.HealthResponse
-	(*CreateSandboxRequest)(nil),         // 1: sandbox.v1.CreateSandboxRequest
-	(*GetSandboxRequest)(nil),            // 2: sandbox.v1.GetSandboxRequest
-	(*DeleteSandboxRequest)(nil),         // 3: sandbox.v1.DeleteSandboxRequest
-	(*ListSandboxesRequest)(nil),         // 4: sandbox.v1.ListSandboxesRequest
-	(*ListSandboxesResponse)(nil),        // 5: sandbox.v1.ListSandboxesResponse
-	(*UpdateSandboxActivityRequest)(nil), // 6: sandbox.v1.UpdateSandboxActivityRequest
-	(*SandboxInfo)(nil),                  // 7: sandbox.v1.SandboxInfo
-	(*ContainerInfo)(nil),                // 8: sandbox.v1.ContainerInfo
-	(*ExecRequest)(nil),                  // 9: sandbox.v1.ExecRequest
-	(*ExecResponse)(nil),                 // 10: sandbox.v1.ExecResponse
-	(*StartProcessRequest)(nil),          // 11: sandbox.v1.StartProcessRequest
-	(*StartProcessResponse)(nil),         // 12: sandbox.v1.StartProcessResponse
-	(*WriteToProcessRequest)(nil),        // 13: sandbox.v1.WriteToProcessRequest
-	(*ReadProcessOutputRequest)(nil),     // 14: sandbox.v1.ReadProcessOutputRequest
-	(*ReadProcessOutputResponse)(nil),    // 15: sandbox.v1.ReadProcessOutputResponse
-	(*CloseProcessStdinRequest)(nil),     // 16: sandbox.v1.CloseProcessStdinRequest
-	(*KillProcessRequest)(nil),           // 17: sandbox.v1.KillProcessRequest
-	(*WaitProcessRequest)(nil),           // 18: sandbox.v1.WaitProcessRequest
-	(*WaitProcessResponse)(nil),          // 19: sandbox.v1.WaitProcessResponse
-	(*ResizeTerminalRequest)(nil),        // 20: sandbox.v1.ResizeTerminalRequest
-	(*ReadFileRequest)(nil),              // 21: sandbox.v1.ReadFileRequest
-	(*ReadFileResponse)(nil),             // 22: sandbox.v1.ReadFileResponse
-	(*WriteFileRequest)(nil),             // 23: sandbox.v1.WriteFileRequest
-	(*ReadArchiveRequest)(nil),           // 24: sandbox.v1.ReadArchiveRequest
-	(*ArchiveChunk)(nil),                 // 25: sandbox.v1.ArchiveChunk
-	(*WriteArchiveRequest)(nil),          // 26: sandbox.v1.WriteArchiveRequest
-	(*WriteArchiveHeader)(nil),           // 27: sandbox.v1.WriteArchiveHeader
-	(*WriteArchiveResponse)(nil),         // 28: sandbox.v1.WriteArchiveResponse
-	(*SaveVMStateRequest)(nil),           // 29: sandbox.v1.SaveVMStateRequest
-	(*RestoreVMStateRequest)(nil),        // 30: sandbox.v1.RestoreVMStateRequest
-	nil,                                  // 31: sandbox.v1.CreateSandboxRequest.EnvEntry
-	nil,                                  // 32: sandbox.v1.CreateSandboxRequest.LabelsEntry
-	nil,                                  // 33: sandbox.v1.SandboxInfo.LabelsEntry
-	(*emptypb.Empty)(nil),                // 34: google.protobuf.Empty
+	(ProcessOutputChunk_Stream)(0),       // 0: sandbox.v1.ProcessOutputChunk.Stream
+	(*HealthResponse)(nil),               // 1: sandbox.v1.HealthResponse
+	(*CreateSandboxRequest)(nil),         // 2: sandbox.v1.CreateSandboxRequest
+	(*GetSandboxRequest)(nil),            // 3: sandbox.v1.GetSandboxRequest
+	(*DeleteSandboxRequest)(nil),         // 4: sandbox.v1.DeleteSandboxRequest
+	(*ListSandboxesRequest)(nil),         // 5: sandbox.v1.ListSandboxesRequest
+	(*ListSandboxesResponse)(nil),        // 6: sandbox.v1.ListSandboxesResponse
+	(*UpdateSandboxActivityRequest)(nil), // 7: sandbox.v1.UpdateSandboxActivityRequest
+	(*SandboxInfo)(nil),                  // 8: sandbox.v1.SandboxInfo
+	(*ContainerInfo)(nil),                // 9: sandbox.v1.ContainerInfo
+	(*ExecRequest)(nil),                  // 10: sandbox.v1.ExecRequest
+	(*ExecResponse)(nil),                 // 11: sandbox.v1.ExecResponse
+	(*StartProcessRequest)(nil),          // 12: sandbox.v1.StartProcessRequest
+	(*StartProcessResponse)(nil),         // 13: sandbox.v1.StartProcessResponse
+	(*WriteToProcessRequest)(nil),        // 14: sandbox.v1.WriteToProcessRequest
+	(*ReadProcessOutputRequest)(nil),     // 15: sandbox.v1.ReadProcessOutputRequest
+	(*ReadProcessOutputResponse)(nil),    // 16: sandbox.v1.ReadProcessOutputResponse
+	(*CloseProcessStdinRequest)(nil),     // 17: sandbox.v1.CloseProcessStdinRequest
+	(*KillProcessRequest)(nil),           // 18: sandbox.v1.KillProcessRequest
+	(*WaitProcessRequest)(nil),           // 19: sandbox.v1.WaitProcessRequest
+	(*WaitProcessResponse)(nil),          // 20: sandbox.v1.WaitProcessResponse
+	(*ResizeTerminalRequest)(nil),        // 21: sandbox.v1.ResizeTerminalRequest
+	(*StreamProcessOutputRequest)(nil),   // 22: sandbox.v1.StreamProcessOutputRequest
+	(*ProcessOutputChunk)(nil),           // 23: sandbox.v1.ProcessOutputChunk
+	(*ReadFileRequest)(nil),              // 24: sandbox.v1.ReadFileRequest
+	(*ReadFileResponse)(nil),             // 25: sandbox.v1.ReadFileResponse
+	(*WriteFileRequest)(nil),             // 26: sandbox.v1.WriteFileRequest
+	(*ReadArchiveRequest)(nil),           // 27: sandbox.v1.ReadArchiveRequest
+	(*ArchiveChunk)(nil),                 // 28: sandbox.v1.ArchiveChunk
+	(*WriteArchiveRequest)(nil),          // 29: sandbox.v1.WriteArchiveRequest
+	(*WriteArchiveHeader)(nil),           // 30: sandbox.v1.WriteArchiveHeader
+	(*WriteArchiveResponse)(nil),         // 31: sandbox.v1.WriteArchiveResponse
+	(*SaveVMStateRequest)(nil),           // 32: sandbox.v1.SaveVMStateRequest
+	(*RestoreVMStateRequest)(nil),        // 33: sandbox.v1.RestoreVMStateRequest
+	(*SuspendSandboxRequest)(nil),        // 34: sandbox.v1.SuspendSandboxRequest
+	(*SuspendSandboxResponse)(nil),       // 35: sandbox.v1.SuspendSandboxResponse
+	nil,                                  // 36: sandbox.v1.CreateSandboxRequest.EnvEntry
+	nil,                                  // 37: sandbox.v1.CreateSandboxRequest.LabelsEntry
+	nil,                                  // 38: sandbox.v1.SandboxInfo.LabelsEntry
+	(*emptypb.Empty)(nil),                // 39: google.protobuf.Empty
 }
 var file_sandbox_proto_depIdxs = []int32{
-	31, // 0: sandbox.v1.CreateSandboxRequest.env:type_name -> sandbox.v1.CreateSandboxRequest.EnvEntry
-	32, // 1: sandbox.v1.CreateSandboxRequest.labels:type_name -> sandbox.v1.CreateSandboxRequest.LabelsEntry
-	7,  // 2: sandbox.v1.ListSandboxesResponse.sandboxes:type_name -> sandbox.v1.SandboxInfo
-	8,  // 3: sandbox.v1.SandboxInfo.containers:type_name -> sandbox.v1.ContainerInfo
-	33, // 4: sandbox.v1.SandboxInfo.labels:type_name -> sandbox.v1.SandboxInfo.LabelsEntry
-	27, // 5: sandbox.v1.WriteArchiveRequest.header:type_name -> sandbox.v1.WriteArchiveHeader
-	34, // 6: sandbox.v1.SandboxAgent.Health:input_type -> google.protobuf.Empty
-	1,  // 7: sandbox.v1.SandboxAgent.CreateSandbox:input_type -> sandbox.v1.CreateSandboxRequest
-	2,  // 8: sandbox.v1.SandboxAgent.GetSandbox:input_type -> sandbox.v1.GetSandboxRequest
-	3,  // 9: sandbox.v1.SandboxAgent.DeleteSandbox:input_type -> sandbox.v1.DeleteSandboxRequest
-	4,  // 10: sandbox.v1.SandboxAgent.ListSandboxes:input_type -> sandbox.v1.ListSandboxesRequest
-	6,  // 11: sandbox.v1.SandboxAgent.UpdateSandboxActivity:input_type -> sandbox.v1.UpdateSandboxActivityRequest
-	9,  // 12: sandbox.v1.SandboxAgent.Exec:input_type -> sandbox.v1.ExecRequest
-	11, // 13: sandbox.v1.SandboxAgent.StartProcess:input_type -> sandbox.v1.StartProcessRequest
-	13, // 14: sandbox.v1.SandboxAgent.WriteToProcess:input_type -> sandbox.v1.WriteToProcessRequest
-	14, // 15: sandbox.v1.SandboxAgent.ReadProcessStdout:input_type -> sandbox.v1.ReadProcessOutputRequest
-	14, // 16: sandbox.v1.SandboxAgent.ReadProcessStderr:input_type -> sandbox.v1.ReadProcessOutputRequest
-	16, // 17: sandbox.v1.SandboxAgent.CloseProcessStdin:input_type -> sandbox.v1.CloseProcessStdinRequest
-	17, // 18: sandbox.v1.SandboxAgent.KillProcess:input_type -> sandbox.v1.KillProcessRequest
-	18, // 19: sandbox.v1.SandboxAgent.WaitProcess:input_type -> sandbox.v1.WaitProcessRequest
-	20, // 20: sandbox.v1.SandboxAgent.ResizeTerminal:input_type -> sandbox.v1.ResizeTerminalRequest
-	21, // 21: sandbox.v1.SandboxAgent.ReadFile:input_type -> sandbox.v1.ReadFileRequest
-	23, // 22: sandbox.v1.SandboxAgent.WriteFile:input_type -> sandbox.v1.WriteFileRequest
-	24, // 23: sandbox.v1.SandboxAgent.ReadArchive:input_type -> sandbox.v1.ReadArchiveRequest
-	26, // 24: sandbox.v1.SandboxAgent.WriteArchive:input_type -> sandbox.v1.WriteArchiveRequest
-	29, // 25: sandbox.v1.SandboxAgent.SaveVMState:input_type -> sandbox.v1.SaveVMStateRequest
-	30, // 26: sandbox.v1.SandboxAgent.RestoreVMState:input_type -> sandbox.v1.RestoreVMStateRequest
-	0,  // 27: sandbox.v1.SandboxAgent.Health:output_type -> sandbox.v1.HealthResponse
-	7,  // 28: sandbox.v1.SandboxAgent.CreateSandbox:output_type -> sandbox.v1.SandboxInfo
-	7,  // 29: sandbox.v1.SandboxAgent.GetSandbox:output_type -> sandbox.v1.SandboxInfo
-	34, // 30: sandbox.v1.SandboxAgent.DeleteSandbox:output_type -> google.protobuf.Empty
-	5,  // 31: sandbox.v1.SandboxAgent.ListSandboxes:output_type -> sandbox.v1.ListSandboxesResponse
-	34, // 32: sandbox.v1.SandboxAgent.UpdateSandboxActivity:output_type -> google.protobuf.Empty
-	10, // 33: sandbox.v1.SandboxAgent.Exec:output_type -> sandbox.v1.ExecResponse
-	12, // 34: sandbox.v1.SandboxAgent.StartProcess:output_type -> sandbox.v1.StartProcessResponse
-	34, // 35: sandbox.v1.SandboxAgent.WriteToProcess:output_type -> google.protobuf.Empty
-	15, // 36: sandbox.v1.SandboxAgent.ReadProcessStdout:output_type -> sandbox.v1.ReadProcessOutputResponse
-	15, // 37: sandbox.v1.SandboxAgent.ReadProcessStderr:output_type -> sandbox.v1.ReadProcessOutputResponse
-	34, // 38: sandbox.v1.SandboxAgent.CloseProcessStdin:output_type -> google.protobuf.Empty
-	34, // 39: sandbox.v1.SandboxAgent.KillProcess:output_type -> google.protobuf.Empty
-	19, // 40: sandbox.v1.SandboxAgent.WaitProcess:output_type -> sandbox.v1.WaitProcessResponse
-	34, // 41: sandbox.v1.SandboxAgent.ResizeTerminal:output_type -> google.protobuf.Empty
-	22, // 42: sandbox.v1.SandboxAgent.ReadFile:output_type -> sandbox.v1.ReadFileResponse
-	34, // 43: sandbox.v1.SandboxAgent.WriteFile:output_type -> google.protobuf.Empty
-	25, // 44: sandbox.v1.SandboxAgent.ReadArchive:output_type -> sandbox.v1.ArchiveChunk
-	28, // 45: sandbox.v1.SandboxAgent.WriteArchive:output_type -> sandbox.v1.WriteArchiveResponse
-	34, // 46: sandbox.v1.SandboxAgent.SaveVMState:output_type -> google.protobuf.Empty
-	34, // 47: sandbox.v1.SandboxAgent.RestoreVMState:output_type -> google.protobuf.Empty
-	27, // [27:48] is the sub-list for method output_type
-	6,  // [6:27] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	36, // 0: sandbox.v1.CreateSandboxRequest.env:type_name -> sandbox.v1.CreateSandboxRequest.EnvEntry
+	37, // 1: sandbox.v1.CreateSandboxRequest.labels:type_name -> sandbox.v1.CreateSandboxRequest.LabelsEntry
+	8,  // 2: sandbox.v1.ListSandboxesResponse.sandboxes:type_name -> sandbox.v1.SandboxInfo
+	9,  // 3: sandbox.v1.SandboxInfo.containers:type_name -> sandbox.v1.ContainerInfo
+	38, // 4: sandbox.v1.SandboxInfo.labels:type_name -> sandbox.v1.SandboxInfo.LabelsEntry
+	0,  // 5: sandbox.v1.ProcessOutputChunk.stream:type_name -> sandbox.v1.ProcessOutputChunk.Stream
+	30, // 6: sandbox.v1.WriteArchiveRequest.header:type_name -> sandbox.v1.WriteArchiveHeader
+	39, // 7: sandbox.v1.SandboxAgent.Health:input_type -> google.protobuf.Empty
+	2,  // 8: sandbox.v1.SandboxAgent.CreateSandbox:input_type -> sandbox.v1.CreateSandboxRequest
+	3,  // 9: sandbox.v1.SandboxAgent.GetSandbox:input_type -> sandbox.v1.GetSandboxRequest
+	4,  // 10: sandbox.v1.SandboxAgent.DeleteSandbox:input_type -> sandbox.v1.DeleteSandboxRequest
+	5,  // 11: sandbox.v1.SandboxAgent.ListSandboxes:input_type -> sandbox.v1.ListSandboxesRequest
+	7,  // 12: sandbox.v1.SandboxAgent.UpdateSandboxActivity:input_type -> sandbox.v1.UpdateSandboxActivityRequest
+	34, // 13: sandbox.v1.SandboxAgent.SuspendSandbox:input_type -> sandbox.v1.SuspendSandboxRequest
+	10, // 14: sandbox.v1.SandboxAgent.Exec:input_type -> sandbox.v1.ExecRequest
+	12, // 15: sandbox.v1.SandboxAgent.StartProcess:input_type -> sandbox.v1.StartProcessRequest
+	14, // 16: sandbox.v1.SandboxAgent.WriteToProcess:input_type -> sandbox.v1.WriteToProcessRequest
+	15, // 17: sandbox.v1.SandboxAgent.ReadProcessStdout:input_type -> sandbox.v1.ReadProcessOutputRequest
+	15, // 18: sandbox.v1.SandboxAgent.ReadProcessStderr:input_type -> sandbox.v1.ReadProcessOutputRequest
+	17, // 19: sandbox.v1.SandboxAgent.CloseProcessStdin:input_type -> sandbox.v1.CloseProcessStdinRequest
+	18, // 20: sandbox.v1.SandboxAgent.KillProcess:input_type -> sandbox.v1.KillProcessRequest
+	19, // 21: sandbox.v1.SandboxAgent.WaitProcess:input_type -> sandbox.v1.WaitProcessRequest
+	21, // 22: sandbox.v1.SandboxAgent.ResizeTerminal:input_type -> sandbox.v1.ResizeTerminalRequest
+	22, // 23: sandbox.v1.SandboxAgent.StreamProcessOutput:input_type -> sandbox.v1.StreamProcessOutputRequest
+	24, // 24: sandbox.v1.SandboxAgent.ReadFile:input_type -> sandbox.v1.ReadFileRequest
+	26, // 25: sandbox.v1.SandboxAgent.WriteFile:input_type -> sandbox.v1.WriteFileRequest
+	27, // 26: sandbox.v1.SandboxAgent.ReadArchive:input_type -> sandbox.v1.ReadArchiveRequest
+	29, // 27: sandbox.v1.SandboxAgent.WriteArchive:input_type -> sandbox.v1.WriteArchiveRequest
+	32, // 28: sandbox.v1.SandboxAgent.SaveVMState:input_type -> sandbox.v1.SaveVMStateRequest
+	33, // 29: sandbox.v1.SandboxAgent.RestoreVMState:input_type -> sandbox.v1.RestoreVMStateRequest
+	1,  // 30: sandbox.v1.SandboxAgent.Health:output_type -> sandbox.v1.HealthResponse
+	8,  // 31: sandbox.v1.SandboxAgent.CreateSandbox:output_type -> sandbox.v1.SandboxInfo
+	8,  // 32: sandbox.v1.SandboxAgent.GetSandbox:output_type -> sandbox.v1.SandboxInfo
+	39, // 33: sandbox.v1.SandboxAgent.DeleteSandbox:output_type -> google.protobuf.Empty
+	6,  // 34: sandbox.v1.SandboxAgent.ListSandboxes:output_type -> sandbox.v1.ListSandboxesResponse
+	39, // 35: sandbox.v1.SandboxAgent.UpdateSandboxActivity:output_type -> google.protobuf.Empty
+	35, // 36: sandbox.v1.SandboxAgent.SuspendSandbox:output_type -> sandbox.v1.SuspendSandboxResponse
+	11, // 37: sandbox.v1.SandboxAgent.Exec:output_type -> sandbox.v1.ExecResponse
+	13, // 38: sandbox.v1.SandboxAgent.StartProcess:output_type -> sandbox.v1.StartProcessResponse
+	39, // 39: sandbox.v1.SandboxAgent.WriteToProcess:output_type -> google.protobuf.Empty
+	16, // 40: sandbox.v1.SandboxAgent.ReadProcessStdout:output_type -> sandbox.v1.ReadProcessOutputResponse
+	16, // 41: sandbox.v1.SandboxAgent.ReadProcessStderr:output_type -> sandbox.v1.ReadProcessOutputResponse
+	39, // 42: sandbox.v1.SandboxAgent.CloseProcessStdin:output_type -> google.protobuf.Empty
+	39, // 43: sandbox.v1.SandboxAgent.KillProcess:output_type -> google.protobuf.Empty
+	20, // 44: sandbox.v1.SandboxAgent.WaitProcess:output_type -> sandbox.v1.WaitProcessResponse
+	39, // 45: sandbox.v1.SandboxAgent.ResizeTerminal:output_type -> google.protobuf.Empty
+	23, // 46: sandbox.v1.SandboxAgent.StreamProcessOutput:output_type -> sandbox.v1.ProcessOutputChunk
+	25, // 47: sandbox.v1.SandboxAgent.ReadFile:output_type -> sandbox.v1.ReadFileResponse
+	39, // 48: sandbox.v1.SandboxAgent.WriteFile:output_type -> google.protobuf.Empty
+	28, // 49: sandbox.v1.SandboxAgent.ReadArchive:output_type -> sandbox.v1.ArchiveChunk
+	31, // 50: sandbox.v1.SandboxAgent.WriteArchive:output_type -> sandbox.v1.WriteArchiveResponse
+	39, // 51: sandbox.v1.SandboxAgent.SaveVMState:output_type -> google.protobuf.Empty
+	39, // 52: sandbox.v1.SandboxAgent.RestoreVMState:output_type -> google.protobuf.Empty
+	30, // [30:53] is the sub-list for method output_type
+	7,  // [7:30] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_sandbox_proto_init() }
@@ -2089,7 +2383,7 @@ func file_sandbox_proto_init() {
 	if File_sandbox_proto != nil {
 		return
 	}
-	file_sandbox_proto_msgTypes[26].OneofWrappers = []any{
+	file_sandbox_proto_msgTypes[28].OneofWrappers = []any{
 		(*WriteArchiveRequest_Header)(nil),
 		(*WriteArchiveRequest_Data)(nil),
 	}
@@ -2098,13 +2392,14 @@ func file_sandbox_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sandbox_proto_rawDesc), len(file_sandbox_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   34,
+			NumEnums:      1,
+			NumMessages:   38,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_sandbox_proto_goTypes,
 		DependencyIndexes: file_sandbox_proto_depIdxs,
+		EnumInfos:         file_sandbox_proto_enumTypes,
 		MessageInfos:      file_sandbox_proto_msgTypes,
 	}.Build()
 	File_sandbox_proto = out.File

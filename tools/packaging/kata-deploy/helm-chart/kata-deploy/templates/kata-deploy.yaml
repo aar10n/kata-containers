@@ -1,3 +1,4 @@
+{{- if .Values.kataDeploy.enabled }}
 {{- if index .Values "node-feature-discovery" "enabled" -}}
 {{- $existingNFDNamespace := include "kata-deploy.detectExistingNFD" . | trim -}}
 {{- if $existingNFDNamespace -}}
@@ -311,3 +312,4 @@ spec:
     rollingUpdate:
       maxUnavailable: 1
     type: RollingUpdate
+{{- end }}

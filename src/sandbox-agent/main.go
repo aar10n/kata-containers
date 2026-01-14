@@ -54,6 +54,16 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Label node if configured
+	var nodeLabeler *k8s.NodeLabeler
+	if cfg.NodeLabel.Enabled {
+		nodeLabeler = k8s.NewNodeLabeler(clientset, nodeName, cfg.NodeLabel.Key, cfg.NodeLabel.Value)
+		if err := nodeLabeler.LabelNode(ctx); err != nil {
+			log.Fatalf("failed to label node %s: %v", nodeName, err)
+		}
+		log.Printf("labeled node %s with %s=%s", nodeName, cfg.NodeLabel.Key, cfg.NodeLabel.Value)
+	}
+
 	watcher := k8s.NewWatcher(clientset, cfg.Kubernetes.ResyncInterval)
 	go func() {
 		if err := watcher.Start(ctx); err != nil {
@@ -194,6 +204,16 @@ func main() {
 		<-shutdownCh
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+
+		// Remove node label on shutdown
+		if nodeLabeler != nil {
+			if err := nodeLabeler.UnlabelNode(ctx); err != nil {
+				log.Printf("failed to remove node label: %v", err)
+			} else {
+				log.Printf("removed node label %s", cfg.NodeLabel.Key)
+			}
+		}
+
 		grpcServer.GracefulStop()
 		if err := httpServer.Shutdown(ctx); err != nil {
 			log.Printf("http shutdown error: %v", err)

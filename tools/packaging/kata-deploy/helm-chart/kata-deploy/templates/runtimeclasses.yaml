@@ -1,4 +1,4 @@
-{{- if .Values.runtimeClasses.enabled }}
+{{- if and .Values.kataDeploy.enabled .Values.runtimeClasses.enabled }}
 {{- $multiInstallSuffix := .Values.env.multiInstallSuffix }}
 {{- $createDefaultRC := .Values.runtimeClasses.createDefault }}
 {{- $defaultRCName := .Values.runtimeClasses.defaultName }}

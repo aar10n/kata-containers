@@ -1,97 +1,16 @@
-# Helm values for Kata Containers with Snapshot POC
+# Helm values for Sandbox Service + Sandbox Agent in "pod" mode (no Kata components)
 # Deploy with: helm install kata ./tools/packaging/kata-deploy/helm-chart/kata-deploy -f kata-snapshot-poc-values.yaml
 
+# Disable Kata runtime deployment - only deploy sandbox-service and sandbox-agent
+kataDeploy:
+  enabled: false
+
 imagePullPolicy: Always
-
-# Custom image with snapshot support (uncomment after building)
-# image:
-#   reference: gcr.io/cohere-artifacts/kata-deploy
-#   tag: "snapshot-poc"
-
-# Kubernetes distribution (adjust if using k3s, rke2, etc.)
-k8sDistribution: "k8s" # k8s, k3s, rke2, k0s, microk8s
 
 # Debug mode - enable for troubleshooting
 debug: true
 
-# Only enable Cloud Hypervisor for this POC
-shims:
-  # Disable all other hypervisors
-  clh:
-    enabled: false
-  dragonball:
-    enabled: false
-  qemu:
-    enabled: false
-  qemu-runtime-rs:
-    enabled: false
-  qemu-nvidia-gpu:
-    enabled: false
-  qemu-nvidia-gpu-snp:
-    enabled: false
-  qemu-nvidia-gpu-tdx:
-    enabled: false
-  qemu-snp:
-    enabled: false
-  qemu-tdx:
-    enabled: false
-  qemu-se:
-    enabled: false
-  qemu-se-runtime-rs:
-    enabled: false
-  qemu-cca:
-    enabled: false
-  qemu-coco-dev:
-    enabled: false
-  qemu-coco-dev-runtime-rs:
-    enabled: false
-  remote:
-    enabled: false
-  stratovirt:
-    enabled: false
-  fc:
-    enabled: false
-
-  # Enable Cloud Hypervisor (runtime-rs version)
-  cloud-hypervisor:
-    enabled: true
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations:
-      # Allow custom annotations for snapshot control
-      - "io.katacontainers.hypervisor.*"
-
-# Default runtime class
-defaultShim:
-  amd64: cloud-hypervisor
-
-# Create runtime classes
-runtimeClasses:
-  enabled: true
-  createDefault: true
-  defaultName: "kata-cloud-hypervisor"
-
-# Optional: Add node selector to only deploy on specific nodes
-# nodeSelector:
-#   kata-enabled: "true"
-
-# Optional: Add tolerations if your nodes have taints
-# tolerations:
-#   - key: "dedicated"
-#     operator: "Equal"
-#     value: "kata"
-#     effect: "NoSchedule"
-
-env:
-  # Ubuntu nodes have writable /opt, no prefix needed
-  installationPrefix: ""
-  hostOS: ""
-
-# Only run kata-deploy on Ubuntu nodes
-nodeSelector:
-  cloud.google.com/gke-os-distribution: ubuntu
-
-# Disable NFD for simplicity
+# Disable NFD (not needed without Kata)
 node-feature-discovery:
   enabled: false
 
@@ -101,14 +20,26 @@ sandboxAgent:
     reference: gcr.io/cohere-artifacts/sandbox-agent
     tag: "latest"
 
-  # Run in kata mode (Kata VMs with kata-agent exec via vsock)
+  # Run in pod mode (regular pods via CRI, no Kata VMs)
   mode: pod
 
+  # Node selector for the sandbox-agent DaemonSet.
+  # To limit agents to specific nodes, label those nodes and select them here.
+  # Example: kubectl label node <node-name> sandbox-agent=enabled
+  nodeSelector:
+    sandbox-agent: "enabled"
+
+  # Node labeling - agents will label their nodes on startup.
+  # Sandbox pods are automatically scheduled to nodes with this label.
+  nodeLabel:
+    enabled: true
+    key: "sandbox.kata.io/agent"
+    value: "true"
+
   # Sandbox pod configuration (managed by sandbox-agent)
-  sandboxNamespace: kata-system
-  runtimeClass: kata-cloud-hypervisor  # Must match available RuntimeClass
+  sandboxNamespace: aaron-sandbox-tool
+  # Additional node selectors for sandbox pods (nodeLabel is auto-added when enabled)
   sandboxNodeSelector:
-    cloud.google.com/gke-os-distribution: ubuntu
 
   # CRI socket auto-detected (containerd or CRI-O)
   cri:
@@ -121,7 +52,7 @@ sandboxAgent:
 
   # Storage configuration for snapshot save/restore
   storage:
-    enabled: true
+    enabled: false
     # Address of sandbox-service's storage gRPC server
     addr: "kata-deploy-sandbox-service.kata-system:9090"
     timeout: "30s"
@@ -142,7 +73,7 @@ sandboxService:
 
   # Storage configuration for snapshot save/restore (S3-compatible backend)
   storage:
-    enabled: true
+    enabled: false
     # S3-compatible endpoint URL (s3proxy in kata-system namespace)
     endpoint: "http://s3proxy.kata-system:8080"
     region: "us-east-1"

@@ -1,3 +1,8 @@
+# Enable/disable the kata-deploy daemonset and related resources (RBAC, cleanup job)
+# Set to false to deploy only sandbox-service and sandbox-agent without Kata runtime components
+kataDeploy:
+  enabled: true
+
 imagePullPolicy: Always
 
 imagePullSecrets: []
@@ -299,9 +304,28 @@ sandboxAgent:
   # Mode: "kata" (Kata VMs with kata-agent) or "pod" (regular pods with CRI)
   mode: kata
 
+  # Node selector for the sandbox-agent DaemonSet itself.
+  # Use this to control which nodes run the sandbox-agent.
+  # To limit the number of agents, pre-label specific nodes and select them here.
+  # Example: { "sandbox-agent": "enabled" }
+  nodeSelector: {}
+
+  # Tolerations for the sandbox-agent DaemonSet.
+  tolerations: []
+
+  # Node labeling configuration.
+  # When enabled, each sandbox-agent will label its node on startup.
+  # This label is then used for scheduling sandbox pods to agent-ready nodes.
+  nodeLabel:
+    enabled: false
+    key: "sandbox.kata.io/agent"
+    value: "true"
+
   # Sandbox pod configuration
   sandboxNamespace: kata-sandboxes
   runtimeClass: kata-qemu  # Only used in kata mode
+  # Node selector for sandbox pods. When nodeLabel is enabled, the agent's
+  # node label is automatically added to ensure pods schedule to agent nodes.
   sandboxNodeSelector:
     katacontainers.io/kata-runtime: "true"
 

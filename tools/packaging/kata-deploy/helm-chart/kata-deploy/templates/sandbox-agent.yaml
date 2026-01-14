@@ -34,6 +34,12 @@ data:
       dial_timeout: {{ .Values.sandboxAgent.grpcDialTimeout | default "5s" | quote }}
     kubernetes:
       resync_interval: {{ .Values.sandboxAgent.resyncInterval | default "5m" | quote }}
+    {{- if .Values.sandboxAgent.nodeLabel.enabled }}
+    node_label:
+      enabled: true
+      key: {{ .Values.sandboxAgent.nodeLabel.key | quote }}
+      value: {{ .Values.sandboxAgent.nodeLabel.value | quote }}
+    {{- end }}
     {{- if eq (.Values.sandboxAgent.mode | default "kata") "kata" }}
     agent:
       timeout: {{ .Values.sandboxAgent.agentTimeout | default "10s" | quote }}
@@ -54,9 +60,14 @@ data:
       {{- if eq (.Values.sandboxAgent.mode | default "kata") "kata" }}
       runtime_class: {{ .Values.sandboxAgent.runtimeClass | quote }}
       {{- end }}
-      {{- with .Values.sandboxAgent.sandboxNodeSelector }}
+      {{- if or .Values.sandboxAgent.sandboxNodeSelector .Values.sandboxAgent.nodeLabel.enabled }}
       node_selector:
+        {{- if .Values.sandboxAgent.nodeLabel.enabled }}
+        {{ .Values.sandboxAgent.nodeLabel.key }}: {{ .Values.sandboxAgent.nodeLabel.value | quote }}
+        {{- end }}
+        {{- with .Values.sandboxAgent.sandboxNodeSelector }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
 ---
 
@@ -82,7 +93,11 @@ rules:
     verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
   - apiGroups: [""]
     resources: ["nodes"]
+    {{- if .Values.sandboxAgent.nodeLabel.enabled }}
+    verbs: ["get", "list", "watch", "patch"]
+    {{- else }}
     verbs: ["get", "list", "watch"]
+    {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -142,7 +157,7 @@ spec:
         app.kubernetes.io/name: sandbox-agent
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%s|%v|%s|%s|%s" .Values.sandboxAgent.mode .Values.sandboxAgent.sandboxNamespace .Values.sandboxAgent.runtimeClass .Values.sandboxAgent.grpcDialTimeout .Values.sandboxAgent.resyncInterval .Values.sandboxAgent.agentTimeout .Values.sandboxAgent.execTimeout .Values.sandboxAgent.maxOutputBytes .Values.sandboxAgent.sandboxNodeSelector .Values.sandboxAgent.cri.socket .Values.sandboxAgent.cri.timeout .Values.sandboxAgent.hostfs.kubeletRoot | sha256sum }}
+        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%s|%v|%s|%s|%s|%v|%s|%s" .Values.sandboxAgent.mode .Values.sandboxAgent.sandboxNamespace .Values.sandboxAgent.runtimeClass .Values.sandboxAgent.grpcDialTimeout .Values.sandboxAgent.resyncInterval .Values.sandboxAgent.agentTimeout .Values.sandboxAgent.execTimeout .Values.sandboxAgent.maxOutputBytes .Values.sandboxAgent.sandboxNodeSelector .Values.sandboxAgent.cri.socket .Values.sandboxAgent.cri.timeout .Values.sandboxAgent.hostfs.kubeletRoot .Values.sandboxAgent.nodeLabel.enabled .Values.sandboxAgent.nodeLabel.key .Values.sandboxAgent.nodeLabel.value | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       {{- if eq (.Values.sandboxAgent.mode | default "kata") "pod" }}
@@ -150,13 +165,17 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
-      {{- with .Values.nodeSelector }}
+      {{- with .Values.sandboxAgent.nodeSelector }}
       nodeSelector:
 {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with .Values.sandboxAgent.tolerations }}
       tolerations:
 {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.sandboxAgent.nodeLabel.enabled }}
+      # Allow time for graceful shutdown to unlabel node
+      terminationGracePeriodSeconds: 30
       {{- end }}
       containers:
         - name: sandbox-agent

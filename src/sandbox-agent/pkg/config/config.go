@@ -40,6 +40,7 @@ type Config struct {
 	Exec       ExecConfig       `mapstructure:"exec"`
 	Sandbox    SandboxConfig    `mapstructure:"sandbox"`
 	Storage    StorageConfig    `mapstructure:"storage"`
+	NodeLabel  NodeLabelConfig  `mapstructure:"node_label"`
 }
 
 // HTTPConfig holds HTTP server configuration.
@@ -111,6 +112,19 @@ type StorageConfig struct {
 	InitImage string `mapstructure:"init_image"`
 }
 
+// NodeLabelConfig holds configuration for node labeling.
+type NodeLabelConfig struct {
+	// Enabled indicates whether the agent should label its node on startup.
+	// When enabled, the agent will add a label to identify nodes ready for sandboxes.
+	Enabled bool `mapstructure:"enabled"`
+	// Key is the label key to apply to the node.
+	// Default: "sandbox.kata.io/agent"
+	Key string `mapstructure:"key"`
+	// Value is the label value to apply to the node.
+	// Default: "true"
+	Value string `mapstructure:"value"`
+}
+
 // Flags defines command-line flags that can override config values.
 type Flags struct {
 	ConfigFile  string
@@ -162,6 +176,11 @@ func DefaultConfig() Config {
 			Timeout:   30 * time.Second,
 			InitImage: "busybox:1.36",
 		},
+		NodeLabel: NodeLabelConfig{
+			Enabled: false,
+			Key:     "sandbox.kata.io/agent",
+			Value:   "true",
+		},
 	}
 }
 
@@ -209,6 +228,9 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("storage::addr", defaults.Storage.Addr)
 	v.SetDefault("storage::timeout", defaults.Storage.Timeout)
 	v.SetDefault("storage::init_image", defaults.Storage.InitImage)
+	v.SetDefault("node_label::enabled", defaults.NodeLabel.Enabled)
+	v.SetDefault("node_label::key", defaults.NodeLabel.Key)
+	v.SetDefault("node_label::value", defaults.NodeLabel.Value)
 
 	// Enable environment variable overrides
 	// Environment variables use SANDBOX_AGENT_ prefix with underscores
@@ -274,6 +296,20 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid node selector value %q for key %q: must be a valid Kubernetes label value", v, k)
 		}
 	}
+
+	// Validate node label config
+	if c.NodeLabel.Enabled {
+		if c.NodeLabel.Key == "" {
+			return fmt.Errorf("node_label.key is required when node_label.enabled is true")
+		}
+		if len(c.NodeLabel.Key) > 253 || !labelKeyRegex.MatchString(c.NodeLabel.Key) {
+			return fmt.Errorf("invalid node_label.key %q: must be a valid Kubernetes label key", c.NodeLabel.Key)
+		}
+		if len(c.NodeLabel.Value) > 63 || !labelValueRegex.MatchString(c.NodeLabel.Value) {
+			return fmt.Errorf("invalid node_label.value %q: must be a valid Kubernetes label value", c.NodeLabel.Value)
+		}
+	}
+
 	return nil
 }
 

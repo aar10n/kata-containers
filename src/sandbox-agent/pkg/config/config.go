@@ -31,16 +31,18 @@ type Config struct {
 	// Default: "kata"
 	Mode Mode `mapstructure:"mode"`
 
-	HTTP       HTTPConfig       `mapstructure:"http"`
-	GRPC       GRPCConfig       `mapstructure:"grpc"`
-	Kubernetes KubernetesConfig `mapstructure:"kubernetes"`
-	Agent      AgentConfig      `mapstructure:"agent"`
-	CRI        CRIConfig        `mapstructure:"cri"`
-	HostFS     HostFSConfig     `mapstructure:"hostfs"`
-	Exec       ExecConfig       `mapstructure:"exec"`
-	Sandbox    SandboxConfig    `mapstructure:"sandbox"`
-	Storage    StorageConfig    `mapstructure:"storage"`
-	NodeLabel  NodeLabelConfig  `mapstructure:"node_label"`
+	HTTP        HTTPConfig        `mapstructure:"http"`
+	GRPC        GRPCConfig        `mapstructure:"grpc"`
+	Kubernetes  KubernetesConfig  `mapstructure:"kubernetes"`
+	Agent       AgentConfig       `mapstructure:"agent"`
+	CRI         CRIConfig         `mapstructure:"cri"`
+	HostFS      HostFSConfig      `mapstructure:"hostfs"`
+	Exec        ExecConfig        `mapstructure:"exec"`
+	Sandbox     SandboxConfig     `mapstructure:"sandbox"`
+	Storage     StorageConfig     `mapstructure:"storage"`
+	NodeLabel   NodeLabelConfig   `mapstructure:"node_label"`
+	FuseStorage FuseStorageConfig `mapstructure:"fuse_storage"`
+	ActivityDB  ActivityDBConfig  `mapstructure:"activity_db"`
 }
 
 // HTTPConfig holds HTTP server configuration.
@@ -93,6 +95,22 @@ type SandboxConfig struct {
 	Namespace        string            `mapstructure:"namespace"`
 	RuntimeClassName string            `mapstructure:"runtime_class"`
 	NodeSelector     map[string]string `mapstructure:"node_selector"`
+	Tolerations      []Toleration      `mapstructure:"tolerations"`
+	ImagePullSecrets []ImagePullSecret `mapstructure:"image_pull_secrets"`
+}
+
+// ImagePullSecret represents a Kubernetes image pull secret reference.
+type ImagePullSecret struct {
+	Name string `mapstructure:"name"`
+}
+
+// Toleration represents a Kubernetes toleration for sandbox pods.
+type Toleration struct {
+	Key               string `mapstructure:"key"`
+	Operator          string `mapstructure:"operator"` // "Exists" or "Equal"
+	Value             string `mapstructure:"value"`
+	Effect            string `mapstructure:"effect"` // "NoSchedule", "PreferNoSchedule", or "NoExecute"
+	TolerationSeconds *int64 `mapstructure:"toleration_seconds"`
 }
 
 // StorageConfig holds configuration for the storage service client.
@@ -123,6 +141,48 @@ type NodeLabelConfig struct {
 	// Value is the label value to apply to the node.
 	// Default: "true"
 	Value string `mapstructure:"value"`
+}
+
+// ActivityDBConfig holds configuration for the SQLite activity database.
+// When enabled, sandbox activity timestamps are stored locally instead of
+// updating Kubernetes annotations, avoiding API rate limiting.
+type ActivityDBConfig struct {
+	// Enabled indicates whether to use SQLite for activity tracking.
+	// When disabled, falls back to K8s annotation updates (existing behavior).
+	Enabled bool `mapstructure:"enabled"`
+	// Path is the directory for the SQLite database file.
+	// Default: /var/lib/sandbox-agent
+	Path string `mapstructure:"path"`
+	// Filename is the database filename.
+	// Default: activity.db
+	Filename string `mapstructure:"filename"`
+}
+
+// FuseStorageConfig holds configuration for the FUSE sidecar S3 mounts.
+// When enabled, sandbox pods get a sidecar container that mounts S3 buckets
+// using mountpoint-s3. This replaces the emptyDir-based storage and snapshot system.
+type FuseStorageConfig struct {
+	// Enabled indicates whether FUSE sidecar should be added to sandbox pods.
+	Enabled bool `mapstructure:"enabled"`
+	// Image is the container image for the FUSE sidecar (mountpoint-s3).
+	Image string `mapstructure:"image"`
+	// Endpoint is the S3-compatible endpoint URL (e.g., "http://s3proxy.kata-system:80").
+	Endpoint string `mapstructure:"endpoint"`
+	// Region is the AWS region.
+	Region string `mapstructure:"region"`
+	// AssetsBucket is the bucket for all sandbox data.
+	// - User drives (/mydrive): {assets_bucket}/my_drive/{user_id}/
+	// - Session data (/data): {assets_bucket}/sandboxes/{session_id}/
+	AssetsBucket string `mapstructure:"assets_bucket"`
+	// AccessKeyID for S3 authentication.
+	AccessKeyID string `mapstructure:"access_key_id"`
+	// SecretAccessKey for S3 authentication (direct value).
+	SecretAccessKey string `mapstructure:"secret_access_key"`
+	// SecretAccessKeySecretName is the name of a Kubernetes Secret containing the secret access key.
+	// When set, SecretAccessKey is ignored and the sidecar env var uses valueFrom.secretKeyRef.
+	SecretAccessKeySecretName string `mapstructure:"secret_access_key_secret_name"`
+	// SecretAccessKeySecretKey is the key within the secret. Defaults to "secretAccessKey".
+	SecretAccessKeySecretKey string `mapstructure:"secret_access_key_secret_key"`
 }
 
 // Flags defines command-line flags that can override config values.
@@ -181,6 +241,16 @@ func DefaultConfig() Config {
 			Key:     "sandbox.kata.io/agent",
 			Value:   "true",
 		},
+		FuseStorage: FuseStorageConfig{
+			Enabled: false,
+			Image:   "amazon/aws-mountpoint-s3:latest",
+			Region:  "us-east-1",
+		},
+		ActivityDB: ActivityDBConfig{
+			Enabled:  true, // Enable by default since this solves the rate limiting issue
+			Path:     "/var/lib/sandbox-agent",
+			Filename: "activity.db",
+		},
 	}
 }
 
@@ -231,6 +301,16 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("node_label::enabled", defaults.NodeLabel.Enabled)
 	v.SetDefault("node_label::key", defaults.NodeLabel.Key)
 	v.SetDefault("node_label::value", defaults.NodeLabel.Value)
+	v.SetDefault("fuse_storage::enabled", defaults.FuseStorage.Enabled)
+	v.SetDefault("fuse_storage::image", defaults.FuseStorage.Image)
+	v.SetDefault("fuse_storage::endpoint", defaults.FuseStorage.Endpoint)
+	v.SetDefault("fuse_storage::region", defaults.FuseStorage.Region)
+	v.SetDefault("fuse_storage::assets_bucket", defaults.FuseStorage.AssetsBucket)
+	v.SetDefault("fuse_storage::access_key_id", defaults.FuseStorage.AccessKeyID)
+	v.SetDefault("fuse_storage::secret_access_key", defaults.FuseStorage.SecretAccessKey)
+	v.SetDefault("activity_db::enabled", defaults.ActivityDB.Enabled)
+	v.SetDefault("activity_db::path", defaults.ActivityDB.Path)
+	v.SetDefault("activity_db::filename", defaults.ActivityDB.Filename)
 
 	// Enable environment variable overrides
 	// Environment variables use SANDBOX_AGENT_ prefix with underscores

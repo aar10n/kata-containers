@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/activitydb"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/backend"
 	apierrors "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/errors"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/hostfs"
@@ -29,11 +30,27 @@ type Config struct {
 	ExecTimeout time.Duration
 	Mode        string // "kata" or "pod"
 
-	// Storage configuration
+	// Storage configuration (legacy snapshot system)
 	StorageEnabled   bool
 	StorageAddr      string
 	StorageTimeout   time.Duration
 	StorageInitImage string
+
+	// FUSE storage configuration (S3-backed mounts)
+	FuseEnabled                   bool
+	FuseImage                     string
+	FuseEndpoint                  string
+	FuseRegion                    string
+	FuseAssetsBucket              string
+	FuseAccessKeyID               string
+	FuseSecretAccessKey           string
+	FuseSecretAccessKeySecretName string
+	FuseSecretAccessKeySecretKey  string
+
+	// Activity database configuration (SQLite for last-used tracking)
+	ActivityDBEnabled  bool
+	ActivityDBPath     string
+	ActivityDBFilename string
 }
 
 // Service defines the sandbox agent service interface.
@@ -96,8 +113,12 @@ type CreateSandboxRequest struct {
 	Labels    map[string]string
 	// DownloadURL is a presigned GET URL for downloading a snapshot to restore.
 	// If set, an init container will download and extract the snapshot before
-	// the main container starts. Only used in pod mode with storage enabled.
+	// the main container starts. Only used in pod mode with legacy storage.
+	// Ignored when FUSE storage is enabled.
 	DownloadURL string
+	// UserID is an optional user identifier. When set with FUSE storage enabled,
+	// enables the /mydrive mount backed by S3 at assets_bucket/my-drive/{user_id}/.
+	UserID string
 }
 
 // SuspendSandboxResult holds the result of a suspend operation.
@@ -146,6 +167,7 @@ type service struct {
 	backend       backend.ExecutionBackend
 	hostfs        *hostfs.HostFS
 	storageClient *storage.Client
+	activityDB    *activitydb.ActivityDB
 }
 
 // New creates a new service instance.
@@ -162,6 +184,20 @@ func New(cfg Config, store *k8s.Store, manager *k8s.Manager, be backend.Executio
 	// Only the agent on the pod's node should handle the finalizer
 	if cfg.NodeName != "" {
 		store.SetLocalNodeName(cfg.NodeName)
+	}
+
+	// Initialize activity database if enabled
+	if cfg.ActivityDBEnabled {
+		adb, err := activitydb.New(activitydb.Config{
+			Path:     cfg.ActivityDBPath,
+			Filename: cfg.ActivityDBFilename,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create activity database: %w", err)
+		}
+		svc.activityDB = adb
+		store.SetActivityProvider(adb)
+		slog.Info("activity database initialized", "path", cfg.ActivityDBPath, "filename", cfg.ActivityDBFilename)
 	}
 
 	// Initialize storage client if enabled
@@ -187,8 +223,24 @@ func (s *service) Mode() string {
 	return s.config.Mode
 }
 
+// touchActivity updates the last-used timestamp for a sandbox in SQLite.
+// This is a best-effort operation - errors are logged but not propagated.
+func (s *service) touchActivity(sessionID string) {
+	if s.activityDB == nil {
+		return
+	}
+	if err := s.activityDB.UpdateActivity(context.Background(), sessionID); err != nil {
+		slog.Warn("failed to update activity", "session_id", sessionID, "error", err)
+	}
+}
+
 func (s *service) Close() error {
 	var errs []error
+	if s.activityDB != nil {
+		if err := s.activityDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if s.storageClient != nil {
 		if err := s.storageClient.Close(); err != nil {
 			errs = append(errs, err)
@@ -208,16 +260,60 @@ func (s *service) Close() error {
 // Sandbox lifecycle
 
 func (s *service) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*k8s.SandboxInfo, error) {
-	return s.manager.CreateSandbox(ctx, k8s.CreateSandboxRequest{
-		SessionID:               req.SessionID,
-		Image:                   req.Image,
-		Command:                 req.Command,
-		Env:                     req.Env,
-		Labels:                  req.Labels,
-		DownloadURL:             req.DownloadURL,
-		InitImage:               s.config.StorageInitImage,
-		EnableSnapshotFinalizer: s.storageClient != nil, // Enable finalizer when storage is enabled
-	})
+	slog.Info("CreateSandbox called", "session_id", req.SessionID, "user_id", req.UserID)
+	// Copy env map to avoid mutating the original
+	env := make(map[string]string, len(req.Env)+2)
+	for k, v := range req.Env {
+		env[k] = v
+	}
+
+	k8sReq := k8s.CreateSandboxRequest{
+		SessionID: req.SessionID,
+		Image:     req.Image,
+		Command:   req.Command,
+		Env:       env,
+		Labels:    req.Labels,
+		UserID:    req.UserID,
+	}
+
+	if s.config.FuseEnabled {
+		// Inject Python persistence env vars so pip installs persist to session storage
+		// The FUSE mount is at /mnt/fuse/data which is backed by S3
+		// PIP_USER=1 makes pip default to --user installs without requiring the flag
+		env["PYTHONUSERBASE"] = "/mnt/fuse/data/.local"
+		env["PIP_USER"] = "1"
+		if existingPath := env["PATH"]; existingPath != "" {
+			env["PATH"] = "/mnt/fuse/data/.local/bin:" + existingPath
+		} else {
+			env["PATH"] = "/mnt/fuse/data/.local/bin:/usr/local/bin:/usr/bin:/bin"
+		}
+
+		// FUSE mode: use S3-backed storage, disable legacy snapshot system
+		k8sReq.FuseConfig = &k8s.FuseSidecarConfig{
+			Image:                     s.config.FuseImage,
+			Endpoint:                  s.config.FuseEndpoint,
+			Region:                    s.config.FuseRegion,
+			AssetsBucket:              s.config.FuseAssetsBucket,
+			AccessKeyID:               s.config.FuseAccessKeyID,
+			SecretAccessKey:           s.config.FuseSecretAccessKey,
+			SecretAccessKeySecretName: s.config.FuseSecretAccessKeySecretName,
+			SecretAccessKeySecretKey:  s.config.FuseSecretAccessKeySecretKey,
+		}
+		// Note: DownloadURL, InitImage, and EnableSnapshotFinalizer are ignored
+		// when FuseConfig is set - FUSE provides persistent storage directly
+	} else {
+		// Legacy mode: emptyDir with optional snapshot restore
+		k8sReq.DownloadURL = req.DownloadURL
+		k8sReq.InitImage = s.config.StorageInitImage
+		k8sReq.EnableSnapshotFinalizer = s.storageClient != nil
+	}
+
+	info, err := s.manager.CreateSandbox(ctx, k8sReq)
+	if err == nil {
+		// Record initial activity timestamp
+		s.touchActivity(req.SessionID)
+	}
+	return info, err
 }
 
 func (s *service) GetSandbox(ctx context.Context, sessionID string) (*k8s.SandboxInfo, error) {
@@ -229,7 +325,14 @@ func (s *service) GetSandbox(ctx context.Context, sessionID string) (*k8s.Sandbo
 }
 
 func (s *service) DeleteSandbox(ctx context.Context, sessionID string) error {
-	return s.manager.DeleteSandbox(ctx, sessionID)
+	err := s.manager.DeleteSandbox(ctx, sessionID)
+	// Clean up activity record regardless of delete result
+	if s.activityDB != nil {
+		if cleanupErr := s.activityDB.Delete(ctx, sessionID); cleanupErr != nil {
+			slog.Warn("failed to clean up activity record", "session_id", sessionID, "error", cleanupErr)
+		}
+	}
+	return err
 }
 
 func (s *service) ListSandboxes(ctx context.Context, nodeName string) []*k8s.SandboxInfo {
@@ -244,6 +347,10 @@ func (s *service) ListSandboxes(ctx context.Context, nodeName string) []*k8s.San
 }
 
 func (s *service) UpdateSandboxActivity(ctx context.Context, sessionID string) error {
+	// Use ActivityDB if enabled, otherwise fall back to K8s annotations
+	if s.activityDB != nil {
+		return s.activityDB.UpdateActivity(ctx, sessionID)
+	}
 	return s.manager.UpdateSandboxActivity(ctx, sessionID)
 }
 
@@ -417,6 +524,7 @@ func (s *service) Exec(ctx context.Context, req ExecRequest) (ExecResponse, erro
 		return ExecResponse{}, err
 	}
 
+	s.touchActivity(req.SessionID)
 	return ExecResponse{
 		Stdout:   result.Stdout,
 		Stderr:   result.Stderr,
@@ -437,6 +545,7 @@ func (s *service) StartProcess(ctx context.Context, req StartProcessRequest) (*P
 		return nil, err
 	}
 
+	s.touchActivity(req.SessionID)
 	return &ProcessInfo{
 		ProcessID:   proc.ID,
 		ContainerID: proc.ContainerID,
@@ -448,7 +557,11 @@ func (s *service) WriteToProcess(ctx context.Context, sessionID, processID strin
 	if err != nil {
 		return err
 	}
-	return s.backend.WriteToProcess(ctx, containerID, processID, data)
+	err = s.backend.WriteToProcess(ctx, containerID, processID, data)
+	if err == nil {
+		s.touchActivity(sessionID)
+	}
+	return err
 }
 
 func (s *service) ReadStdout(ctx context.Context, sessionID, processID string, maxBytes int) ([]byte, error) {
@@ -504,7 +617,11 @@ func (s *service) KillProcess(ctx context.Context, sessionID, processID string, 
 	if err != nil {
 		return err
 	}
-	return s.backend.KillProcess(ctx, containerID, processID, signal)
+	err = s.backend.KillProcess(ctx, containerID, processID, signal)
+	if err == nil {
+		s.touchActivity(sessionID)
+	}
+	return err
 }
 
 func (s *service) WaitProcess(ctx context.Context, sessionID, processID string) (int32, error) {
@@ -535,7 +652,11 @@ func (s *service) ReadFile(ctx context.Context, sessionID, path string) ([]byte,
 		return nil, fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
 	}
 
-	return s.hostfs.ReadFile(ctx, podUID, path)
+	data, err := s.hostfs.ReadFile(ctx, podUID, path)
+	if err == nil {
+		s.touchActivity(sessionID)
+	}
+	return data, err
 }
 
 func (s *service) WriteFile(ctx context.Context, sessionID, path string, content []byte, mode uint32) error {
@@ -548,7 +669,11 @@ func (s *service) WriteFile(ctx context.Context, sessionID, path string, content
 		return fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
 	}
 
-	return s.hostfs.WriteFile(ctx, podUID, path, content, modeToFileMode(mode))
+	err := s.hostfs.WriteFile(ctx, podUID, path, content, modeToFileMode(mode))
+	if err == nil {
+		s.touchActivity(sessionID)
+	}
+	return err
 }
 
 func (s *service) ReadArchive(ctx context.Context, sessionID, path string) (io.ReadCloser, error) {
@@ -561,7 +686,11 @@ func (s *service) ReadArchive(ctx context.Context, sessionID, path string) (io.R
 		return nil, fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
 	}
 
-	return s.hostfs.ReadArchive(ctx, podUID, path)
+	reader, err := s.hostfs.ReadArchive(ctx, podUID, path)
+	if err == nil {
+		s.touchActivity(sessionID)
+	}
+	return reader, err
 }
 
 func (s *service) WriteArchive(ctx context.Context, sessionID, destDir string, tarData io.Reader) error {
@@ -574,7 +703,11 @@ func (s *service) WriteArchive(ctx context.Context, sessionID, destDir string, t
 		return fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
 	}
 
-	return s.hostfs.WriteArchive(ctx, podUID, destDir, tarData)
+	err := s.hostfs.WriteArchive(ctx, podUID, destDir, tarData)
+	if err == nil {
+		s.touchActivity(sessionID)
+	}
+	return err
 }
 
 // VM state operations

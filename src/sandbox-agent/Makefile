@@ -1,12 +1,14 @@
-REGISTRY ?= gcr.io/cohere-artifacts
+#REGISTRY ?= gcr.io/cohere-artifacts
+REGISTRY ?= us-docker.pkg.dev/cohere-artifacts/replicated/cohere
 TAG ?= latest
 PUSH ?= false
-REMOTE ?= aaron@192.168.1.105:build/
+#REMOTE ?= aaron@192.168.1.105:build/
+REMOTE ?= aaron-builder:build/
 PROTOC ?= protoc
 DOCKER_BUILDKIT ?= 1
 
 REPO_ROOT := $(shell cd ../.. && pwd)
-DOCKER_BUILD_CMD = DOCKER_BUILDKIT=$(DOCKER_BUILDKIT) docker build --platform linux/amd64 -t $(REGISTRY)/sandbox-agent:$(TAG) -f ../../tools/packaging/sandbox-agent/Dockerfile ../../
+DOCKER_BUILD_CMD = DOCKER_BUILDKIT=$(DOCKER_BUILDKIT) docker build --platform linux/amd64 -t $(REGISTRY)/sandbox/agent:$(TAG) -f ../../tools/packaging/sandbox-agent/Dockerfile ../../
 REMOTE_HOST := $(shell printf '%s' "$(REMOTE)" | sed -E 's/:.*$$//')
 REMOTE_PATH := $(shell printf '%s' "$(REMOTE)" | sed -E 's/^[^:]+://')
 REMOTE_REPO := $(REMOTE_PATH)kata-containers
@@ -23,12 +25,12 @@ PROTO_INCLUDES := -I /opt/homebrew/include -I $(PROTO_DIR) -I $(REPO_ROOT)/src/l
 docker-build:
 	$(DOCKER_BUILD_CMD)
 	@if [ "$(PUSH)" = "true" ] || [ "$(PUSH)" = "1" ]; then \
-		docker push $(REGISTRY)/sandbox-agent:$(TAG); \
+		docker push $(REGISTRY)/sandbox/agent:$(TAG); \
 	fi
 
 docker-build-remote:
 	@rsync -az --delete --relative $(RSYNC_PATHS) $(REMOTE)kata-containers/
-	@ssh $(REMOTE_HOST) 'cd $(REMOTE_BUILD_DIR) && $(DOCKER_BUILD_CMD) && if [ "$(PUSH)" = "true" ] || [ "$(PUSH)" = "1" ]; then docker push $(REGISTRY)/sandbox-agent:$(TAG); fi'
+	@ssh $(REMOTE_HOST) 'cd $(REMOTE_BUILD_DIR) && $(DOCKER_BUILD_CMD) && if [ "$(PUSH)" = "true" ] || [ "$(PUSH)" = "1" ]; then docker push $(REGISTRY)/sandbox/agent:$(TAG); fi'
 
 proto-gen: proto-gen-storage
 	@mkdir -p $(PROTO_OUT)

@@ -350,6 +350,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, sessionID st
 		Env:        req.Env,
 		WorkingDir: req.WorkingDir,
 		Image:      req.Image,
+		UserID:     getUserID(r),
 	}
 	if req.TimeoutMs > 0 {
 		input.Timeout = time.Duration(req.TimeoutMs) * time.Millisecond
@@ -375,7 +376,7 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request, sess
 		return
 	}
 
-	data, err := s.svc.DownloadFile(r.Context(), sessionID, path)
+	data, err := s.svc.DownloadFile(r.Context(), sessionID, path, getUserID(r))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -422,7 +423,7 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request, sessio
 		return
 	}
 
-	if err := s.svc.UploadFile(r.Context(), sessionID, path, data, overwrite); err != nil {
+	if err := s.svc.UploadFile(r.Context(), sessionID, path, data, overwrite, getUserID(r)); err != nil {
 		// Check if it's a "file already exists" error
 		if strings.Contains(err.Error(), "file already exists") {
 			writeError(w, http.StatusConflict, err.Error())
@@ -447,7 +448,7 @@ func (s *Server) handleShellExec(w http.ResponseWriter, r *http.Request, session
 	}
 
 	timeout := time.Duration(req.TimeoutMs) * time.Millisecond
-	result, err := s.svc.ExecShell(r.Context(), sessionID, req.Command, timeout)
+	result, err := s.svc.ExecShell(r.Context(), sessionID, req.Command, timeout, getUserID(r))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -520,7 +521,7 @@ func (s *Server) handlePythonExec(w http.ResponseWriter, r *http.Request, sessio
 	}
 
 	timeout := time.Duration(req.TimeoutMs) * time.Millisecond
-	result, err := s.svc.ExecPython(r.Context(), sessionID, req.Code, timeout)
+	result, err := s.svc.ExecPython(r.Context(), sessionID, req.Code, timeout, getUserID(r))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -641,10 +642,11 @@ func (s *Server) streamExec(w http.ResponseWriter, r *http.Request, sessionID, c
 	}
 
 	var err error
+	userID := getUserID(r)
 	if isShell {
-		err = s.svc.StreamExecShell(ctx, sessionID, command, timeout, sendChunk)
+		err = s.svc.StreamExecShell(ctx, sessionID, command, timeout, userID, sendChunk)
 	} else {
-		err = s.svc.StreamExecPython(ctx, sessionID, code, timeout, sendChunk)
+		err = s.svc.StreamExecPython(ctx, sessionID, code, timeout, userID, sendChunk)
 	}
 
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -695,7 +697,7 @@ func (s *Server) handleStartJob(w http.ResponseWriter, r *http.Request, sessionI
 		return
 	}
 
-	job, err := s.svc.StartJob(r.Context(), sessionID, req.Command, req.Name)
+	job, err := s.svc.StartJob(r.Context(), sessionID, req.Command, req.Name, getUserID(r))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -816,4 +818,13 @@ func formatTime(value time.Time) string {
 		return ""
 	}
 	return value.UTC().Format(time.RFC3339)
+}
+
+// getUserID extracts the user ID from the request header or query parameter.
+// The header X-North-User-ID takes precedence over the query parameter user_id.
+func getUserID(r *http.Request) string {
+	if userID := r.Header.Get("X-North-User-ID"); userID != "" {
+		return userID
+	}
+	return r.URL.Query().Get("user_id")
 }

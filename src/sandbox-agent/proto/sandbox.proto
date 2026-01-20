@@ -101,7 +101,11 @@ message CreateSandboxRequest {
   map<string, string> labels = 5;
   // Presigned GET URL for downloading a snapshot to restore (pod mode only).
   // If set, an init container will download and extract the snapshot into /data.
+  // Ignored when fuse_storage is enabled.
   string download_url = 6;
+  // Optional user ID. When provided and fuse_storage is enabled, enables
+  // the /mydrive mount backed by S3 at assets_bucket/my-drive/{user_id}/.
+  string user_id = 7;
 }
 
 message GetSandboxRequest {
@@ -148,6 +152,8 @@ message ExecRequest {
   repeated string env = 4;
   string cwd = 5;
   int64 timeout_ms = 6;
+  // Optional user ID. Currently unused but reserved for future use.
+  string user_id = 7;
 }
 
 message ExecResponse {
@@ -163,6 +169,8 @@ message StartProcessRequest {
   repeated string env = 3;
   string cwd = 4;
   bool tty = 5;
+  // Optional user ID. Currently unused but reserved for future use.
+  string user_id = 6;
 }
 
 message StartProcessResponse {

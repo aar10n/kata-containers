@@ -69,6 +69,7 @@ func (s *Server) CreateSandbox(ctx context.Context, req *pb.CreateSandboxRequest
 		Env:         req.GetEnv(),
 		Labels:      req.GetLabels(),
 		DownloadURL: req.GetDownloadUrl(),
+		UserID:      req.GetUserId(),
 	})
 	if err != nil {
 		if errors.Is(err, k8s.ErrSandboxAlreadyExists) {

@@ -25,6 +25,12 @@ const (
 	// SnapshotFinalizer is added to pods when storage is enabled to ensure
 	// snapshots are saved before pod deletion.
 	SnapshotFinalizer = "sandbox.cohere.com/snapshot"
+
+	// FUSE sidecar constants
+	FuseMountVolumeName  = "fuse-mounts"
+	FuseDeviceVolumeName = "fuse-device"
+	FuseMountPath        = "/mnt/fuse"
+	MyDriveMountPath     = "/mydrive"
 )
 
 var (
@@ -37,6 +43,8 @@ type ManagerConfig struct {
 	Namespace        string
 	RuntimeClassName string
 	NodeSelector     map[string]string
+	Tolerations      []corev1.Toleration
+	ImagePullSecrets []corev1.LocalObjectReference
 	// PodMode indicates whether to create regular pods (true) or Kata VMs (false).
 	// When true, RuntimeClassName is not set and emptyDir volumes are added.
 	PodMode bool
@@ -61,6 +69,21 @@ func NewManager(client kubernetes.Interface, config ManagerConfig, store *Store)
 	}
 }
 
+// FuseSidecarConfig holds configuration for the FUSE sidecar container.
+type FuseSidecarConfig struct {
+	Image           string
+	Endpoint        string
+	Region          string
+	AssetsBucket    string
+	AccessKeyID     string
+	SecretAccessKey string
+	// SecretAccessKeySecretName is the name of a Kubernetes Secret containing the secret access key.
+	// When set, SecretAccessKey is ignored and the value is loaded from the secret.
+	SecretAccessKeySecretName string
+	// SecretAccessKeySecretKey is the key within the secret. Defaults to "secretAccessKey".
+	SecretAccessKeySecretKey string
+}
+
 // CreateSandboxRequest holds parameters for creating a sandbox.
 type CreateSandboxRequest struct {
 	SessionID string
@@ -70,13 +93,21 @@ type CreateSandboxRequest struct {
 	Labels    map[string]string
 	// DownloadURL is a presigned GET URL for downloading a snapshot to restore.
 	// If set, an init container will download and extract the snapshot into /data.
+	// Ignored when FuseConfig is set (FUSE provides persistent storage).
 	DownloadURL string
 	// InitImage is the container image for the init container.
 	// Should contain wget/curl and tar. Defaults to busybox:1.36.
 	InitImage string
 	// EnableSnapshotFinalizer adds a finalizer to the pod that blocks deletion
 	// until a snapshot is saved. This ensures data is preserved on pod eviction.
+	// Ignored when FuseConfig is set (FUSE provides persistent storage).
 	EnableSnapshotFinalizer bool
+	// UserID is an optional user identifier. When set along with FuseConfig,
+	// enables the /mydrive mount backed by S3 at assets_bucket/my-drive/{user_id}/.
+	UserID string
+	// FuseConfig enables the FUSE sidecar for S3-backed storage.
+	// When set, replaces emptyDir with FUSE mounts and disables snapshot system.
+	FuseConfig *FuseSidecarConfig
 }
 
 // CreateSandbox creates a new sandbox pod.
@@ -124,69 +155,116 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 	}
 
 	// Build pod spec
+	terminationGracePeriod := int64(5) // Short grace period since preStop hook handles cleanup
 	podSpec := corev1.PodSpec{
-		NodeSelector:  copyMap(m.config.NodeSelector),
-		Containers:    []corev1.Container{container},
-		RestartPolicy: corev1.RestartPolicyNever,
+		NodeSelector:                  copyMap(m.config.NodeSelector),
+		Tolerations:                   m.config.Tolerations,
+		ImagePullSecrets:              m.config.ImagePullSecrets,
+		Containers:                    []corev1.Container{container},
+		RestartPolicy:                 corev1.RestartPolicyNever,
+		TerminationGracePeriodSeconds: &terminationGracePeriod,
 	}
 
 	// Configure based on mode
+	var finalizers []string
 	if m.config.PodMode {
-		// Pod mode: add emptyDir volume for data, no RuntimeClassName
-		podSpec.Volumes = []corev1.Volume{
-			{
-				Name: SandboxDataVolumeName,
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				},
-			},
-		}
-		podSpec.Containers[0].VolumeMounts = []corev1.VolumeMount{
-			{
-				Name:      SandboxDataVolumeName,
-				MountPath: SandboxDataMountPath,
-			},
-		}
+		if req.FuseConfig != nil {
+			// FUSE mode: use S3-backed storage via mountpoint-s3 sidecar
+			// This replaces emptyDir and the snapshot system
+			hostPathCharDev := corev1.HostPathCharDev
+			mountPropBidirectional := corev1.MountPropagationBidirectional
+			mountPropHostToContainer := corev1.MountPropagationHostToContainer
 
-		// Add init container if restoring from snapshot
-		if downloadURL := strings.TrimSpace(req.DownloadURL); downloadURL != "" {
-			initImage := strings.TrimSpace(req.InitImage)
-			if initImage == "" {
-				initImage = "busybox:1.36"
-			}
-
-			// Init container downloads and extracts the snapshot into /data
-			// Uses wget (busybox) to download and tar to extract
-			podSpec.InitContainers = []corev1.Container{
+			podSpec.Volumes = []corev1.Volume{
 				{
-					Name:  "restore-snapshot",
-					Image: initImage,
-					Command: []string{
-						"/bin/sh",
-						"-c",
-						fmt.Sprintf("wget -q -O - '%s' | tar -xzf - --strip-components=1 -C %s", downloadURL, SandboxDataMountPath),
+					Name: FuseMountVolumeName,
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
 					},
-					VolumeMounts: []corev1.VolumeMount{
-						{
-							Name:      SandboxDataVolumeName,
-							MountPath: SandboxDataMountPath,
+				},
+				{
+					Name: FuseDeviceVolumeName,
+					VolumeSource: corev1.VolumeSource{
+						HostPath: &corev1.HostPathVolumeSource{
+							Path: "/dev/fuse",
+							Type: &hostPathCharDev,
 						},
 					},
 				},
 			}
 
-			// Add annotation to track that this pod was restored from snapshot
-			annotations["sandbox.cohere.com/restored-from-snapshot"] = "true"
+			// Build mounts for main container
+			// Mount the shared volume at /mnt/fuse with HostToContainer propagation
+			// The sidecar creates FUSE mounts at /mnt/fuse/data and /mnt/fuse/mydrive
+			// which propagate to the main container
+			mainMounts := []corev1.VolumeMount{
+				{
+					Name:             FuseMountVolumeName,
+					MountPath:        FuseMountPath,
+					MountPropagation: &mountPropHostToContainer,
+				},
+			}
+			if userID := strings.TrimSpace(req.UserID); userID != "" {
+				labels["sandbox.cohere.com/user-id"] = userID
+			}
+			podSpec.Containers[0].VolumeMounts = mainMounts
+
+			// Add FUSE sidecar as a native Kubernetes sidecar (init container with restartPolicy: Always)
+			// This ensures: 1) sidecar starts before main container, 2) terminates when main container exits
+			sidecar := buildFuseSidecar(req.FuseConfig, sessionID, req.UserID, &mountPropBidirectional)
+			podSpec.InitContainers = append(podSpec.InitContainers, sidecar)
+		} else {
+			// Legacy mode: emptyDir volume with optional snapshot restore
+			podSpec.Volumes = []corev1.Volume{
+				{
+					Name: SandboxDataVolumeName,
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+			}
+			podSpec.Containers[0].VolumeMounts = []corev1.VolumeMount{
+				{
+					Name:      SandboxDataVolumeName,
+					MountPath: SandboxDataMountPath,
+				},
+			}
+
+			// Add init container if restoring from snapshot
+			if downloadURL := strings.TrimSpace(req.DownloadURL); downloadURL != "" {
+				initImage := strings.TrimSpace(req.InitImage)
+				if initImage == "" {
+					initImage = "busybox:1.36"
+				}
+
+				podSpec.InitContainers = []corev1.Container{
+					{
+						Name:  "restore-snapshot",
+						Image: initImage,
+						Command: []string{
+							"/bin/sh",
+							"-c",
+							fmt.Sprintf("wget -q -O - '%s' | tar -xzf - --strip-components=1 -C %s", downloadURL, SandboxDataMountPath),
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{
+								Name:      SandboxDataVolumeName,
+								MountPath: SandboxDataMountPath,
+							},
+						},
+					},
+				}
+				annotations["sandbox.cohere.com/restored-from-snapshot"] = "true"
+			}
+
+			// Only enable snapshot finalizer in legacy mode
+			if req.EnableSnapshotFinalizer {
+				finalizers = []string{SnapshotFinalizer}
+			}
 		}
 	} else {
 		// Kata mode: set RuntimeClassName if configured
 		podSpec.RuntimeClassName = runtimeClassName(m.config.RuntimeClassName)
-	}
-
-	// Build finalizers list if snapshot finalizer is enabled
-	var finalizers []string
-	if req.EnableSnapshotFinalizer {
-		finalizers = []string{SnapshotFinalizer}
 	}
 
 	pod := &corev1.Pod{
@@ -445,4 +523,156 @@ func mapToEnvVars(m map[string]string) []corev1.EnvVar {
 		result = append(result, corev1.EnvVar{Name: k, Value: v})
 	}
 	return result
+}
+
+// buildFuseSidecar creates the FUSE sidecar container spec using fuse-adapter.
+// fuse-adapter (https://github.com/aar10n/fuse-adapter) supports multiple FUSE backends
+// via YAML config and provides POSIX permissions (via S3 metadata headers), which is
+// required for pip install --user to work.
+func buildFuseSidecar(cfg *FuseSidecarConfig, sessionID, userID string, mountProp *corev1.MountPropagationMode) corev1.Container {
+	userID = strings.TrimSpace(userID)
+
+	// Build YAML config for fuse-adapter
+	// Always mount /data -> assets_bucket/sandboxes/{session_id}/
+	// Optionally mount /mydrive -> assets_bucket/my_drive/{user_id}/
+	//
+	// Common S3 config is defined under connectors.s3, mounts reference it by type.
+	// The cache layer is required for random write operations (S3 only supports full object writes).
+	var yamlConfig string
+	if userID != "" {
+		yamlConfig = fmt.Sprintf(`logging:
+  level: warn
+
+connectors:
+  s3:
+    bucket: %s
+    region: %s
+    endpoint: "%s"
+    force_path_style: true
+	cache:
+      type: filesystem
+      path: /tmp/fuse-adapter-cache/s3
+      max_size: "256MB"
+      flush_interval: 30s
+
+mounts:
+  - path: %s/data
+    connector:
+      type: s3
+      prefix: "sandboxes/%s/"
+  - path: %s/mydrive
+    connector:
+      type: s3
+      prefix: "my_drive/%s/"
+	  read_only: true
+`, cfg.AssetsBucket, cfg.Region, cfg.Endpoint,
+			FuseMountPath, sessionID,
+			FuseMountPath, userID)
+	} else {
+		yamlConfig = fmt.Sprintf(`logging:
+  level: warn
+
+connectors:
+  s3:
+    bucket: %s
+    region: %s
+    endpoint: "%s"
+    force_path_style: true
+
+mounts:
+  - path: %s/data
+    connector:
+      type: s3
+      prefix: "sandboxes/%s/"
+    cache:
+      type: filesystem
+      path: /tmp/fuse-adapter-cache/data
+      max_size: "512MB"
+      flush_interval: 30s
+`, cfg.AssetsBucket, cfg.Region, cfg.Endpoint,
+			FuseMountPath, sessionID)
+	}
+
+	// Yaml doesn't allow tabs
+	yamlConfig = strings.ReplaceAll(yamlConfig, "\t", "  ")
+
+	// Script to write config and run fuse-adapter
+	// The YAML config is passed via FUSE_ADAPTER_CONFIG env var for easy debugging
+	// (visible in kubectl describe pod). Using printf '%s' safely handles all characters.
+	mkdirPath := FuseMountPath + "/data"
+	if userID != "" {
+		mkdirPath += " " + FuseMountPath + "/mydrive"
+	}
+	script := fmt.Sprintf(`#!/bin/sh
+set -e
+
+mkdir -p %s
+printf '%%s' "$FUSE_ADAPTER_CONFIG" > /tmp/fuse-adapter.yaml
+
+exec /usr/local/bin/fuse-adapter /tmp/fuse-adapter.yaml
+`, mkdirPath)
+
+	restartAlways := corev1.ContainerRestartPolicyAlways
+
+	// Build env vars - use secretKeyRef if secret name is provided
+	// FUSE_ADAPTER_CONFIG contains the YAML config, making it visible in kubectl describe pod
+	envVars := []corev1.EnvVar{
+		{Name: "AWS_ACCESS_KEY_ID", Value: cfg.AccessKeyID},
+		{Name: "FUSE_ADAPTER_CONFIG", Value: yamlConfig},
+	}
+	if cfg.SecretAccessKeySecretName != "" {
+		secretKey := cfg.SecretAccessKeySecretKey
+		if secretKey == "" {
+			secretKey = "secretAccessKey"
+		}
+		envVars = append(envVars, corev1.EnvVar{
+			Name: "AWS_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: cfg.SecretAccessKeySecretName,
+					},
+					Key: secretKey,
+				},
+			},
+		})
+	} else {
+		envVars = append(envVars, corev1.EnvVar{
+			Name: "AWS_SECRET_ACCESS_KEY", Value: cfg.SecretAccessKey,
+		})
+	}
+
+	return corev1.Container{
+		Name:          "fuse-sidecar",
+		Image:         cfg.Image,
+		Command:       []string{"/bin/sh", "-c", script},
+		RestartPolicy: &restartAlways, // Native sidecar: runs alongside main container, terminates when pod exits
+		Env:           envVars,
+		SecurityContext: &corev1.SecurityContext{
+			Privileged: boolPtr(true), // Required for bidirectional mount propagation
+		},
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Exec: &corev1.ExecAction{
+					// Send SIGINT to fuse-adapter for graceful shutdown (unmounts all filesystems)
+					Command: []string{"/bin/sh", "-c", "pkill -INT fuse-adapter; sleep 2; pkill -KILL fuse-adapter 2>/dev/null; exit 0"},
+				},
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      FuseDeviceVolumeName,
+				MountPath: "/dev/fuse",
+			},
+			{
+				Name:             FuseMountVolumeName,
+				MountPath:        FuseMountPath,
+				MountPropagation: mountProp,
+			},
+		},
+	}
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }

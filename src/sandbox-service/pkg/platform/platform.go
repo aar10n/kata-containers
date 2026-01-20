@@ -43,6 +43,9 @@ type CreateSandboxRequest struct {
 	// DownloadURL is a presigned GET URL for downloading a snapshot to restore.
 	// If set, sandbox-agent will create an init container to restore the snapshot.
 	DownloadURL string
+	// UserID is an optional user identifier. When provided and FUSE storage is enabled,
+	// enables the /mydrive mount backed by S3 at assets_bucket/my-drive/{user_id}/.
+	UserID string
 }
 
 type Sandbox struct {
@@ -72,6 +75,8 @@ type ExecRequest struct {
 	Env           map[string]string
 	WorkingDir    string
 	Timeout       time.Duration
+	// UserID is an optional user identifier passed through to the sandbox-agent.
+	UserID string
 }
 
 type ExecResult struct {
@@ -87,6 +92,8 @@ type StartProcessRequest struct {
 	Command       []string
 	Env           []string
 	Terminal      bool
+	// UserID is an optional user identifier passed through to the sandbox-agent.
+	UserID string
 }
 
 type Process struct {

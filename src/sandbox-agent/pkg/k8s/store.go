@@ -1,12 +1,21 @@
 package k8s
 
 import (
+	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 )
+
+// ActivityProvider defines the interface for activity timestamp lookups.
+// This allows the store to retrieve last-used times from SQLite.
+type ActivityProvider interface {
+	GetLastUsed(ctx context.Context, sessionID string) (int64, bool)
+	GetAllLastUsed(ctx context.Context) (map[string]int64, error)
+}
 
 const sandboxAnnotationKey = "io.kubernetes.cri.sandbox-id"
 const sandboxAnnotationAltKey = "sandbox.cohere.com/sandbox-id"
@@ -65,6 +74,7 @@ type Store struct {
 	onPodDeleting        PodDeletingCallback
 	pendingSnapshotSaves map[string]bool // sessions that have already triggered snapshot save
 	localNodeName        string          // node name for this agent, used to filter finalizer handling
+	activityDB           ActivityProvider
 }
 
 func NewStore() *Store {
@@ -108,6 +118,14 @@ func (s *Store) SetLocalNodeName(nodeName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.localNodeName = nodeName
+}
+
+// SetActivityProvider sets the activity database for timestamp lookups.
+// When set, LastUsedAt values in GetSandbox/ListSandboxes will be sourced from SQLite.
+func (s *Store) SetActivityProvider(ap ActivityProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activityDB = ap
 }
 
 // UpdateSandboxID updates the sandbox ID for a session and populates the vmToSession mapping.
@@ -297,15 +315,24 @@ func (s *Store) GetSandbox(sessionID string) (*SandboxInfo, bool) {
 	}
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	info, ok := s.sandboxes[sessionID]
 	if !ok {
+		s.mu.RUnlock()
 		return nil, false
 	}
 	// Only return if the node has an agent
 	if _, agentOK := s.nodeToSandboxPodIP[info.Node]; !agentOK && info.Node != "" {
+		s.mu.RUnlock()
 		return nil, false
+	}
+	activityDB := s.activityDB
+	s.mu.RUnlock()
+
+	// Override LastUsedAt from ActivityDB if available
+	if activityDB != nil {
+		if ts, ok := activityDB.GetLastUsed(context.Background(), sessionID); ok {
+			info.LastUsedAt = time.Unix(ts, 0)
+		}
 	}
 	return info, true
 }
@@ -334,8 +361,6 @@ func (s *Store) GetSandboxByVMID(vmID string) (*SandboxInfo, bool) {
 // ListSandboxes returns all sandboxes, optionally filtered by node.
 func (s *Store) ListSandboxes(nodeName string) []*SandboxInfo {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	nodeName = strings.TrimSpace(nodeName)
 	result := make([]*SandboxInfo, 0, len(s.sandboxes))
 	for _, info := range s.sandboxes {
@@ -349,6 +374,20 @@ func (s *Store) ListSandboxes(nodeName string) []*SandboxInfo {
 			}
 		}
 		result = append(result, info)
+	}
+	activityDB := s.activityDB
+	s.mu.RUnlock()
+
+	// Bulk load activity timestamps for efficiency
+	if activityDB != nil {
+		activityMap, err := activityDB.GetAllLastUsed(context.Background())
+		if err == nil && activityMap != nil {
+			for _, info := range result {
+				if ts, ok := activityMap[info.SessionID]; ok {
+					info.LastUsedAt = time.Unix(ts, 0)
+				}
+			}
+		}
 	}
 	return result
 }
@@ -378,8 +417,9 @@ func (s *Store) PodUIDForSession(sessionID string) (string, bool) {
 	return info.PodUID, info.PodUID != ""
 }
 
-// ContainerIDForSession returns the first running container ID for a session.
+// ContainerIDForSession returns the main sandbox container ID for a session.
 // This is used for CRI-based command execution.
+// It specifically looks for the "sandbox" container to avoid executing in sidecars.
 func (s *Store) ContainerIDForSession(sessionID string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -389,7 +429,14 @@ func (s *Store) ContainerIDForSession(sessionID string) (string, bool) {
 		return "", false
 	}
 
-	// Return first container ID if available
+	// Always use the "sandbox" container, never sidecars
+	for _, c := range info.Containers {
+		if c.Name == "sandbox" && c.ContainerID != "" {
+			return c.ContainerID, true
+		}
+	}
+	// Fallback: return first container if "sandbox" not found (shouldn't happen)
+	slog.Warn("sandbox container not found, using fallback", "session_id", sessionID)
 	for _, c := range info.Containers {
 		if c.ContainerID != "" {
 			return c.ContainerID, true

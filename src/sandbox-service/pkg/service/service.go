@@ -33,25 +33,30 @@ const (
 	maxCompletedJobs    = 50
 )
 
-const shellInitScript = `
-bind 'set enable-bracketed-paste off'
-stty -echo
-export PS1=
-unset PROMPT_COMMAND
-printf '%s'
-`
+// shellReadyPrefix is the prefix for the ready marker printed by the bashrc.
+// The full marker includes a random suffix to avoid false matches.
+const shellReadyPrefix = "<<<SHELL_READY_"
 
 // shellWrapperScript is a wrapper that respawns bash when it exits.
 // This handles the case where a user runs 'exit' - the shell restarts automatically.
 // Note: Environment variables and state are lost on restart, which is expected.
 // The wrapper creates a bashrc that initializes each new bash instance.
+// The %s placeholder is for the ready token that signals bash initialization is complete.
 const shellWrapperScript = `#!/bin/bash
-# Create init script for each bash instance
-cat > /tmp/.sandbox-bashrc << 'BASHRC'
-bind 'set enable-bracketed-paste off' 2>/dev/null
+READY_TOKEN="%s"
+
+# Disable TTY echo immediately before starting bash to prevent race condition
 stty -echo 2>/dev/null
+sleep 0.1  # Allow stty settings to propagate to TTY driver
+
+# Create init script for each bash instance
+# The ready token is printed AFTER stty -echo to guarantee no echo race
+cat > /tmp/.sandbox-bashrc << BASHRC
+stty -echo 2>/dev/null
+bind 'set enable-bracketed-paste off' 2>/dev/null
 export PS1=
 unset PROMPT_COMMAND
+printf '%%s\n' "$READY_TOKEN"
 BASHRC
 
 trap '' INT  # Ignore SIGINT in wrapper, let inner bash handle it
@@ -63,6 +68,8 @@ while true; do
         # Print restart message to stderr so it doesn't interfere with markers
         printf '\n[Shell exited, restarting with fresh state...]\n' >&2
     fi
+    # Re-disable echo before each bash instance (in case it was re-enabled)
+    stty -echo 2>/dev/null
     bash --rcfile /tmp/.sandbox-bashrc -i
 done
 `
@@ -74,8 +81,19 @@ Reads code blocks delimited by <<<EXEC>>>, executes them, and outputs <<<DONE>>>
 Automatically handles exit()/sys.exit() by resetting state and continuing.
 """
 import sys
+import os
+import site
 import traceback
 import io
+
+# Ensure user site-packages is in sys.path even if directory didn't exist at startup.
+# This allows pip install --user to work without restarting the REPL.
+_user_base = os.environ.get('PYTHONUSERBASE')
+if _user_base:
+    _user_site = os.path.join(_user_base, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')
+    os.makedirs(_user_site, exist_ok=True)
+    if _user_site not in sys.path:
+        site.addsitedir(_user_site)
 
 # Global context for persistent state
 __context__ = {'__builtins__': __builtins__}
@@ -180,9 +198,9 @@ type Service struct {
 	leaderElection  LeaderElectionConfig
 	stopCh          chan struct{}
 	stopOnce        sync.Once
-	mu            sync.Mutex
-	sessions      map[string]*Session
-	storageClient StorageClient // Optional storage client for snapshot restore
+	mu              sync.Mutex
+	sessions        map[string]*Session
+	storageClient   StorageClient // Optional storage client for snapshot restore
 }
 
 type ExecInput struct {
@@ -191,10 +209,12 @@ type ExecInput struct {
 	WorkingDir string
 	Timeout    time.Duration
 	Image      string
+	UserID     string
 }
 
 type Session struct {
 	SessionID string
+	UserID    string // Optional user ID for /mydrive mount
 	Shell     *ProcessState
 	REPLs     map[string]*ProcessState
 	Jobs      map[string]*JobState
@@ -288,16 +308,24 @@ func (s *Service) SetStorageClient(client StorageClient) {
 }
 
 func (s *Service) getSession(sessionID string) *Session {
+	return s.getSessionWithUserID(sessionID, "")
+}
+
+func (s *Service) getSessionWithUserID(sessionID, userID string) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[sessionID]
 	if !ok {
 		session = &Session{
 			SessionID: sessionID,
+			UserID:    userID,
 			REPLs:     make(map[string]*ProcessState),
 			Jobs:      make(map[string]*JobState),
 		}
 		s.sessions[sessionID] = session
+	} else if userID != "" && session.UserID == "" {
+		// Update userID if provided and not already set
+		session.UserID = userID
 	}
 	return session
 }
@@ -320,7 +348,11 @@ func (s *Service) Exec(ctx context.Context, sessionID string, input ExecInput) (
 		input.Timeout = s.defaultTimeout
 	}
 
-	if err := s.ensureReady(ctx, sessionID, input.Image); err != nil {
+	// Store userID in session for future operations
+	slog.Info("Exec called", "session_id", sessionID, "user_id", input.UserID)
+	session := s.getSessionWithUserID(sessionID, input.UserID)
+
+	if err := s.ensureReady(ctx, sessionID, input.Image, session.UserID); err != nil {
 		return nil, err
 	}
 
@@ -331,6 +363,7 @@ func (s *Service) Exec(ctx context.Context, sessionID string, input ExecInput) (
 		Env:           input.Env,
 		WorkingDir:    input.WorkingDir,
 		Timeout:       input.Timeout,
+		UserID:        input.UserID,
 	})
 	if err != nil {
 		return nil, err
@@ -342,7 +375,7 @@ func (s *Service) Exec(ctx context.Context, sessionID string, input ExecInput) (
 
 // DownloadFile reads a file from the sandbox and returns its contents.
 // The file is read using base64 encoding to safely handle binary content.
-func (s *Service) DownloadFile(ctx context.Context, sessionID, path string) ([]byte, error) {
+func (s *Service) DownloadFile(ctx context.Context, sessionID, path, userID string) ([]byte, error) {
 	if sessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
@@ -350,7 +383,8 @@ func (s *Service) DownloadFile(ctx context.Context, sessionID, path string) ([]b
 		return nil, errors.New("path is required")
 	}
 
-	if err := s.ensureReady(ctx, sessionID, ""); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID)
+	if err := s.ensureReady(ctx, sessionID, "", session.UserID); err != nil {
 		return nil, err
 	}
 
@@ -384,7 +418,7 @@ func (s *Service) DownloadFile(ctx context.Context, sessionID, path string) ([]b
 
 // UploadFile writes data to a file in the sandbox.
 // If overwrite is false and the file already exists, an error is returned.
-func (s *Service) UploadFile(ctx context.Context, sessionID, path string, data []byte, overwrite bool) error {
+func (s *Service) UploadFile(ctx context.Context, sessionID, path string, data []byte, overwrite bool, userID string) error {
 	if sessionID == "" {
 		return errors.New("session_id is required")
 	}
@@ -392,7 +426,8 @@ func (s *Service) UploadFile(ctx context.Context, sessionID, path string, data [
 		return errors.New("path is required")
 	}
 
-	if err := s.ensureReady(ctx, sessionID, ""); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID)
+	if err := s.ensureReady(ctx, sessionID, "", session.UserID); err != nil {
 		return err
 	}
 
@@ -438,7 +473,8 @@ func (s *Service) UploadFile(ctx context.Context, sessionID, path string, data [
 	return nil
 }
 
-func (s *Service) ExecShell(ctx context.Context, sessionID, command string, timeout time.Duration) (*ShellResult, error) {
+func (s *Service) ExecShell(ctx context.Context, sessionID, command string, timeout time.Duration, userID string) (*ShellResult, error) {
+	slog.Info("ExecShell called", "session_id", sessionID, "user_id", userID)
 	if sessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
@@ -452,7 +488,8 @@ func (s *Service) ExecShell(ctx context.Context, sessionID, command string, time
 	readyCtx, readyCancel := context.WithTimeout(ctx, s.readyTimeout)
 	defer readyCancel()
 
-	if err := s.ensureReady(readyCtx, sessionID, ""); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID)
+	if err := s.ensureReady(readyCtx, sessionID, "", session.UserID); err != nil {
 		return nil, err
 	}
 
@@ -494,7 +531,7 @@ func (s *Service) ExecShell(ctx context.Context, sessionID, command string, time
 // StreamExecShell executes a shell command and streams output via the onChunk callback.
 // The callback is called with each chunk of stdout/stderr data as it becomes available.
 // The final call will have Done=true and include the exit code.
-func (s *Service) StreamExecShell(ctx context.Context, sessionID, command string, timeout time.Duration, onChunk func(OutputChunk)) error {
+func (s *Service) StreamExecShell(ctx context.Context, sessionID, command string, timeout time.Duration, userID string, onChunk func(OutputChunk)) error {
 	if sessionID == "" {
 		return errors.New("session_id is required")
 	}
@@ -508,7 +545,8 @@ func (s *Service) StreamExecShell(ctx context.Context, sessionID, command string
 	readyCtx, readyCancel := context.WithTimeout(ctx, s.readyTimeout)
 	defer readyCancel()
 
-	if err := s.ensureReady(readyCtx, sessionID, ""); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID)
+	if err := s.ensureReady(readyCtx, sessionID, "", session.UserID); err != nil {
 		return err
 	}
 
@@ -758,7 +796,7 @@ func (s *Service) ResizeShell(ctx context.Context, sessionID string, columns, ro
 	return s.platform.ResizeProcess(ctx, sessionID, execID, rows, columns)
 }
 
-func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeout time.Duration) (*REPLResult, error) {
+func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeout time.Duration, userID string) (*REPLResult, error) {
 	if sessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
@@ -772,7 +810,8 @@ func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeou
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if err := s.ensureReady(ctx, sessionID, ""); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID)
+	if err := s.ensureReady(ctx, sessionID, "", session.UserID); err != nil {
 		return nil, err
 	}
 
@@ -801,7 +840,7 @@ func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeou
 // StreamExecPython executes Python code and streams output via the onChunk callback.
 // The callback is called with each chunk of stdout/stderr data as it becomes available.
 // The final call will have Done=true.
-func (s *Service) StreamExecPython(ctx context.Context, sessionID, code string, timeout time.Duration, onChunk func(OutputChunk)) error {
+func (s *Service) StreamExecPython(ctx context.Context, sessionID, code string, timeout time.Duration, userID string, onChunk func(OutputChunk)) error {
 	if sessionID == "" {
 		return errors.New("session_id is required")
 	}
@@ -815,7 +854,8 @@ func (s *Service) StreamExecPython(ctx context.Context, sessionID, code string, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if err := s.ensureReady(ctx, sessionID, ""); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID)
+	if err := s.ensureReady(ctx, sessionID, "", session.UserID); err != nil {
 		return err
 	}
 
@@ -1175,12 +1215,17 @@ func (s *Service) ensureShell(ctx context.Context, sessionID string) (*ProcessSt
 		s.mu.Unlock()
 	}
 
+	// Generate a unique ready token for this shell instance
+	readyToken := fmt.Sprintf("%s%s>>>", shellReadyPrefix, randomString(8))
+
 	// Inject the shell wrapper script that respawns bash on exit
+	// The ready token is embedded in the script so the bashrc prints it after init
 	wrapperPath := "/tmp/shell-wrapper.sh"
+	wrapperWithToken := fmt.Sprintf(shellWrapperScript, readyToken)
 	_, err := s.platform.Exec(ctx, platform.ExecRequest{
 		SessionID:     sessionID,
 		ContainerName: s.shellContainer,
-		Command:       []string{"/bin/sh", "-c", fmt.Sprintf("cat > %s << 'WRAPPER_EOF'\n%s\nWRAPPER_EOF\nchmod +x %s", wrapperPath, shellWrapperScript, wrapperPath)},
+		Command:       []string{"/bin/sh", "-c", fmt.Sprintf("cat > %s << 'WRAPPER_EOF'\n%s\nWRAPPER_EOF\nchmod +x %s", wrapperPath, wrapperWithToken, wrapperPath)},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to inject shell wrapper: %w", err)
@@ -1191,8 +1236,11 @@ func (s *Service) ensureShell(ctx context.Context, sessionID string) (*ProcessSt
 		ContainerName: s.shellContainer,
 		ExecID:        fmt.Sprintf("%s-shell", sessionID),
 		Command:       []string{wrapperPath},
-		Env:           []string{"PS1=", "PROMPT_COMMAND=", "TERM=xterm-256color"},
-		Terminal:      true,
+		// Only set shell-specific env vars here. PYTHONUSERBASE, PIP_USER, and PATH
+		// are set at container level by sandbox-agent and inherited automatically.
+		Env:      []string{"PS1=", "PROMPT_COMMAND=", "TERM=xterm-256color"},
+		Terminal: true,
+		UserID:   session.UserID,
 	})
 	if err != nil {
 		return nil, err
@@ -1204,9 +1252,11 @@ func (s *Service) ensureShell(ctx context.Context, sessionID string) (*ProcessSt
 		LastUsedAt: proc.StartedAt,
 	}
 
-	if err := s.initShell(ctx, sessionID, proc.ExecID); err != nil {
+	// Wait for the bashrc to complete initialization and print the ready token.
+	// This guarantees stty -echo has run before we send any commands.
+	if _, err := s.readUntilToken(ctx, sessionID, proc.ExecID, readyToken); err != nil {
 		_ = s.platform.KillProcess(ctx, sessionID, proc.ExecID)
-		return nil, err
+		return nil, fmt.Errorf("shell init failed: %w", err)
 	}
 
 	s.mu.Lock()
@@ -1248,7 +1298,10 @@ func (s *Service) ensurePythonREPL(ctx context.Context, sessionID string) (*Proc
 		ContainerName: s.mainContainer,
 		ExecID:        fmt.Sprintf("%s-python", sessionID),
 		Command:       []string{"/usr/local/bin/python3", wrapperPath},
-		Terminal:      false,
+		// PYTHONUSERBASE and PIP_USER are set at container level by sandbox-agent
+		Env:      nil,
+		Terminal: false,
+		UserID:   session.UserID,
 	})
 	if err != nil {
 		return nil, err
@@ -1370,18 +1423,9 @@ func (s *Service) readUntilDone(ctx context.Context, sessionID, execID string) (
 	}
 }
 
-func (s *Service) initShell(ctx context.Context, sessionID, execID string) error {
-	token := fmt.Sprintf("<<<READY_%s>>>", randomString(8))
-	setup := fmt.Sprintf(shellInitScript, token)
-	if err := s.platform.WriteToProcess(ctx, sessionID, execID, []byte(setup)); err != nil {
-		return err
-	}
-	_, err := s.readUntilToken(ctx, sessionID, execID, token)
-	return err
-}
-
 func (s *Service) drainProcessOutput(ctx context.Context, sessionID, execID string, max time.Duration) {
 	deadline := time.Now().Add(max)
+	emptyReads := 0
 	for time.Now().Before(deadline) {
 		stdout, err := s.platform.ReadStdout(ctx, sessionID, execID)
 		if err != nil {
@@ -1389,7 +1433,13 @@ func (s *Service) drainProcessOutput(ctx context.Context, sessionID, execID stri
 		}
 		// For shell (TTY), all output is on stdout, so we only need to drain that
 		if len(stdout) == 0 {
-			return
+			emptyReads++
+			// Require multiple consecutive empty reads to ensure output is fully drained
+			if emptyReads >= 3 {
+				return
+			}
+		} else {
+			emptyReads = 0
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1460,14 +1510,20 @@ func normalizeNewlines(value string) string {
 	return value
 }
 
+// shellReadyMarkerRegex matches shell ready markers that may leak into output when the shell restarts
+// (e.g., after user runs 'exit'). The marker format is <<<SHELL_READY_xxxxxxxx>>> where x is a hex character.
+var shellReadyMarkerRegex = regexp.MustCompile(`<<<SHELL_READY_[a-f0-9]{8}>>>\n?`)
+
 func normalizeShellOutput(value string) string {
 	value = normalizeNewlines(value)
 	value = strings.ReplaceAll(value, "\u001b[?2004h", "")
 	value = strings.ReplaceAll(value, "\u001b[?2004l", "")
+	// Remove any shell ready markers that leak through (e.g., after shell restart)
+	value = shellReadyMarkerRegex.ReplaceAllString(value, "")
 	return value
 }
 
-func (s *Service) ensureReady(ctx context.Context, sessionID string, image string) error {
+func (s *Service) ensureReady(ctx context.Context, sessionID, image, userID string) error {
 	sandbox, err := s.platform.GetSandbox(ctx, sessionID)
 	if err != nil {
 		if !errors.Is(err, platform.ErrNotFound) {
@@ -1496,11 +1552,13 @@ func (s *Service) ensureReady(ctx context.Context, sessionID string, image strin
 			}
 		}
 
+		slog.Info("creating sandbox", "session_id", sessionID, "user_id", userID)
 		_, err := s.platform.CreateSandbox(ctx, platform.CreateSandboxRequest{
 			SessionID:   sessionID,
 			Image:       image,
 			Command:     append([]string{}, s.defaultCommand...),
 			DownloadURL: downloadURL,
+			UserID:      userID,
 		})
 		if err != nil && !errors.Is(err, platform.ErrAlreadyExists) {
 			return err
@@ -1576,7 +1634,7 @@ func shellQuote(s string) string {
 }
 
 // StartJob starts a background job that inherits the shell's environment.
-func (s *Service) StartJob(ctx context.Context, sessionID, command, name string) (*JobState, error) {
+func (s *Service) StartJob(ctx context.Context, sessionID, command, name, userID string) (*JobState, error) {
 	if sessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
@@ -1589,7 +1647,7 @@ func (s *Service) StartJob(ctx context.Context, sessionID, command, name string)
 		return nil, fmt.Errorf("failed to ensure shell: %w", err)
 	}
 
-	session := s.getSession(sessionID)
+	session := s.getSessionWithUserID(sessionID, userID)
 	jobID := randomString(12)
 	now := time.Now().UTC()
 
@@ -1605,7 +1663,7 @@ func (s *Service) StartJob(ctx context.Context, sessionID, command, name string)
 		jobID,
 	)
 
-	result, err := s.ExecShell(ctx, sessionID, spawnCmd, 10*time.Second)
+	result, err := s.ExecShell(ctx, sessionID, spawnCmd, 10*time.Second, session.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to spawn job: %w", err)
 	}

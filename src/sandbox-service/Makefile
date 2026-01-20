@@ -1,8 +1,10 @@
-REGISTRY ?= gcr.io/cohere-artifacts
+#REGISTRY ?= gcr.io/cohere-artifacts
+REGISTRY ?= us-docker.pkg.dev/cohere-artifacts/replicated/cohere
 TAG ?= latest
 PUSH ?= false
 DOCKER_BUILDKIT ?= 1
-REMOTE ?= aaron@192.168.1.105:build/
+#REMOTE ?= aaron@192.168.1.105:build/
+REMOTE ?= aaron-builder:build/
 PROTOC ?= protoc
 REPO_ROOT := $(shell cd ../.. && pwd)
 REMOTE_HOST := $(shell printf '%s' "$(REMOTE)" | sed -E 's/:.*$$//')
@@ -22,11 +24,11 @@ test:
 
 docker-build:
 	DOCKER_BUILDKIT=$(DOCKER_BUILDKIT) docker build --platform linux/amd64 \
-		-t $(REGISTRY)/sandbox-service:$(TAG) \
+		-t $(REGISTRY)/sandbox/service:$(TAG) \
 		-f ../../tools/packaging/sandbox-service/Dockerfile \
 		../../
 	@if [ "$(PUSH)" = "true" ] || [ "$(PUSH)" = "1" ]; then \
-		docker push $(REGISTRY)/sandbox-service:$(TAG); \
+		docker push $(REGISTRY)/sandbox/service:$(TAG); \
 	fi
 
 # For building on remote Linux machine (from macOS)

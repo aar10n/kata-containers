@@ -39,7 +39,6 @@ func (s *StorageServer) GetUploadURL(ctx context.Context, req *pb.GetUploadURLRe
 		return nil, status.Errorf(codes.Internal, "failed to generate upload URL: %v", err)
 	}
 
-	slog.Info("generated upload URL", "session_id", req.SessionId, "file_name", req.FileName, "key", key)
 	return &pb.GetUploadURLResponse{
 		Url:              url,
 		Key:              key,
@@ -73,7 +72,6 @@ func (s *StorageServer) GetDownloadURL(ctx context.Context, req *pb.GetDownloadU
 		return nil, status.Errorf(codes.Internal, "failed to generate download URL: %v", err)
 	}
 
-	slog.Info("generated download URL", "session_id", req.SessionId, "file_name", req.FileName, "key", key)
 	return &pb.GetDownloadURLResponse{
 		Url:              url,
 		Key:              key,

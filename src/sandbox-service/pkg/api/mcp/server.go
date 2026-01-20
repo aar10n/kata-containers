@@ -196,7 +196,7 @@ func (s *Server) handleShell(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	timeoutMs := int(req.GetFloat("timeout_ms", 0))
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
-	result, err := s.svc.ExecShell(ctx, sessionID, command, timeout)
+	result, err := s.svc.ExecShell(ctx, sessionID, command, timeout, "")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -224,7 +224,7 @@ func (s *Server) handlePython(ctx context.Context, req mcp.CallToolRequest) (*mc
 	timeoutMs := int(req.GetFloat("timeout_ms", 0))
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
-	result, err := s.svc.ExecPython(ctx, sessionID, code, timeout)
+	result, err := s.svc.ExecPython(ctx, sessionID, code, timeout, "")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -286,7 +286,7 @@ func (s *Server) handleJobStart(ctx context.Context, req mcp.CallToolRequest) (*
 
 	name := req.GetString("name", "")
 
-	job, err := s.svc.StartJob(ctx, sessionID, command, name)
+	job, err := s.svc.StartJob(ctx, sessionID, command, name, "")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

@@ -26,6 +26,7 @@ import (
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func main() {
@@ -118,6 +119,8 @@ func main() {
 		Namespace:        cfg.Sandbox.Namespace,
 		RuntimeClassName: cfg.Sandbox.RuntimeClassName,
 		NodeSelector:     cfg.Sandbox.NodeSelector,
+		Tolerations:      convertTolerations(cfg.Sandbox.Tolerations),
+		ImagePullSecrets: convertImagePullSecrets(cfg.Sandbox.ImagePullSecrets),
 		PodMode:          cfg.IsPodMode(),
 	}, watcher.Store())
 
@@ -150,6 +153,20 @@ func main() {
 		StorageAddr:      cfg.Storage.Addr,
 		StorageTimeout:   cfg.Storage.Timeout,
 		StorageInitImage: cfg.Storage.InitImage,
+		// FUSE storage config
+		FuseEnabled:         cfg.FuseStorage.Enabled,
+		FuseImage:                     cfg.FuseStorage.Image,
+		FuseEndpoint:                  cfg.FuseStorage.Endpoint,
+		FuseRegion:                    cfg.FuseStorage.Region,
+		FuseAssetsBucket:              cfg.FuseStorage.AssetsBucket,
+		FuseAccessKeyID:               cfg.FuseStorage.AccessKeyID,
+		FuseSecretAccessKey:           cfg.FuseStorage.SecretAccessKey,
+		FuseSecretAccessKeySecretName: cfg.FuseStorage.SecretAccessKeySecretName,
+		FuseSecretAccessKeySecretKey:  cfg.FuseStorage.SecretAccessKeySecretKey,
+		// Activity database config (SQLite for last-used tracking)
+		ActivityDBEnabled:  cfg.ActivityDB.Enabled,
+		ActivityDBPath:     cfg.ActivityDB.Path,
+		ActivityDBFilename: cfg.ActivityDB.Filename,
 	}, watcher.Store(), manager, be, hfs)
 	if err != nil {
 		log.Fatalf("create service: %v", err)
@@ -238,4 +255,33 @@ func grpcEndpoint(grpcAddr string) string {
 		host = "127.0.0.1"
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// convertTolerations converts config tolerations to Kubernetes tolerations.
+func convertTolerations(cfgTolerations []config.Toleration) []corev1.Toleration {
+	if len(cfgTolerations) == 0 {
+		return nil
+	}
+	tolerations := make([]corev1.Toleration, len(cfgTolerations))
+	for i, t := range cfgTolerations {
+		tolerations[i] = corev1.Toleration{
+			Key:               t.Key,
+			Operator:          corev1.TolerationOperator(t.Operator),
+			Value:             t.Value,
+			Effect:            corev1.TaintEffect(t.Effect),
+			TolerationSeconds: t.TolerationSeconds,
+		}
+	}
+	return tolerations
+}
+
+func convertImagePullSecrets(cfgSecrets []config.ImagePullSecret) []corev1.LocalObjectReference {
+	if len(cfgSecrets) == 0 {
+		return nil
+	}
+	secrets := make([]corev1.LocalObjectReference, len(cfgSecrets))
+	for i, s := range cfgSecrets {
+		secrets[i] = corev1.LocalObjectReference{Name: s.Name}
+	}
+	return secrets
 }

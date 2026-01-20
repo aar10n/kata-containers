@@ -339,6 +339,32 @@ sandboxAgent:
   hostfs:
     kubeletRoot: "/var/lib/kubelet"
 
+  # FUSE sidecar configuration for S3-backed storage (pod mode only).
+  # When enabled, sandbox pods get a sidecar container that mounts S3 buckets
+  # using mountpoint-s3. This replaces emptyDir-based storage and the snapshot system.
+  fuseStorage:
+    enabled: false
+    image: "gcr.io/cohere-artifacts/sandbox/sidecar:latest"
+    # S3-compatible endpoint (e.g., s3proxy)
+    endpoint: "http://s3proxy.kata-system:80"
+    region: "us-east-1"
+    # Bucket for user drives (/mydrive mount)
+    assetsBucket: "north-assets-bucket"
+    # Bucket for session data (/data mount)
+    snapshotsBucket: "snapshots-bucket"
+    # S3 credentials - consider using secretRef for production
+    accessKeyId: ""
+    secretAccessKey: ""
+
+  # Activity database configuration (SQLite for last-used tracking).
+  # Stores sandbox activity timestamps locally to avoid K8s API rate limiting.
+  # The database lives on the host node at the specified path and survives agent restarts.
+  activityDB:
+    enabled: true
+    # Path on host node where the SQLite database is stored (must be writable)
+    path: "/var/lib/sandbox-agent"
+    filename: "activity.db"
+
 sandboxService:
   enabled: true
   replicas: 1

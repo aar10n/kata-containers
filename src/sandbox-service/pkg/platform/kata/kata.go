@@ -188,23 +188,52 @@ func (p *Platform) updateSessionNode(sessionID, nodeAddr string) {
 	p.mu.Unlock()
 }
 
-// handleRedirect checks if the error is a redirect and updates routing.
-// Returns the new client to use and true if redirect was handled.
+// clearSessionNode removes a session from the node cache.
+// This should be called when a connection error occurs to force re-discovery.
+func (p *Platform) clearSessionNode(sessionID string) {
+	p.mu.Lock()
+	delete(p.sessionNodes, sessionID)
+	p.mu.Unlock()
+}
+
+// handleRedirect checks if the error is a redirect or connection error and updates routing.
+// For redirects: updates the session-to-node mapping and returns a client for the new node.
+// For connection errors: clears the stale cache and returns a client for the default address.
+// Returns the new client to use and true if the error was handled (caller should retry).
 func (p *Platform) handleRedirect(sessionID string, err error) (pb.SandboxAgentClient, bool) {
+	// First check for explicit redirect
 	host, port, ok := redirectTarget(err)
-	if !ok {
-		return nil, false
+	if ok {
+		// Build the new address
+		newAddr := host
+		if port > 0 {
+			newAddr = net.JoinHostPort(host, strconv.Itoa(port))
+		}
+
+		slog.Debug("handling redirect", "session_id", sessionID, "new_addr", newAddr)
+		p.updateSessionNode(sessionID, newAddr)
+		return p.getClientForNode(newAddr), true
 	}
 
-	// Build the new address
-	newAddr := host
-	if port > 0 {
-		newAddr = net.JoinHostPort(host, strconv.Itoa(port))
+	// Check for connection errors (e.g., node IP changed, pod restarted)
+	if isConnectionError(err) {
+		// Check if we had a cached node for this session
+		p.mu.RLock()
+		cachedAddr := p.sessionNodes[sessionID]
+		p.mu.RUnlock()
+
+		if cachedAddr != "" && cachedAddr != p.defaultAddr {
+			slog.Debug("clearing stale node cache due to connection error",
+				"session_id", sessionID,
+				"stale_addr", cachedAddr,
+				"error", err)
+			p.clearSessionNode(sessionID)
+			// Return default client for retry - this will re-discover the correct node
+			return p.getClientForNode(p.defaultAddr), true
+		}
 	}
 
-	slog.Debug("handling redirect", "session_id", sessionID, "new_addr", newAddr)
-	p.updateSessionNode(sessionID, newAddr)
-	return p.getClientForNode(newAddr), true
+	return nil, false
 }
 
 // client returns the default sandbox-agent client.
@@ -227,6 +256,7 @@ func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandbox
 		Env:         req.Env,
 		Labels:      req.Labels,
 		DownloadUrl: req.DownloadURL,
+		UserId:      req.UserID,
 	}
 
 	resp, err := client.CreateSandbox(ctx, pbReq)
@@ -362,6 +392,7 @@ func (p *Platform) Exec(ctx context.Context, req platform.ExecRequest) (*platfor
 		Env:       mapToEnv(req.Env),
 		Cwd:       req.WorkingDir,
 		TimeoutMs: timeoutMs,
+		UserId:    req.UserID,
 	}
 
 	resp, err := client.Exec(ctx, pbReq)
@@ -397,6 +428,7 @@ func (p *Platform) StartProcess(ctx context.Context, req platform.StartProcessRe
 		Command:   req.Command,
 		Env:       req.Env,
 		Tty:       req.Terminal,
+		UserId:    req.UserID,
 	}
 
 	resp, err := client.StartProcess(ctx, pbReq)
@@ -854,4 +886,14 @@ func isTimeout(err error) bool {
 		return true
 	}
 	return false
+}
+
+// isConnectionError returns true if the error indicates a connection failure
+// (e.g., the target node is unavailable, connection refused, etc.)
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	code := status.Code(err)
+	return code == codes.Unavailable || code == codes.Internal
 }

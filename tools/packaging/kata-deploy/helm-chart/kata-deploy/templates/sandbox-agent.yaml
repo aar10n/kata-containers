@@ -69,6 +69,31 @@ data:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
+      {{- with .Values.sandboxAgent.sandboxTolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if .Values.sandboxAgent.fuseStorage.enabled }}
+    fuse_storage:
+      enabled: true
+      image: {{ .Values.sandboxAgent.fuseStorage.image | quote }}
+      endpoint: {{ .Values.sandboxAgent.fuseStorage.endpoint | quote }}
+      region: {{ .Values.sandboxAgent.fuseStorage.region | quote }}
+      assets_bucket: {{ .Values.sandboxAgent.fuseStorage.assetsBucket | quote }}
+      access_key_id: {{ .Values.sandboxAgent.fuseStorage.accessKeyId | quote }}
+      {{- if .Values.sandboxAgent.fuseStorage.secretAccessKeySecretRef }}
+      secret_access_key_secret_name: {{ .Values.sandboxAgent.fuseStorage.secretAccessKeySecretRef.name | quote }}
+      secret_access_key_secret_key: {{ .Values.sandboxAgent.fuseStorage.secretAccessKeySecretRef.key | default "secretAccessKey" | quote }}
+      {{- else }}
+      secret_access_key: {{ .Values.sandboxAgent.fuseStorage.secretAccessKey | quote }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.sandboxAgent.activityDB.enabled }}
+    activity_db:
+      enabled: true
+      path: {{ .Values.sandboxAgent.activityDB.path | quote }}
+      filename: {{ .Values.sandboxAgent.activityDB.filename | quote }}
+    {{- end }}
 ---
 
 apiVersion: v1
@@ -157,7 +182,7 @@ spec:
         app.kubernetes.io/name: sandbox-agent
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%s|%v|%s|%s|%s|%v|%s|%s" .Values.sandboxAgent.mode .Values.sandboxAgent.sandboxNamespace .Values.sandboxAgent.runtimeClass .Values.sandboxAgent.grpcDialTimeout .Values.sandboxAgent.resyncInterval .Values.sandboxAgent.agentTimeout .Values.sandboxAgent.execTimeout .Values.sandboxAgent.maxOutputBytes .Values.sandboxAgent.sandboxNodeSelector .Values.sandboxAgent.cri.socket .Values.sandboxAgent.cri.timeout .Values.sandboxAgent.hostfs.kubeletRoot .Values.sandboxAgent.nodeLabel.enabled .Values.sandboxAgent.nodeLabel.key .Values.sandboxAgent.nodeLabel.value | sha256sum }}
+        checksum/config: {{ printf "%s|%s|%s|%s|%s|%s|%s|%s|%v|%s|%s|%s|%v|%s|%s|%v|%s|%s|%s|%s|%v|%s|%s" .Values.sandboxAgent.mode .Values.sandboxAgent.sandboxNamespace .Values.sandboxAgent.runtimeClass .Values.sandboxAgent.grpcDialTimeout .Values.sandboxAgent.resyncInterval .Values.sandboxAgent.agentTimeout .Values.sandboxAgent.execTimeout .Values.sandboxAgent.maxOutputBytes .Values.sandboxAgent.sandboxNodeSelector .Values.sandboxAgent.cri.socket .Values.sandboxAgent.cri.timeout .Values.sandboxAgent.hostfs.kubeletRoot .Values.sandboxAgent.nodeLabel.enabled .Values.sandboxAgent.nodeLabel.key .Values.sandboxAgent.nodeLabel.value .Values.sandboxAgent.fuseStorage.enabled .Values.sandboxAgent.fuseStorage.image .Values.sandboxAgent.fuseStorage.endpoint .Values.sandboxAgent.fuseStorage.assetsBucket .Values.sandboxAgent.fuseStorage.region .Values.sandboxAgent.activityDB.enabled .Values.sandboxAgent.activityDB.path .Values.sandboxAgent.activityDB.filename | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       {{- if eq (.Values.sandboxAgent.mode | default "kata") "pod" }}
@@ -206,6 +231,10 @@ spec:
             - name: config
               mountPath: /etc/sandbox-agent
               readOnly: true
+            {{- if .Values.sandboxAgent.activityDB.enabled }}
+            - name: activity-db
+              mountPath: {{ .Values.sandboxAgent.activityDB.path }}
+            {{- end }}
             {{- if eq (.Values.sandboxAgent.mode | default "kata") "kata" }}
             # Kata mode: access to shim management sockets
             - name: shim-sockets
@@ -233,6 +262,12 @@ spec:
         - name: config
           configMap:
             name: {{ $name }}-config
+        {{- if .Values.sandboxAgent.activityDB.enabled }}
+        - name: activity-db
+          hostPath:
+            path: {{ .Values.sandboxAgent.activityDB.path }}
+            type: DirectoryOrCreate
+        {{- end }}
         {{- if eq (.Values.sandboxAgent.mode | default "kata") "kata" }}
         # Kata mode volumes
         - name: shim-sockets

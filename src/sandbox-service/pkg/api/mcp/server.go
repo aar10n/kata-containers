@@ -196,7 +196,7 @@ func (s *Server) handleShell(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	timeoutMs := int(req.GetFloat("timeout_ms", 0))
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
-	result, err := s.svc.ExecShell(ctx, sessionID, command, timeout, "")
+	result, err := s.svc.ExecShell(ctx, sessionID, command, timeout, "", nil)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -224,7 +224,7 @@ func (s *Server) handlePython(ctx context.Context, req mcp.CallToolRequest) (*mc
 	timeoutMs := int(req.GetFloat("timeout_ms", 0))
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
-	result, err := s.svc.ExecPython(ctx, sessionID, code, timeout, "")
+	result, err := s.svc.ExecPython(ctx, sessionID, code, timeout, "", nil)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/capacity"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/service"
 )
@@ -24,16 +25,19 @@ type ExecRequest struct {
 	WorkingDir string            `json:"working_dir,omitempty"`
 	TimeoutMs  int64             `json:"timeout_ms,omitempty"`
 	Image      string            `json:"image,omitempty"`
+	Features   map[string]string `json:"features,omitempty"`
 }
 
 type ShellRequest struct {
-	Command   string `json:"command"`
-	TimeoutMs int64  `json:"timeout_ms,omitempty"`
+	Command   string            `json:"command"`
+	TimeoutMs int64             `json:"timeout_ms,omitempty"`
+	Features  map[string]string `json:"features,omitempty"`
 }
 
 type PythonRequest struct {
-	Code      string `json:"code"`
-	TimeoutMs int64  `json:"timeout_ms,omitempty"`
+	Code      string            `json:"code"`
+	TimeoutMs int64             `json:"timeout_ms,omitempty"`
+	Features  map[string]string `json:"features,omitempty"`
 }
 
 type ExecResponse struct {
@@ -95,6 +99,22 @@ type HealthResponse struct {
 	Status string `json:"status"`
 }
 
+type CapacityResponse struct {
+	TotalMaxSandboxes     int32          `json:"total_max_sandboxes"`
+	TotalCurrentSandboxes int32          `json:"total_current_sandboxes"`
+	AvailableNodes        int32          `json:"available_nodes"`
+	Nodes                 []NodeCapacity `json:"nodes"`
+}
+
+type NodeCapacity struct {
+	NodeName         string `json:"node_name"`
+	MaxSandboxes     int32  `json:"max_sandboxes"`
+	CurrentSandboxes int32  `json:"current_sandboxes"`
+	Available        int32  `json:"available"`
+	LastUpdated      string `json:"last_updated"`
+	Stale            bool   `json:"stale"`
+}
+
 type ProcessStatusResponse struct {
 	Alive      bool   `json:"alive"`
 	ExecID     string `json:"exec_id"`
@@ -153,6 +173,7 @@ func NewServer(svc *service.Service) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/v1/capacity", s.handleCapacity)
 	mux.HandleFunc("/v1/sessions", s.handleSessions)
 	mux.HandleFunc("/v1/", s.handleSession)
 	return mux
@@ -164,6 +185,36 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+}
+
+func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	totalMax, totalCurrent, availableNodes := s.svc.GetCapacitySummary()
+	nodes := s.svc.GetCapacityNodes()
+
+	resp := CapacityResponse{
+		TotalMaxSandboxes:     totalMax,
+		TotalCurrentSandboxes: totalCurrent,
+		AvailableNodes:        availableNodes,
+		Nodes:                 make([]NodeCapacity, 0, len(nodes)),
+	}
+
+	for _, n := range nodes {
+		resp.Nodes = append(resp.Nodes, NodeCapacity{
+			NodeName:         n.Name,
+			MaxSandboxes:     n.MaxSandboxes,
+			CurrentSandboxes: n.CurrentSandboxes,
+			Available:        n.Available(),
+			LastUpdated:      n.LastUpdated.UTC().Format(time.RFC3339),
+			Stale:            n.IsStale(capacity.DefaultStaleThreshold),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -351,6 +402,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request, sessionID st
 		WorkingDir: req.WorkingDir,
 		Image:      req.Image,
 		UserID:     getUserID(r),
+		Features:   req.Features,
 	}
 	if req.TimeoutMs > 0 {
 		input.Timeout = time.Duration(req.TimeoutMs) * time.Millisecond
@@ -448,7 +500,7 @@ func (s *Server) handleShellExec(w http.ResponseWriter, r *http.Request, session
 	}
 
 	timeout := time.Duration(req.TimeoutMs) * time.Millisecond
-	result, err := s.svc.ExecShell(r.Context(), sessionID, req.Command, timeout, getUserID(r))
+	result, err := s.svc.ExecShell(r.Context(), sessionID, req.Command, timeout, getUserID(r), req.Features)
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -521,7 +573,7 @@ func (s *Server) handlePythonExec(w http.ResponseWriter, r *http.Request, sessio
 	}
 
 	timeout := time.Duration(req.TimeoutMs) * time.Millisecond
-	result, err := s.svc.ExecPython(r.Context(), sessionID, req.Code, timeout, getUserID(r))
+	result, err := s.svc.ExecPython(r.Context(), sessionID, req.Code, timeout, getUserID(r), req.Features)
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -587,7 +639,8 @@ func (s *Server) handleShellStream(w http.ResponseWriter, r *http.Request, sessi
 		}
 	}
 
-	s.streamExec(w, r, sessionID, command, "", timeout, true)
+	features := parseQueryFeatures(r)
+	s.streamExec(w, r, sessionID, command, "", timeout, true, features)
 }
 
 func (s *Server) handlePythonStream(w http.ResponseWriter, r *http.Request, sessionID string) {
@@ -604,10 +657,11 @@ func (s *Server) handlePythonStream(w http.ResponseWriter, r *http.Request, sess
 		}
 	}
 
-	s.streamExec(w, r, sessionID, "", code, timeout, false)
+	features := parseQueryFeatures(r)
+	s.streamExec(w, r, sessionID, "", code, timeout, false, features)
 }
 
-func (s *Server) streamExec(w http.ResponseWriter, r *http.Request, sessionID, command, code string, timeout time.Duration, isShell bool) {
+func (s *Server) streamExec(w http.ResponseWriter, r *http.Request, sessionID, command, code string, timeout time.Duration, isShell bool, features map[string]string) {
 	// Check if client supports SSE
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -644,9 +698,9 @@ func (s *Server) streamExec(w http.ResponseWriter, r *http.Request, sessionID, c
 	var err error
 	userID := getUserID(r)
 	if isShell {
-		err = s.svc.StreamExecShell(ctx, sessionID, command, timeout, userID, sendChunk)
+		err = s.svc.StreamExecShell(ctx, sessionID, command, timeout, userID, features, sendChunk)
 	} else {
-		err = s.svc.StreamExecPython(ctx, sessionID, code, timeout, userID, sendChunk)
+		err = s.svc.StreamExecPython(ctx, sessionID, code, timeout, userID, features, sendChunk)
 	}
 
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -795,6 +849,12 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		code = http.StatusConflict
 	case errors.Is(err, platform.ErrNotReady):
 		code = http.StatusServiceUnavailable
+	case errors.Is(err, platform.ErrCapacityExceeded):
+		code = http.StatusServiceUnavailable
+	case errors.Is(err, platform.ErrSandboxPending):
+		code = http.StatusPreconditionFailed
+	case errors.Is(err, platform.ErrSandboxFailed):
+		code = http.StatusPreconditionFailed
 	case errors.Is(err, context.DeadlineExceeded):
 		code = http.StatusGatewayTimeout
 	case errors.Is(err, context.Canceled):
@@ -827,4 +887,20 @@ func getUserID(r *http.Request) string {
 		return userID
 	}
 	return r.URL.Query().Get("user_id")
+}
+
+// parseQueryFeatures extracts features from query parameters with "feature_" prefix.
+// For example, ?feature_support_bundles=true becomes {"support_bundles": "true"}.
+func parseQueryFeatures(r *http.Request) map[string]string {
+	features := make(map[string]string)
+	for key, values := range r.URL.Query() {
+		if strings.HasPrefix(key, "feature_") && len(values) > 0 {
+			featureKey := strings.TrimPrefix(key, "feature_")
+			features[featureKey] = values[0]
+		}
+	}
+	if len(features) == 0 {
+		return nil
+	}
+	return features
 }

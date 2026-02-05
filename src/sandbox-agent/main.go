@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -16,10 +18,12 @@ import (
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/backend"
 	cribackend "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/backend/cri"
 	katabackend "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/backend/kata"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/capacity"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/config"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/cri"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/hostfs"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/prefetch"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/service"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/shim_mgmt"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -27,6 +31,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/client-go/kubernetes"
 )
 
 func main() {
@@ -65,7 +71,19 @@ func main() {
 		log.Printf("labeled node %s with %s=%s", nodeName, cfg.NodeLabel.Key, cfg.NodeLabel.Value)
 	}
 
-	watcher := k8s.NewWatcher(clientset, cfg.Kubernetes.ResyncInterval)
+	// Prefetch images in background if configured (don't block startup)
+	if cfg.Sandbox.PrefetchImages && cfg.Sandbox.DefaultImage != "" {
+		log.Printf("starting background image prefetch for: %s", cfg.Sandbox.DefaultImage)
+		go func() {
+			if err := prefetchImages(ctx, cfg, clientset); err != nil {
+				log.Printf("warning: image prefetch failed: %v", err)
+			} else {
+				log.Printf("image prefetch completed successfully")
+			}
+		}()
+	}
+
+	watcher := k8s.NewWatcher(clientset, cfg.Kubernetes.ResyncInterval, cfg.Sandbox.Namespace)
 	go func() {
 		if err := watcher.Start(ctx); err != nil {
 			log.Fatalf("failed to start k8s watchers: %v", err)
@@ -121,6 +139,7 @@ func main() {
 		NodeSelector:     cfg.Sandbox.NodeSelector,
 		Tolerations:      convertTolerations(cfg.Sandbox.Tolerations),
 		ImagePullSecrets: convertImagePullSecrets(cfg.Sandbox.ImagePullSecrets),
+		Resources:        convertResources(cfg.Sandbox.Resources),
 		PodMode:          cfg.IsPodMode(),
 	}, watcher.Store())
 
@@ -154,7 +173,7 @@ func main() {
 		StorageTimeout:   cfg.Storage.Timeout,
 		StorageInitImage: cfg.Storage.InitImage,
 		// FUSE storage config
-		FuseEnabled:         cfg.FuseStorage.Enabled,
+		FuseEnabled:                   cfg.FuseStorage.Enabled,
 		FuseImage:                     cfg.FuseStorage.Image,
 		FuseEndpoint:                  cfg.FuseStorage.Endpoint,
 		FuseRegion:                    cfg.FuseStorage.Region,
@@ -163,6 +182,9 @@ func main() {
 		FuseSecretAccessKey:           cfg.FuseStorage.SecretAccessKey,
 		FuseSecretAccessKeySecretName: cfg.FuseStorage.SecretAccessKeySecretName,
 		FuseSecretAccessKeySecretKey:  cfg.FuseStorage.SecretAccessKeySecretKey,
+		FuseUID:                       cfg.FuseStorage.UID,
+		FuseGID:                       cfg.FuseStorage.GID,
+		FuseSidecarResources:          convertResources(cfg.FuseStorage.SidecarResources),
 		// Activity database config (SQLite for last-used tracking)
 		ActivityDBEnabled:  cfg.ActivityDB.Enabled,
 		ActivityDBPath:     cfg.ActivityDB.Path,
@@ -170,6 +192,26 @@ func main() {
 	}, watcher.Store(), manager, be, hfs)
 	if err != nil {
 		log.Fatalf("create service: %v", err)
+	}
+
+	// Initialize capacity manager (local node only - service aggregates cluster-wide)
+	capCfg := capacity.Config{
+		NodeName:        nodeName,
+		RefreshInterval: cfg.Sandbox.CapacityRefreshInterval,
+		SandboxCPU:      cfg.Sandbox.Resources.Requests.CPU,
+		SandboxMemory:   cfg.Sandbox.Resources.Requests.Memory,
+	}
+	// Include sidecar resources in capacity calculation when FUSE storage is enabled
+	if cfg.FuseStorage.Enabled {
+		capCfg.SidecarCPU = cfg.FuseStorage.SidecarResources.Requests.CPU
+		capCfg.SidecarMemory = cfg.FuseStorage.SidecarResources.Requests.Memory
+	}
+	capMgr, err := capacity.New(capCfg, clientset, &storeCounter{store: watcher.Store(), nodeName: nodeName})
+	if err != nil {
+		slog.Warn("failed to initialize capacity manager", "error", err)
+	} else {
+		svc.SetCapacityManager(capMgr)
+		slog.Info("capacity manager initialized", "node", nodeName)
 	}
 
 	grpcServer := grpc.NewServer()
@@ -257,6 +299,19 @@ func grpcEndpoint(grpcAddr string) string {
 	return net.JoinHostPort(host, port)
 }
 
+// parseListenPort extracts the port number from a listen address like ":8080" or "0.0.0.0:8080".
+func parseListenPort(listenAddr string) int {
+	_, portStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return 8080 // default
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 8080
+	}
+	return port
+}
+
 // convertTolerations converts config tolerations to Kubernetes tolerations.
 func convertTolerations(cfgTolerations []config.Toleration) []corev1.Toleration {
 	if len(cfgTolerations) == 0 {
@@ -284,4 +339,72 @@ func convertImagePullSecrets(cfgSecrets []config.ImagePullSecret) []corev1.Local
 		secrets[i] = corev1.LocalObjectReference{Name: s.Name}
 	}
 	return secrets
+}
+
+func convertResources(cfg config.ResourcesConfig) corev1.ResourceRequirements {
+	reqs := corev1.ResourceRequirements{}
+
+	// Convert requests
+	if cfg.Requests.CPU != "" || cfg.Requests.Memory != "" {
+		reqs.Requests = corev1.ResourceList{}
+		if cfg.Requests.CPU != "" {
+			reqs.Requests[corev1.ResourceCPU] = resource.MustParse(cfg.Requests.CPU)
+		}
+		if cfg.Requests.Memory != "" {
+			reqs.Requests[corev1.ResourceMemory] = resource.MustParse(cfg.Requests.Memory)
+		}
+	}
+
+	// Convert limits
+	if cfg.Limits.CPU != "" || cfg.Limits.Memory != "" {
+		reqs.Limits = corev1.ResourceList{}
+		if cfg.Limits.CPU != "" {
+			reqs.Limits[corev1.ResourceCPU] = resource.MustParse(cfg.Limits.CPU)
+		}
+		if cfg.Limits.Memory != "" {
+			reqs.Limits[corev1.ResourceMemory] = resource.MustParse(cfg.Limits.Memory)
+		}
+	}
+
+	return reqs
+}
+
+// prefetchImages pulls configured images to the node's container runtime.
+func prefetchImages(ctx context.Context, cfg config.Config, k8sClient kubernetes.Interface) error {
+	log.Printf("prefetching default image: %s", cfg.Sandbox.DefaultImage)
+
+	// Create a CRI client for image pulling
+	criClient, err := cri.New(cri.Config{
+		Socket:  cfg.CRI.Socket,
+		Timeout: cfg.CRI.Timeout,
+	})
+	if err != nil {
+		return err
+	}
+	defer criClient.Close()
+
+	// Extract secret names from config
+	secretNames := make([]string, len(cfg.Sandbox.ImagePullSecrets))
+	for i, s := range cfg.Sandbox.ImagePullSecrets {
+		secretNames[i] = s.Name
+	}
+
+	prefetcher := prefetch.New(criClient, k8sClient, prefetch.Config{
+		Images:           []string{cfg.Sandbox.DefaultImage},
+		Namespace:        cfg.Sandbox.Namespace,
+		ImagePullSecrets: secretNames,
+	})
+
+	return prefetcher.PrefetchAll(ctx)
+}
+
+// storeCounter implements capacity.SandboxCounter using the K8s store.
+type storeCounter struct {
+	store    *k8s.Store
+	nodeName string
+}
+
+func (c *storeCounter) CountSandboxesOnNode(nodeName string) int32 {
+	sandboxes := c.store.ListSandboxes(nodeName)
+	return int32(len(sandboxes))
 }

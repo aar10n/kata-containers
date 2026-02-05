@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // S3Config holds configuration for S3-compatible storage.
@@ -161,4 +162,131 @@ func (c *S3Client) DeleteFile(ctx context.Context, sessionID, fileName string) (
 // PresignExpiry returns the presign expiry duration in seconds.
 func (c *S3Client) PresignExpiry() int64 {
 	return int64(c.presignExpiry.Seconds())
+}
+
+// SandboxStatePrefix returns the S3 prefix for a sandbox's persistent state.
+func SandboxStatePrefix(sessionID string) string {
+	return fmt.Sprintf("sandboxes/%s/", sessionID)
+}
+
+// ListSandboxPrefixes enumerates all sandboxes/{sessionID}/ prefixes in S3.
+// Returns a map of sessionID to the most recent LastModified time for any object in that prefix.
+func (c *S3Client) ListSandboxPrefixes(ctx context.Context) (map[string]time.Time, error) {
+	result := make(map[string]time.Time)
+	prefix := "sandboxes/"
+	delimiter := "/"
+
+	paginator := s3.NewListObjectsV2Paginator(c.client, &s3.ListObjectsV2Input{
+		Bucket:    &c.bucket,
+		Prefix:    &prefix,
+		Delimiter: &delimiter,
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list sandbox prefixes: %w", err)
+		}
+
+		// CommonPrefixes contains the "directories" (sandboxes/{sessionID}/)
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix == nil {
+				continue
+			}
+			// Extract sessionID from "sandboxes/{sessionID}/"
+			prefixStr := *cp.Prefix
+			if len(prefixStr) > len("sandboxes/") && prefixStr[len(prefixStr)-1] == '/' {
+				sessionID := prefixStr[len("sandboxes/") : len(prefixStr)-1]
+				if sessionID != "" {
+					// Initialize with zero time; actual LastModified will be fetched separately
+					result[sessionID] = time.Time{}
+				}
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// GetSandboxStateLastModified returns the most recent LastModified time from any object
+// under the sandbox's prefix. Returns zero time if no objects exist.
+func (c *S3Client) GetSandboxStateLastModified(ctx context.Context, sessionID string) (time.Time, error) {
+	prefix := SandboxStatePrefix(sessionID)
+	var latestModified time.Time
+
+	paginator := s3.NewListObjectsV2Paginator(c.client, &s3.ListObjectsV2Input{
+		Bucket: &c.bucket,
+		Prefix: &prefix,
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("get sandbox state last modified: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			if obj.LastModified != nil && obj.LastModified.After(latestModified) {
+				latestModified = *obj.LastModified
+			}
+		}
+	}
+
+	return latestModified, nil
+}
+
+// DeleteSandboxState batch deletes all objects under the sandbox's prefix.
+// Returns the number of objects deleted.
+func (c *S3Client) DeleteSandboxState(ctx context.Context, sessionID string) (int, error) {
+	prefix := SandboxStatePrefix(sessionID)
+	deleted := 0
+
+	// List all objects under the prefix
+	paginator := s3.NewListObjectsV2Paginator(c.client, &s3.ListObjectsV2Input{
+		Bucket: &c.bucket,
+		Prefix: &prefix,
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return deleted, fmt.Errorf("list objects for deletion: %w", err)
+		}
+
+		if len(page.Contents) == 0 {
+			continue
+		}
+
+		// Delete objects in batches (S3 allows up to 1000 per request)
+		for i := 0; i < len(page.Contents); i += 1000 {
+			end := i + 1000
+			if end > len(page.Contents) {
+				end = len(page.Contents)
+			}
+			batch := page.Contents[i:end]
+
+			objects := make([]s3Types.ObjectIdentifier, len(batch))
+			for j, obj := range batch {
+				objects[j] = s3Types.ObjectIdentifier{Key: obj.Key}
+			}
+
+			_, err := c.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: &c.bucket,
+				Delete: &s3Types.Delete{
+					Objects: objects,
+					Quiet:   boolPtr(true),
+				},
+			})
+			if err != nil {
+				return deleted, fmt.Errorf("batch delete objects: %w", err)
+			}
+			deleted += len(batch)
+		}
+	}
+
+	return deleted, nil
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }

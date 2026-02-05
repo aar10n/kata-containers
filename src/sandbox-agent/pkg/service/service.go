@@ -15,10 +15,12 @@ import (
 
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/activitydb"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/backend"
+	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/capacity"
 	apierrors "github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/errors"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/hostfs"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/k8s"
 	"github.com/cohere-ai/kata-containers/src/sandbox-agent/pkg/storage"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // SnapshotFileName is the default name for sandbox snapshot files.
@@ -46,6 +48,9 @@ type Config struct {
 	FuseSecretAccessKey           string
 	FuseSecretAccessKeySecretName string
 	FuseSecretAccessKeySecretKey  string
+	FuseUID                       int
+	FuseGID                       int
+	FuseSidecarResources          corev1.ResourceRequirements
 
 	// Activity database configuration (SQLite for last-used tracking)
 	ActivityDBEnabled  bool
@@ -100,6 +105,10 @@ type Service interface {
 	// Mode info
 	Mode() string
 
+	// Capacity (local node only - service aggregates cluster-wide)
+	GetCapacity(ctx context.Context) *capacity.NodeCapacity
+	SetCapacityManager(cm *capacity.Manager)
+
 	// Cleanup
 	Close() error
 }
@@ -119,6 +128,9 @@ type CreateSandboxRequest struct {
 	// UserID is an optional user identifier. When set with FUSE storage enabled,
 	// enables the /mydrive mount backed by S3 at assets_bucket/my-drive/{user_id}/.
 	UserID string
+	// Features is a map of optional feature flags. Known features:
+	//   - "support_bundles": "true" - enables /mnt/support_bundles/ S3 mount
+	Features map[string]string
 }
 
 // SuspendSandboxResult holds the result of a suspend operation.
@@ -161,13 +173,14 @@ type ProcessInfo struct {
 }
 
 type service struct {
-	config        Config
-	store         *k8s.Store
-	manager       *k8s.Manager
-	backend       backend.ExecutionBackend
-	hostfs        *hostfs.HostFS
-	storageClient *storage.Client
-	activityDB    *activitydb.ActivityDB
+	config          Config
+	store           *k8s.Store
+	manager         *k8s.Manager
+	backend         backend.ExecutionBackend
+	hostfs          *hostfs.HostFS
+	storageClient   *storage.Client
+	activityDB      *activitydb.ActivityDB
+	capacityManager *capacity.Manager
 }
 
 // New creates a new service instance.
@@ -223,6 +236,19 @@ func (s *service) Mode() string {
 	return s.config.Mode
 }
 
+// SetCapacityManager sets the capacity manager for this service.
+func (s *service) SetCapacityManager(cm *capacity.Manager) {
+	s.capacityManager = cm
+}
+
+// GetCapacity returns the current node capacity information.
+func (s *service) GetCapacity(ctx context.Context) *capacity.NodeCapacity {
+	if s.capacityManager == nil {
+		return nil
+	}
+	return s.capacityManager.GetCapacity()
+}
+
 // touchActivity updates the last-used timestamp for a sandbox in SQLite.
 // This is a best-effort operation - errors are logged but not propagated.
 func (s *service) touchActivity(sessionID string) {
@@ -274,18 +300,19 @@ func (s *service) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 		Env:       env,
 		Labels:    req.Labels,
 		UserID:    req.UserID,
+		Features:  req.Features,
 	}
 
 	if s.config.FuseEnabled {
-		// Inject Python persistence env vars so pip installs persist to session storage
-		// The FUSE mount is at /mnt/fuse/data which is backed by S3
-		// PIP_USER=1 makes pip default to --user installs without requiring the flag
-		env["PYTHONUSERBASE"] = "/mnt/fuse/data/.local"
-		env["PIP_USER"] = "1"
+		// Use a virtual env at /mnt/data/.venv for persistent Python packages.
+		// The venv is created by sandbox-service with --system-site-packages so that
+		// pre-installed packages from the base image are available while still allowing
+		// pip install to add packages to the persistent FUSE mount.
+		env["VIRTUAL_ENV"] = "/mnt/data/.venv"
 		if existingPath := env["PATH"]; existingPath != "" {
-			env["PATH"] = "/mnt/fuse/data/.local/bin:" + existingPath
+			env["PATH"] = "/mnt/data/.venv/bin:" + existingPath
 		} else {
-			env["PATH"] = "/mnt/fuse/data/.local/bin:/usr/local/bin:/usr/bin:/bin"
+			env["PATH"] = "/mnt/data/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 		}
 
 		// FUSE mode: use S3-backed storage, disable legacy snapshot system
@@ -298,6 +325,9 @@ func (s *service) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 			SecretAccessKey:           s.config.FuseSecretAccessKey,
 			SecretAccessKeySecretName: s.config.FuseSecretAccessKeySecretName,
 			SecretAccessKeySecretKey:  s.config.FuseSecretAccessKeySecretKey,
+			UID:                       s.config.FuseUID,
+			GID:                       s.config.FuseGID,
+			SidecarResources:          s.config.FuseSidecarResources,
 		}
 		// Note: DownloadURL, InitImage, and EnableSnapshotFinalizer are ignored
 		// when FuseConfig is set - FUSE provides persistent storage directly
@@ -755,6 +785,22 @@ func (s *service) RestoreVMState(ctx context.Context, sessionID, statePath strin
 func (s *service) resolveContainerID(sessionID string) (string, error) {
 	if sessionID == "" {
 		return "", fmt.Errorf("%w: session id is required", apierrors.ErrInvalidArgument)
+	}
+
+	// Check sandbox status before attempting to resolve container
+	info, ok := s.store.GetSandbox(sessionID)
+	if !ok {
+		return "", fmt.Errorf("%w: sandbox not found", apierrors.ErrNotFound)
+	}
+
+	// Return specific errors for pending/failed sandboxes
+	switch info.Status {
+	case k8s.SandboxStatusPending:
+		return "", apierrors.ErrSandboxPending
+	case k8s.SandboxStatusFailed:
+		return "", apierrors.ErrSandboxFailed
+	case k8s.SandboxStatusTerminated:
+		return "", fmt.Errorf("%w: sandbox has been terminated", apierrors.ErrNotFound)
 	}
 
 	// In both pod and kata modes, use container ID from pod status.

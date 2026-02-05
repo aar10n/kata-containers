@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -49,10 +50,24 @@ func (s *Server) Register(grpcServer *grpc.Server) {
 }
 
 func (s *Server) Health(ctx context.Context, _ *emptypb.Empty) (*pb.HealthResponse, error) {
-	return &pb.HealthResponse{
+	resp := &pb.HealthResponse{
 		Status: "ok",
 		Mode:   s.svc.Mode(),
-	}, nil
+	}
+
+	// Include local capacity info if available
+	if cap := s.svc.GetCapacity(ctx); cap != nil {
+		resp.Capacity = &pb.NodeCapacity{
+			NodeName:         cap.NodeName,
+			MaxSandboxes:     cap.MaxSandboxes,
+			CurrentSandboxes: cap.CurrentSandboxes,
+			CalculatedAtUnix: cap.CalculatedAt.Unix(),
+		}
+	}
+
+	// Note: Cluster capacity is now aggregated by sandbox-service, not agents
+
+	return resp, nil
 }
 
 // Sandbox lifecycle
@@ -70,6 +85,7 @@ func (s *Server) CreateSandbox(ctx context.Context, req *pb.CreateSandboxRequest
 		Labels:      req.GetLabels(),
 		DownloadURL: req.GetDownloadUrl(),
 		UserID:      req.GetUserId(),
+		Features:    req.GetFeatures(),
 	})
 	if err != nil {
 		if errors.Is(err, k8s.ErrSandboxAlreadyExists) {
@@ -413,6 +429,8 @@ func (s *Server) StreamProcessOutput(req *pb.StreamProcessOutputRequest, stream 
 		return status.Error(codes.InvalidArgument, "process_id is required")
 	}
 
+	slog.Info("StreamProcessOutput: starting", "session_id", sessionID, "process_id", processID)
+
 	// Check if sandbox is local
 	info, err := s.svc.GetSandbox(stream.Context(), sessionID)
 	if err != nil {
@@ -430,26 +448,34 @@ func (s *Server) StreamProcessOutput(req *pb.StreamProcessOutputRequest, stream 
 	// Start streaming from backend
 	outCh, err := s.svc.StreamOutput(stream.Context(), sessionID, processID)
 	if err != nil {
+		slog.Error("StreamProcessOutput: failed to start", "session_id", sessionID, "error", err)
 		return toGRPCError(err)
 	}
+	slog.Info("StreamProcessOutput: stream started, waiting for data", "session_id", sessionID)
 
 	// Stream chunks to client
+	chunkNum := 0
 	for chunk := range outCh {
+		chunkNum++
 		if chunk.EOF {
+			slog.Info("StreamProcessOutput: EOF", "session_id", sessionID, "chunks_sent", chunkNum)
 			return nil
 		}
 		pbStream := pb.ProcessOutputChunk_STDOUT
 		if chunk.Stream == backend.StreamStderr {
 			pbStream = pb.ProcessOutputChunk_STDERR
 		}
+		slog.Debug("StreamProcessOutput: sending chunk", "session_id", sessionID, "chunk_num", chunkNum, "bytes", len(chunk.Data))
 		if err := stream.Send(&pb.ProcessOutputChunk{
 			Stream: pbStream,
 			Data:   chunk.Data,
 		}); err != nil {
+			slog.Error("StreamProcessOutput: send failed", "session_id", sessionID, "error", err)
 			return err
 		}
 	}
 
+	slog.Info("StreamProcessOutput: channel closed", "session_id", sessionID, "chunks_sent", chunkNum)
 	return nil
 }
 
@@ -724,6 +750,12 @@ func toGRPCError(err error) error {
 	}
 	if errors.Is(err, apierrors.ErrNotSupported) {
 		return status.Error(codes.Unimplemented, err.Error())
+	}
+	if errors.Is(err, apierrors.ErrSandboxPending) {
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	if errors.Is(err, apierrors.ErrSandboxFailed) {
+		return status.Error(codes.FailedPrecondition, err.Error())
 	}
 	if errors.Is(err, k8s.ErrSandboxNotFound) {
 		return status.Error(codes.NotFound, err.Error())

@@ -7,9 +7,12 @@ import (
 )
 
 var (
-	ErrNotFound      = errors.New("sandbox not found")
-	ErrAlreadyExists = errors.New("sandbox already exists")
-	ErrNotReady      = errors.New("sandbox not ready for exec")
+	ErrNotFound         = errors.New("sandbox not found")
+	ErrAlreadyExists    = errors.New("sandbox already exists")
+	ErrNotReady         = errors.New("sandbox not ready for exec")
+	ErrCapacityExceeded = errors.New("sandbox capacity exceeded")
+	ErrSandboxPending   = errors.New("sandbox is pending and not ready")
+	ErrSandboxFailed    = errors.New("sandbox has failed")
 )
 
 // Platform defines the execution platform interface for managing
@@ -32,6 +35,34 @@ type Platform interface {
 	StreamStdout(ctx context.Context, req StreamReadRequest) (<-chan StreamChunk, error)
 	StreamStderr(ctx context.Context, req StreamReadRequest) (<-chan StreamChunk, error)
 	StreamOutput(ctx context.Context, req StreamReadRequest) (<-chan OutputChunk, error)
+
+	// GetHealth returns the health and capacity information from the sandbox agent.
+	GetHealth(ctx context.Context) (*HealthInfo, error)
+}
+
+// HealthInfo holds health and capacity information from a sandbox agent.
+type HealthInfo struct {
+	Status   string
+	Mode     string
+	Capacity *NodeCapacity
+	Cluster  *ClusterCapacity // Cluster-wide capacity (from peer polling)
+}
+
+// NodeCapacity holds capacity information for a node.
+type NodeCapacity struct {
+	NodeName         string
+	MaxSandboxes     int32
+	CurrentSandboxes int32
+	CalculatedAt     time.Time
+}
+
+// ClusterCapacity holds aggregated capacity across all nodes.
+type ClusterCapacity struct {
+	TotalMaxSandboxes     int32
+	TotalCurrentSandboxes int32
+	AvailableNodes        int32
+	Nodes                 []NodeCapacity
+	CalculatedAt          time.Time
 }
 
 type CreateSandboxRequest struct {
@@ -46,6 +77,10 @@ type CreateSandboxRequest struct {
 	// UserID is an optional user identifier. When provided and FUSE storage is enabled,
 	// enables the /mydrive mount backed by S3 at assets_bucket/my-drive/{user_id}/.
 	UserID string
+	// Features is a map of optional feature flags passed through to sandbox-agent.
+	// The sandbox-agent interprets specific features. This allows the service to
+	// pass through features without needing to know their specifics.
+	Features map[string]string
 }
 
 type Sandbox struct {

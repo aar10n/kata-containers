@@ -7,6 +7,8 @@ var (
 	ErrSandboxNotFound  = errors.New("sandbox not found")
 	ErrAlreadyExists    = errors.New("already exists")
 	ErrNotReady         = errors.New("sandbox not ready")
+	ErrSandboxPending   = errors.New("sandbox is pending and not ready")
+	ErrSandboxFailed    = errors.New("sandbox has failed")
 	ErrInvalidArgument  = errors.New("invalid argument")
 	ErrConnectionClosed = errors.New("connection closed")
 	ErrEOF              = errors.New("end of stream")

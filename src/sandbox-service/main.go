@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/api"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/api/mcp"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/api/pb"
+	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/capacity"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/config"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform/docker"
@@ -18,6 +21,8 @@ import (
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/storage"
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 func main() {
@@ -60,8 +65,60 @@ func main() {
 		cfg.Sandbox.DefaultTTL,
 		cfg.Sandbox.CleanupInterval,
 		leaderElection,
+		cfg.Storage.StateTTL,
+		cfg.Storage.StateCleanupInterval,
 	)
 	defer svc.Stop()
+
+	// Initialize capacity tracker
+	tracker := capacity.NewTracker(capacity.Config{
+		MaxSandboxes:      cfg.Sandbox.MaxSandboxes,
+		OvercommitPercent: cfg.Sandbox.OvercommitPercent,
+	})
+	svc.SetCapacityTracker(tracker)
+	svc.SetCapacityConfig(
+		cfg.Sandbox.CapacityRefreshInterval,
+		cfg.Sandbox.EvictionInterval,
+		cfg.Sandbox.EvictionEnabled,
+	)
+	svc.StartCapacityLoops()
+	slog.Info("capacity tracking enabled",
+		"max", cfg.Sandbox.MaxSandboxes,
+		"overcommit_percent", cfg.Sandbox.OvercommitPercent,
+		"refresh_interval", cfg.Sandbox.CapacityRefreshInterval,
+		"eviction_enabled", cfg.Sandbox.EvictionEnabled)
+
+	// Start agent watcher if enabled (for dynamic capacity tracking)
+	if cfg.Sandbox.AgentWatcher.Enabled {
+		k8sConfig, err := rest.InClusterConfig()
+		if err != nil {
+			log.Fatalf("failed to get in-cluster config: %v", err)
+		}
+		k8sClient, err := kubernetes.NewForConfig(k8sConfig)
+		if err != nil {
+			log.Fatalf("failed to create k8s client: %v", err)
+		}
+
+		agentWatcher := capacity.NewAgentWatcher(
+			capacity.AgentWatcherConfig{
+				Namespace:     cfg.Sandbox.AgentWatcher.Namespace,
+				LabelSelector: cfg.Sandbox.AgentWatcher.LabelSelector,
+				HTTPPort:      cfg.Sandbox.AgentWatcher.HTTPPort,
+				PollInterval:  cfg.Sandbox.CapacityRefreshInterval,
+				PollTimeout:   cfg.Sandbox.AgentWatcher.PollTimeout,
+			},
+			k8sClient,
+			tracker,
+		)
+
+		ctx := context.Background()
+		if err := agentWatcher.Start(ctx); err != nil {
+			log.Fatalf("failed to start agent watcher: %v", err)
+		}
+		slog.Info("agent watcher started",
+			"namespace", cfg.Sandbox.AgentWatcher.Namespace,
+			"selector", cfg.Sandbox.AgentWatcher.LabelSelector)
+	}
 
 	// Start MCP server if enabled
 	if cfg.MCP.Enabled {
@@ -91,6 +148,12 @@ func main() {
 
 		// Set storage client on service for snapshot restore
 		svc.SetStorageClient(s3Client)
+
+		// Set state cleanup client if state TTL is configured
+		if cfg.Storage.StateTTL > 0 {
+			svc.SetStateCleanupClient(s3Client)
+			log.Printf("state cleanup enabled: ttl=%v, interval=%v", cfg.Storage.StateTTL, cfg.Storage.StateCleanupInterval)
+		}
 
 		storageServer := api.NewStorageServer(s3Client)
 		grpcServer := grpc.NewServer()

@@ -29,8 +29,7 @@ const (
 	// FUSE sidecar constants
 	FuseMountVolumeName  = "fuse-mounts"
 	FuseDeviceVolumeName = "fuse-device"
-	FuseMountPath        = "/mnt/fuse"
-	MyDriveMountPath     = "/mydrive"
+	FuseMountPath        = "/mnt"
 )
 
 var (
@@ -45,6 +44,8 @@ type ManagerConfig struct {
 	NodeSelector     map[string]string
 	Tolerations      []corev1.Toleration
 	ImagePullSecrets []corev1.LocalObjectReference
+	// Resources specifies the default resource requests and limits for sandbox containers.
+	Resources corev1.ResourceRequirements
 	// PodMode indicates whether to create regular pods (true) or Kata VMs (false).
 	// When true, RuntimeClassName is not set and emptyDir volumes are added.
 	PodMode bool
@@ -82,6 +83,12 @@ type FuseSidecarConfig struct {
 	SecretAccessKeySecretName string
 	// SecretAccessKeySecretKey is the key within the secret. Defaults to "secretAccessKey".
 	SecretAccessKeySecretKey string
+	// UID is the user ID for the sandbox user that owns the FUSE mounts.
+	UID int
+	// GID is the group ID for the sandbox user that owns the FUSE mounts.
+	GID int
+	// SidecarResources specifies resource requests/limits for the sidecar container.
+	SidecarResources corev1.ResourceRequirements
 }
 
 // CreateSandboxRequest holds parameters for creating a sandbox.
@@ -105,6 +112,10 @@ type CreateSandboxRequest struct {
 	// UserID is an optional user identifier. When set along with FuseConfig,
 	// enables the /mydrive mount backed by S3 at assets_bucket/my-drive/{user_id}/.
 	UserID string
+	// Features is a map of optional feature flags passed through from the API.
+	// Known features:
+	//   - "support_bundles": "true" - enables /mnt/support_bundles/ S3 mount
+	Features map[string]string
 	// FuseConfig enables the FUSE sidecar for S3-backed storage.
 	// When set, replaces emptyDir with FUSE mounts and disables snapshot system.
 	FuseConfig *FuseSidecarConfig
@@ -148,20 +159,26 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 
 	// Build container spec
 	container := corev1.Container{
-		Name:    "sandbox",
-		Image:   image,
-		Command: command,
-		Env:     mapToEnvVars(req.Env),
+		Name:      "sandbox",
+		Image:     image,
+		Command:   command,
+		Env:       mapToEnvVars(req.Env),
+		Resources: m.config.Resources,
 	}
 
 	// Build pod spec
 	terminationGracePeriod := int64(5) // Short grace period since preStop hook handles cleanup
 	podSpec := corev1.PodSpec{
-		NodeSelector:                  copyMap(m.config.NodeSelector),
-		Tolerations:                   m.config.Tolerations,
-		ImagePullSecrets:              m.config.ImagePullSecrets,
-		Containers:                    []corev1.Container{container},
-		RestartPolicy:                 corev1.RestartPolicyNever,
+		NodeSelector:     copyMap(m.config.NodeSelector),
+		Tolerations:      m.config.Tolerations,
+		ImagePullSecrets: m.config.ImagePullSecrets,
+		Containers:       []corev1.Container{container},
+		RestartPolicy:    corev1.RestartPolicyNever,
+		SecurityContext: &corev1.PodSecurityContext{
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: "RuntimeDefault",
+			},
+		},
 		TerminationGracePeriodSeconds: &terminationGracePeriod,
 	}
 
@@ -194,8 +211,8 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 			}
 
 			// Build mounts for main container
-			// Mount the shared volume at /mnt/fuse with HostToContainer propagation
-			// The sidecar creates FUSE mounts at /mnt/fuse/data and /mnt/fuse/mydrive
+			// Mount the shared volume at /mnt with HostToContainer propagation
+			// The sidecar creates FUSE mounts at /mnt/data and /mnt/mydrive
 			// which propagate to the main container
 			mainMounts := []corev1.VolumeMount{
 				{
@@ -211,8 +228,33 @@ func (m *Manager) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (
 
 			// Add FUSE sidecar as a native Kubernetes sidecar (init container with restartPolicy: Always)
 			// This ensures: 1) sidecar starts before main container, 2) terminates when main container exits
-			sidecar := buildFuseSidecar(req.FuseConfig, sessionID, req.UserID, &mountPropBidirectional)
+			sidecar := buildFuseSidecar(req.FuseConfig, sessionID, req.UserID, req.Features, &mountPropBidirectional)
 			podSpec.InitContainers = append(podSpec.InitContainers, sidecar)
+
+			// Add lifecycle hook to create minimal venv (non-blocking).
+			// Uses --without-pip for instant creation (just symlinks), then installs a
+			// pip wrapper that lazily creates full venv on first pip use.
+			podSpec.Containers[0].Lifecycle = &corev1.Lifecycle{
+				PostStart: &corev1.LifecycleHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"/bin/sh", "-c",
+							`python3 -m venv --system-site-packages --without-pip /mnt/data/.venv 2>/dev/null; cat > /mnt/data/.venv/bin/pip << 'WRAPPER'
+#!/bin/sh
+# Lazy pip initializer - creates full venv on first use
+VENV=/mnt/data/.venv
+MARKER="$VENV/.pip-ready"
+if [ ! -f "$MARKER" ]; then
+  python3 -m venv --system-site-packages "$VENV" 2>/dev/null
+  touch "$MARKER"
+fi
+exec "$VENV/bin/pip" "$@"
+WRAPPER
+chmod +x /mnt/data/.venv/bin/pip`,
+						},
+					},
+				},
+			}
 		} else {
 			// Legacy mode: emptyDir volume with optional snapshot restore
 			podSpec.Volumes = []corev1.Volume{
@@ -529,48 +571,20 @@ func mapToEnvVars(m map[string]string) []corev1.EnvVar {
 // fuse-adapter (https://github.com/aar10n/fuse-adapter) supports multiple FUSE backends
 // via YAML config and provides POSIX permissions (via S3 metadata headers), which is
 // required for pip install --user to work.
-func buildFuseSidecar(cfg *FuseSidecarConfig, sessionID, userID string, mountProp *corev1.MountPropagationMode) corev1.Container {
+func buildFuseSidecar(cfg *FuseSidecarConfig, sessionID, userID string, features map[string]string, mountProp *corev1.MountPropagationMode) corev1.Container {
 	userID = strings.TrimSpace(userID)
+	enableSupportBundles := features["support_bundles"] == "true"
 
 	// Build YAML config for fuse-adapter
 	// Always mount /data -> assets_bucket/sandboxes/{session_id}/
-	// Optionally mount /mydrive -> assets_bucket/my_drive/{user_id}/
+	// Optionally mount /mydrive -> assets_bucket/my_drive/{user_id}/ (if userID provided)
+	// Optionally mount /support_bundles -> assets_bucket/support-bundles/ (if feature enabled)
 	//
 	// Common S3 config is defined under connectors.s3, mounts reference it by type.
 	// The cache layer is required for random write operations (S3 only supports full object writes).
-	var yamlConfig string
-	if userID != "" {
-		yamlConfig = fmt.Sprintf(`logging:
-  level: warn
-
-connectors:
-  s3:
-    bucket: %s
-    region: %s
-    endpoint: "%s"
-    force_path_style: true
-	cache:
-      type: filesystem
-      path: /tmp/fuse-adapter-cache/s3
-      max_size: "256MB"
-      flush_interval: 30s
-
-mounts:
-  - path: %s/data
-    connector:
-      type: s3
-      prefix: "sandboxes/%s/"
-  - path: %s/mydrive
-    connector:
-      type: s3
-      prefix: "my_drive/%s/"
-	  read_only: true
-`, cfg.AssetsBucket, cfg.Region, cfg.Endpoint,
-			FuseMountPath, sessionID,
-			FuseMountPath, userID)
-	} else {
-		yamlConfig = fmt.Sprintf(`logging:
-  level: warn
+	var yamlBuilder strings.Builder
+	yamlBuilder.WriteString(fmt.Sprintf(`logging:
+  level: info
 
 connectors:
   s3:
@@ -581,6 +595,8 @@ connectors:
 
 mounts:
   - path: %s/data
+    uid: %d
+    gid: %d
     connector:
       type: s3
       prefix: "sandboxes/%s/"
@@ -589,9 +605,47 @@ mounts:
       path: /tmp/fuse-adapter-cache/data
       max_size: "512MB"
       flush_interval: 30s
+      exclude_from_sync:
+        # Exclude venv binaries and tools (platform-specific, recreatable)
+        - ".venv/bin/*"
+        - ".venv/include/*"
+        # Exclude pip itself (comes with Python)
+        - ".venv/lib/python*/site-packages/pip/*"
+        - ".venv/lib/python*/site-packages/pip-*.dist-info/*"
+        # Exclude setuptools (comes with Python)
+        - ".venv/lib/python*/site-packages/setuptools/*"
+        - ".venv/lib/python*/site-packages/setuptools-*.dist-info/*"
+        # Exclude compiled Python files (recreatable)
+        - "**/__pycache__/**"
+        - "**/*.pyc"
 `, cfg.AssetsBucket, cfg.Region, cfg.Endpoint,
-			FuseMountPath, sessionID)
+		FuseMountPath, cfg.UID, cfg.GID, sessionID))
+
+	// Add mydrive mount if userID is provided
+	if userID != "" {
+		yamlBuilder.WriteString(fmt.Sprintf(`  - path: %s/mydrive
+    uid: %d
+    gid: %d
+    connector:
+      type: s3
+      prefix: "my_drive/%s/"
+    read_only: true
+`, FuseMountPath, cfg.UID, cfg.GID, userID))
 	}
+
+	// Add support_bundles mount if feature is enabled
+	if enableSupportBundles {
+		yamlBuilder.WriteString(fmt.Sprintf(`  - path: %s/support_bundles
+    uid: %d
+    gid: %d
+    connector:
+      type: s3
+      prefix: "support-bundles/"
+    read_only: true
+`, FuseMountPath, cfg.UID, cfg.GID))
+	}
+
+	yamlConfig := yamlBuilder.String()
 
 	// Yaml doesn't allow tabs
 	yamlConfig = strings.ReplaceAll(yamlConfig, "\t", "  ")
@@ -599,18 +653,24 @@ mounts:
 	// Script to write config and run fuse-adapter
 	// The YAML config is passed via FUSE_ADAPTER_CONFIG env var for easy debugging
 	// (visible in kubectl describe pod). Using printf '%s' safely handles all characters.
-	mkdirPath := FuseMountPath + "/data"
+	mkdirPaths := []string{FuseMountPath + "/data"}
 	if userID != "" {
-		mkdirPath += " " + FuseMountPath + "/mydrive"
+		mkdirPaths = append(mkdirPaths, FuseMountPath+"/mydrive")
 	}
+	if enableSupportBundles {
+		mkdirPaths = append(mkdirPaths, FuseMountPath+"/support_bundles")
+	}
+	mkdirPath := strings.Join(mkdirPaths, " ")
+
 	script := fmt.Sprintf(`#!/bin/sh
 set -e
 
 mkdir -p %s
+chown %d:%d %s
 printf '%%s' "$FUSE_ADAPTER_CONFIG" > /tmp/fuse-adapter.yaml
 
 exec /usr/local/bin/fuse-adapter /tmp/fuse-adapter.yaml
-`, mkdirPath)
+`, mkdirPath, cfg.UID, cfg.GID, mkdirPath)
 
 	restartAlways := corev1.ContainerRestartPolicyAlways
 
@@ -648,6 +708,7 @@ exec /usr/local/bin/fuse-adapter /tmp/fuse-adapter.yaml
 		Command:       []string{"/bin/sh", "-c", script},
 		RestartPolicy: &restartAlways, // Native sidecar: runs alongside main container, terminates when pod exits
 		Env:           envVars,
+		Resources:     cfg.SidecarResources,
 		SecurityContext: &corev1.SecurityContext{
 			Privileged: boolPtr(true), // Required for bidirectional mount propagation
 		},

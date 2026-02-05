@@ -68,7 +68,6 @@ type Store struct {
 	mu                   sync.RWMutex
 	sandboxes            map[string]*SandboxInfo // session_id -> sandbox info
 	vmToSession          map[string]string       // sandbox_id (vm_id) -> session_id
-	nodeToAddr           map[string]string
 	nodeToSandboxPodIP   map[string]string
 	onSandboxIDFound     SandboxIDCallback
 	onPodDeleting        PodDeletingCallback
@@ -81,7 +80,6 @@ func NewStore() *Store {
 	return &Store{
 		sandboxes:            make(map[string]*SandboxInfo),
 		vmToSession:          make(map[string]string),
-		nodeToAddr:           make(map[string]string),
 		nodeToSandboxPodIP:   make(map[string]string),
 		pendingSnapshotSaves: make(map[string]bool),
 	}
@@ -242,31 +240,6 @@ func (s *Store) DeletePod(pod *corev1.Pod) {
 	}
 }
 
-func (s *Store) SetNode(node *corev1.Node) {
-	if node == nil {
-		return
-	}
-
-	addr := nodeAddress(node)
-	if addr == "" {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.nodeToAddr[node.Name] = addr
-}
-
-func (s *Store) DeleteNode(node *corev1.Node) {
-	if node == nil {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.nodeToAddr, node.Name)
-}
-
 func (s *Store) NodeForVM(vmID string) (string, bool) {
 	vmID = normalizeID(vmID)
 	if vmID == "" {
@@ -293,18 +266,24 @@ func (s *Store) NodeForVM(vmID string) (string, bool) {
 	return info.Node, true
 }
 
-func (s *Store) AddressForNode(nodeName string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	addr, ok := s.nodeToAddr[nodeName]
-	return addr, ok
-}
-
 func (s *Store) SandboxAgentAddressForNode(nodeName string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	addr, ok := s.nodeToSandboxPodIP[nodeName]
 	return addr, ok
+}
+
+// GetPeerAddresses returns a map of node name to sandbox-agent pod IP.
+// This is used by the capacity manager to poll peer agents.
+func (s *Store) GetPeerAddresses() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make(map[string]string, len(s.nodeToSandboxPodIP))
+	for node, ip := range s.nodeToSandboxPodIP {
+		result[node] = ip
+	}
+	return result
 }
 
 // GetSandbox returns sandbox info by session ID.
@@ -498,25 +477,6 @@ func normalizeID(id string) string {
 		return strings.TrimSpace(parts[1])
 	}
 	return id
-}
-
-func nodeAddress(node *corev1.Node) string {
-	var hostname string
-
-	for _, addr := range node.Status.Addresses {
-		switch addr.Type {
-		case corev1.NodeInternalIP:
-			return addr.Address
-		case corev1.NodeExternalIP:
-			hostname = addr.Address
-		case corev1.NodeHostName:
-			if hostname == "" {
-				hostname = addr.Address
-			}
-		}
-	}
-
-	return hostname
 }
 
 func isSandboxServicePod(pod *corev1.Pod) bool {

@@ -17,18 +17,35 @@ type Watcher struct {
 	factory   informers.SharedInformerFactory
 	store     *Store
 	resync    time.Duration
+	namespace string
 }
 
-func NewWatcher(clientset *kubernetes.Clientset, resync time.Duration) *Watcher {
+// NewWatcher creates a new watcher that watches resources in the specified namespace.
+// If namespace is empty, it watches all namespaces (requires cluster-scoped RBAC).
+func NewWatcher(clientset *kubernetes.Clientset, resync time.Duration, namespace string) *Watcher {
 	if resync <= 0 {
 		resync = 5 * time.Minute
 	}
 
+	var factory informers.SharedInformerFactory
+	if namespace != "" {
+		// Namespace-scoped watching - only requires namespace-level RBAC
+		factory = informers.NewSharedInformerFactoryWithOptions(
+			clientset,
+			resync,
+			informers.WithNamespace(namespace),
+		)
+	} else {
+		// Cluster-scoped watching - requires cluster-level RBAC
+		factory = informers.NewSharedInformerFactory(clientset, resync)
+	}
+
 	return &Watcher{
 		clientset: clientset,
-		factory:   informers.NewSharedInformerFactory(clientset, resync),
+		factory:   factory,
 		store:     NewStore(),
 		resync:    resync,
+		namespace: namespace,
 	}
 }
 
@@ -38,7 +55,6 @@ func (w *Watcher) Store() *Store {
 
 func (w *Watcher) Start(ctx context.Context) error {
 	podInformer := w.factory.Core().V1().Pods().Informer()
-	nodeInformer := w.factory.Core().V1().Nodes().Informer()
 
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -57,27 +73,6 @@ func (w *Watcher) Start(ctx context.Context) error {
 			pod, ok := obj.(*corev1.Pod)
 			if ok {
 				w.store.DeletePod(pod)
-			}
-		},
-	})
-
-	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			node, ok := obj.(*corev1.Node)
-			if ok {
-				w.store.SetNode(node)
-			}
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			node, ok := newObj.(*corev1.Node)
-			if ok {
-				w.store.SetNode(node)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			node, ok := obj.(*corev1.Node)
-			if ok {
-				w.store.DeleteNode(node)
 			}
 		},
 	})

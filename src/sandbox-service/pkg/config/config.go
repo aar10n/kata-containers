@@ -50,6 +50,10 @@ type StorageConfig struct {
 	PresignExpiry time.Duration `mapstructure:"presign_expiry"`
 	// ForcePathStyle forces path-style URLs (required for s3proxy)
 	ForcePathStyle bool `mapstructure:"force_path_style"`
+	// StateTTL is the TTL for sandbox state in S3 (0 = disabled)
+	StateTTL time.Duration `mapstructure:"state_ttl"`
+	// StateCleanupInterval is how often to run state cleanup (default: 1h)
+	StateCleanupInterval time.Duration `mapstructure:"state_cleanup_interval"`
 }
 
 // MCPConfig holds MCP server configuration.
@@ -100,6 +104,35 @@ type SandboxConfig struct {
 	DefaultImage string `mapstructure:"default_image"`
 	// DefaultCommand is the command to run in new sandbox containers.
 	DefaultCommand []string `mapstructure:"default_command"`
+
+	// MaxSandboxes is an optional hard limit on total sandboxes (0 = use dynamic capacity).
+	MaxSandboxes int `mapstructure:"max_sandboxes"`
+	// OvercommitPercent allows slight overcommit above capacity (default: 5%).
+	OvercommitPercent int `mapstructure:"overcommit_percent"`
+	// CapacityRefreshInterval is how often to poll agents for capacity (default: 15s).
+	CapacityRefreshInterval time.Duration `mapstructure:"capacity_refresh_interval"`
+	// EvictionEnabled enables background eviction when over capacity.
+	EvictionEnabled bool `mapstructure:"eviction_enabled"`
+	// EvictionInterval is how often to check for excess sandboxes (default: 30s).
+	EvictionInterval time.Duration `mapstructure:"eviction_interval"`
+
+	// AgentWatcher configuration for polling sandbox-agent pods directly.
+	AgentWatcher AgentWatcherConfig `mapstructure:"agent_watcher"`
+}
+
+// AgentWatcherConfig holds configuration for the agent pod watcher.
+type AgentWatcherConfig struct {
+	// Enabled indicates whether the agent watcher is enabled.
+	// When enabled, the service polls all agent pods directly for capacity.
+	Enabled bool `mapstructure:"enabled"`
+	// Namespace where sandbox-agent pods are running.
+	Namespace string `mapstructure:"namespace"`
+	// LabelSelector to find sandbox-agent pods (e.g., "app=sandbox-agent").
+	LabelSelector string `mapstructure:"label_selector"`
+	// HTTPPort is the port agents listen on for HTTP/health requests.
+	HTTPPort int `mapstructure:"http_port"`
+	// PollTimeout is the timeout for polling a single agent.
+	PollTimeout time.Duration `mapstructure:"poll_timeout"`
 }
 
 // Flags defines command-line flags that can override config values.
@@ -141,16 +174,30 @@ func DefaultConfig() Config {
 			MaxOutputBytes: 1024 * 1024,
 		},
 		Sandbox: SandboxConfig{
-			DefaultTTL:      10 * time.Minute,
-			CleanupInterval: 30 * time.Second,
-			DefaultImage:    "python:3.11-slim",
-			DefaultCommand:  []string{"sleep", "infinity"},
+			DefaultTTL:              10 * time.Minute,
+			CleanupInterval:         30 * time.Second,
+			DefaultImage:            "python:3.11-slim",
+			DefaultCommand:          []string{"sleep", "infinity"},
+			MaxSandboxes:            0,
+			OvercommitPercent:       5,
+			CapacityRefreshInterval: 15 * time.Second,
+			EvictionEnabled:         false,
+			EvictionInterval:        30 * time.Second,
+			AgentWatcher: AgentWatcherConfig{
+				Enabled:       false, // Disabled by default, enable in config
+				Namespace:     "default",
+				LabelSelector: "app=sandbox-agent",
+				HTTPPort:      8080,
+				PollTimeout:   5 * time.Second,
+			},
 		},
 		Storage: StorageConfig{
-			Enabled:        false,
-			Region:         "us-east-1",
-			PresignExpiry:  15 * time.Minute,
-			ForcePathStyle: true,
+			Enabled:              false,
+			Region:               "us-east-1",
+			PresignExpiry:        15 * time.Minute,
+			ForcePathStyle:       true,
+			StateTTL:             0, // disabled by default
+			StateCleanupInterval: 1 * time.Hour,
 		},
 	}
 }
@@ -194,10 +241,22 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("sandbox.cleanup_interval", defaults.Sandbox.CleanupInterval)
 	v.SetDefault("sandbox.default_image", defaults.Sandbox.DefaultImage)
 	v.SetDefault("sandbox.default_command", defaults.Sandbox.DefaultCommand)
+	v.SetDefault("sandbox.max_sandboxes", defaults.Sandbox.MaxSandboxes)
+	v.SetDefault("sandbox.overcommit_percent", defaults.Sandbox.OvercommitPercent)
+	v.SetDefault("sandbox.capacity_refresh_interval", defaults.Sandbox.CapacityRefreshInterval)
+	v.SetDefault("sandbox.eviction_enabled", defaults.Sandbox.EvictionEnabled)
+	v.SetDefault("sandbox.eviction_interval", defaults.Sandbox.EvictionInterval)
+	v.SetDefault("sandbox.agent_watcher.enabled", defaults.Sandbox.AgentWatcher.Enabled)
+	v.SetDefault("sandbox.agent_watcher.namespace", defaults.Sandbox.AgentWatcher.Namespace)
+	v.SetDefault("sandbox.agent_watcher.label_selector", defaults.Sandbox.AgentWatcher.LabelSelector)
+	v.SetDefault("sandbox.agent_watcher.http_port", defaults.Sandbox.AgentWatcher.HTTPPort)
+	v.SetDefault("sandbox.agent_watcher.poll_timeout", defaults.Sandbox.AgentWatcher.PollTimeout)
 	v.SetDefault("storage.enabled", defaults.Storage.Enabled)
 	v.SetDefault("storage.region", defaults.Storage.Region)
 	v.SetDefault("storage.presign_expiry", defaults.Storage.PresignExpiry)
 	v.SetDefault("storage.force_path_style", defaults.Storage.ForcePathStyle)
+	v.SetDefault("storage.state_ttl", defaults.Storage.StateTTL)
+	v.SetDefault("storage.state_cleanup_interval", defaults.Storage.StateCleanupInterval)
 
 	// Enable environment variable overrides
 	// Environment variables use SANDBOX_SERVICE_ prefix with underscores

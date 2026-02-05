@@ -35,10 +35,11 @@ type Config struct {
 	Timeout time.Duration
 }
 
-// Client provides access to the CRI RuntimeService.
+// Client provides access to the CRI RuntimeService and ImageService.
 type Client struct {
 	conn    *grpc.ClientConn
 	runtime runtimeapi.RuntimeServiceClient
+	image   runtimeapi.ImageServiceClient
 	timeout time.Duration
 }
 
@@ -82,6 +83,7 @@ func New(cfg Config) (*Client, error) {
 	return &Client{
 		conn:    conn,
 		runtime: runtimeapi.NewRuntimeServiceClient(conn),
+		image:   runtimeapi.NewImageServiceClient(conn),
 		timeout: timeout,
 	}, nil
 }
@@ -196,6 +198,35 @@ func (c *Client) ContainerStatus(ctx context.Context, containerID string) (*runt
 		return nil, fmt.Errorf("container status failed: %w", err)
 	}
 	return resp.Status, nil
+}
+
+// PullImage pulls a container image with optional authentication.
+// auth can be nil for public images.
+func (c *Client) PullImage(ctx context.Context, image string, auth *runtimeapi.AuthConfig) (string, error) {
+	resp, err := c.image.PullImage(ctx, &runtimeapi.PullImageRequest{
+		Image: &runtimeapi.ImageSpec{
+			Image: image,
+		},
+		Auth: auth,
+	})
+	if err != nil {
+		return "", fmt.Errorf("pull image failed: %w", err)
+	}
+	return resp.ImageRef, nil
+}
+
+// ImageStatus returns the status of an image, or nil if the image doesn't exist locally.
+func (c *Client) ImageStatus(ctx context.Context, image string) (*runtimeapi.Image, error) {
+	resp, err := c.image.ImageStatus(ctx, &runtimeapi.ImageStatusRequest{
+		Image: &runtimeapi.ImageSpec{
+			Image: image,
+		},
+		Verbose: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("image status failed: %w", err)
+	}
+	return resp.Image, nil
 }
 
 // stripContainerIDPrefix removes the runtime prefix from container IDs.

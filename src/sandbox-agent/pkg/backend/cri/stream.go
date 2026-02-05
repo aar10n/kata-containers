@@ -87,6 +87,7 @@ func newStreamConn(ctx context.Context, streamURL string) (*streamConn, error) {
 func (c *streamConn) readLoop() {
 	defer close(c.done)
 
+	msgCount := 0
 	for {
 		_, data, err := c.ws.ReadMessage()
 		if err != nil {
@@ -94,12 +95,19 @@ func (c *streamConn) readLoop() {
 			return
 		}
 
+		msgCount++
 		if len(data) < 1 {
 			continue
 		}
 
 		streamType := data[0]
 		payload := data[1:]
+
+		// Only buffer and signal if there's actual payload data
+		if len(payload) == 0 {
+			// Skip frames with no payload (just stream type byte)
+			continue
+		}
 
 		c.bufMu.Lock()
 		switch streamType {

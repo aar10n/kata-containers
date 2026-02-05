@@ -90,6 +90,23 @@ service SandboxAgent {
 message HealthResponse {
   string status = 1;
   string mode = 2;  // "kata" or "pod"
+  NodeCapacity capacity = 3;  // Local node capacity info
+  ClusterCapacity cluster = 4;  // Cluster-wide capacity info (from peer polling)
+}
+
+message NodeCapacity {
+  string node_name = 1;
+  int32 max_sandboxes = 2;
+  int32 current_sandboxes = 3;
+  int64 calculated_at_unix = 4;
+}
+
+message ClusterCapacity {
+  int32 total_max_sandboxes = 1;
+  int32 total_current_sandboxes = 2;
+  int32 available_nodes = 3;
+  repeated NodeCapacity nodes = 4;
+  int64 calculated_at_unix = 5;
 }
 
 // Sandbox lifecycle messages
@@ -106,6 +123,10 @@ message CreateSandboxRequest {
   // Optional user ID. When provided and fuse_storage is enabled, enables
   // the /mydrive mount backed by S3 at assets_bucket/my-drive/{user_id}/.
   string user_id = 7;
+  // Optional feature flags. Passed through from sandbox-service to sandbox-agent.
+  // The sandbox-agent interprets specific features. Known features:
+  //   - "support_bundles": "true" - enables /mnt/support_bundles/ S3 mount
+  map<string, string> features = 8;
 }
 
 message GetSandboxRequest {

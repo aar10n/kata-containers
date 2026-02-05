@@ -19,10 +19,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 const (
-	agentReadTimeout     = 100 * time.Millisecond // Short timeout for non-blocking reads
+	agentReadTimeout     = 500 * time.Millisecond // Timeout for reads (increased to allow larger reads)
+	maxReadBytes         = 1024 * 1024            // 1MB max per read to reduce round-trips for large output
 	sandboxPollInitDelay = 100 * time.Millisecond
 	sandboxPollMaxDelay  = 2 * time.Second
 	sandboxReadyTimeout  = 30 * time.Second
@@ -257,6 +259,7 @@ func (p *Platform) CreateSandbox(ctx context.Context, req platform.CreateSandbox
 		Labels:      req.Labels,
 		DownloadUrl: req.DownloadURL,
 		UserId:      req.UserID,
+		Features:    req.Features,
 	}
 
 	resp, err := client.CreateSandbox(ctx, pbReq)
@@ -497,7 +500,7 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 		resp, err := p.getClientForSession(sessionID).ReadProcessStdout(readCtx, &pb.ReadProcessOutputRequest{
 			SessionId: sessionID,
 			ProcessId: execID,
-			MaxBytes:  4096,
+			MaxBytes:  maxReadBytes,
 		})
 		var data []byte
 		if resp != nil {
@@ -510,7 +513,7 @@ func (p *Platform) ReadFromProcess(ctx context.Context, sessionID, execID string
 		resp, err := p.getClientForSession(sessionID).ReadProcessStderr(readCtx, &pb.ReadProcessOutputRequest{
 			SessionId: sessionID,
 			ProcessId: execID,
-			MaxBytes:  4096,
+			MaxBytes:  maxReadBytes,
 		})
 		var data []byte
 		if resp != nil {
@@ -544,7 +547,7 @@ func (p *Platform) ReadStdout(ctx context.Context, sessionID, execID string) ([]
 	resp, err := p.getClientForSession(sessionID).ReadProcessStdout(readCtx, &pb.ReadProcessOutputRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
-		MaxBytes:  4096,
+		MaxBytes:  maxReadBytes,
 	})
 	if err != nil && !isTimeout(err) {
 		return nil, fmt.Errorf("read stdout: %w", err)
@@ -563,7 +566,7 @@ func (p *Platform) ReadStderr(ctx context.Context, sessionID, execID string) ([]
 	resp, err := p.getClientForSession(sessionID).ReadProcessStderr(readCtx, &pb.ReadProcessOutputRequest{
 		SessionId: sessionID,
 		ProcessId: execID,
-		MaxBytes:  4096,
+		MaxBytes:  maxReadBytes,
 	})
 	if err != nil && !isTimeout(err) {
 		return nil, fmt.Errorf("read stderr: %w", err)
@@ -896,4 +899,52 @@ func isConnectionError(err error) bool {
 	}
 	code := status.Code(err)
 	return code == codes.Unavailable || code == codes.Internal
+}
+
+// GetHealth returns the health and capacity information from the sandbox agent.
+func (p *Platform) GetHealth(ctx context.Context) (*platform.HealthInfo, error) {
+	client := p.client()
+	if client == nil {
+		return nil, fmt.Errorf("no connection to sandbox-agent")
+	}
+
+	resp, err := client.Health(ctx, &emptypb.Empty{})
+	if err != nil {
+		return nil, fmt.Errorf("get health: %w", err)
+	}
+
+	info := &platform.HealthInfo{
+		Status: resp.GetStatus(),
+		Mode:   resp.GetMode(),
+	}
+
+	if cap := resp.GetCapacity(); cap != nil {
+		info.Capacity = &platform.NodeCapacity{
+			NodeName:         cap.GetNodeName(),
+			MaxSandboxes:     cap.GetMaxSandboxes(),
+			CurrentSandboxes: cap.GetCurrentSandboxes(),
+			CalculatedAt:     time.Unix(cap.GetCalculatedAtUnix(), 0),
+		}
+	}
+
+	// Include cluster capacity if available
+	if cluster := resp.GetCluster(); cluster != nil {
+		info.Cluster = &platform.ClusterCapacity{
+			TotalMaxSandboxes:     cluster.GetTotalMaxSandboxes(),
+			TotalCurrentSandboxes: cluster.GetTotalCurrentSandboxes(),
+			AvailableNodes:        cluster.GetAvailableNodes(),
+			CalculatedAt:          time.Unix(cluster.GetCalculatedAtUnix(), 0),
+		}
+		// Convert node capacities
+		for _, node := range cluster.GetNodes() {
+			info.Cluster.Nodes = append(info.Cluster.Nodes, platform.NodeCapacity{
+				NodeName:         node.GetNodeName(),
+				MaxSandboxes:     node.GetMaxSandboxes(),
+				CurrentSandboxes: node.GetCurrentSandboxes(),
+				CalculatedAt:     time.Unix(node.GetCalculatedAtUnix(), 0),
+			})
+		}
+	}
+
+	return info, nil
 }

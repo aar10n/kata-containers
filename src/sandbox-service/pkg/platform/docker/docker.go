@@ -923,3 +923,19 @@ func hashSuffix(value string) string {
 	sum := sha1.Sum([]byte(value))
 	return hex.EncodeToString(sum[:4])
 }
+
+// GetHealth returns health information for the Docker platform.
+// Since Docker doesn't have a sandbox agent, this returns basic status without capacity info.
+func (p *Platform) GetHealth(ctx context.Context) (*platform.HealthInfo, error) {
+	// Ping Docker to verify it's available
+	_, err := p.docker.Ping(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("docker ping: %w", err)
+	}
+
+	return &platform.HealthInfo{
+		Status:   "ok",
+		Mode:     "docker",
+		Capacity: nil, // Docker platform doesn't report capacity
+	}, nil
+}

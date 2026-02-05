@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/capacity"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/platform"
 	"github.com/cohere-ai/kata-containers/src/sandbox-service/pkg/storage"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,14 +51,15 @@ stty -echo 2>/dev/null
 sleep 0.1  # Allow stty settings to propagate to TTY driver
 
 # Create init script for each bash instance
-# The ready token is printed AFTER stty -echo to guarantee no echo race
-cat > /tmp/.sandbox-bashrc << BASHRC
+# Note: Python venv is created by init container at sandbox startup, not here.
+cat > /tmp/.sandbox-bashrc << 'BASHRC'
 stty -echo 2>/dev/null
 bind 'set enable-bracketed-paste off' 2>/dev/null
 export PS1=
 unset PROMPT_COMMAND
-printf '%%s\n' "$READY_TOKEN"
 BASHRC
+# Append ready token
+echo "printf '%%s\n' \"$READY_TOKEN\"" >> /tmp/.sandbox-bashrc
 
 trap '' INT  # Ignore SIGINT in wrapper, let inner bash handle it
 first=1
@@ -70,7 +72,8 @@ while true; do
     fi
     # Re-disable echo before each bash instance (in case it was re-enabled)
     stty -echo 2>/dev/null
-    bash --rcfile /tmp/.sandbox-bashrc -i
+    # Use script to capture all terminal I/O and write to container stdout for pod logs
+    script -q -f /proc/1/fd/1 -c "bash --rcfile /tmp/.sandbox-bashrc -i"
 done
 `
 
@@ -85,18 +88,38 @@ import os
 import site
 import traceback
 import io
+import subprocess
 
-# Ensure user site-packages is in sys.path even if directory didn't exist at startup.
-# This allows pip install --user to work without restarting the REPL.
-_user_base = os.environ.get('PYTHONUSERBASE')
-if _user_base:
-    _user_site = os.path.join(_user_base, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')
-    os.makedirs(_user_site, exist_ok=True)
-    if _user_site not in sys.path:
-        site.addsitedir(_user_site)
+# Activate virtual environment if it exists.
+# The venv is created by the init container at sandbox startup, not here.
+# This just activates it by updating sys.prefix and sys.path.
+_venv_path = os.environ.get('VIRTUAL_ENV')
+if _venv_path and os.path.exists(_venv_path):
+    _venv_site = os.path.join(_venv_path, 'lib', f'python{sys.version_info.major}.{sys.version_info.minor}', 'site-packages')
+    sys.prefix = _venv_path
+    sys.exec_prefix = _venv_path
+    if os.path.exists(_venv_site) and _venv_site not in sys.path:
+        sys.path.insert(0, _venv_site)
 
 # Global context for persistent state
 __context__ = {'__builtins__': __builtins__}
+
+# Open container log file for writing executed code and results to pod logs.
+# This mirrors how the shell uses 'script -f /proc/1/fd/1' to log all I/O.
+_container_log = None
+try:
+    _container_log = open('/proc/1/fd/1', 'w', buffering=1)
+except (OSError, IOError):
+    pass  # Not fatal if we can't open container logs
+
+def log_to_container(text):
+    """Write text to container logs (pod logs)."""
+    if _container_log:
+        try:
+            _container_log.write(text)
+            _container_log.flush()
+        except (OSError, IOError):
+            pass
 
 def reset_context():
     """Reset the global context to a fresh state."""
@@ -143,22 +166,36 @@ def main():
             code = ''.join(code_buffer)
             code_buffer = []
 
+            # Log the code being executed to container logs (Python REPL style)
+            code_lines = code.rstrip().split('\n')
+            if code_lines:
+                log_to_container(f">>> {code_lines[0]}\n")
+                for line in code_lines[1:]:
+                    log_to_container(f"... {line}\n")
+
             stdout, stderr, should_reset = execute_code(code)
 
-            # Output results
+            # Log output to container logs
             if stdout:
-                sys.stdout.write(stdout)
+                log_to_container(stdout)
+            if stderr:
+                log_to_container(stderr)
+
+            # Output results to caller - stderr first, then flush it before the marker
+            # This ensures stderr data is in the pipe before the done marker arrives
             if stderr:
                 sys.stderr.write(stderr)
+                sys.stderr.flush()
+            if stdout:
+                sys.stdout.write(stdout)
 
             # Reset context if exit() was called
             if should_reset:
                 reset_context()
 
-            # Signal completion
+            # Signal completion (after stderr is flushed)
             sys.stdout.write('<<<DONE>>>\n')
             sys.stdout.flush()
-            sys.stderr.flush()
         else:
             code_buffer.append(line)
 
@@ -183,24 +220,41 @@ type StorageClient interface {
 	HeadFile(ctx context.Context, sessionID, fileName string) (*storage.FileInfo, error)
 }
 
+// StateCleanupClient provides S3 operations for state cleanup.
+type StateCleanupClient interface {
+	ListSandboxPrefixes(ctx context.Context) (map[string]time.Time, error)
+	GetSandboxStateLastModified(ctx context.Context, sessionID string) (time.Time, error)
+	DeleteSandboxState(ctx context.Context, sessionID string) (int, error)
+}
+
 type Service struct {
-	platform        platform.Platform
-	defaultImage    string
-	defaultCommand  []string
-	mainContainer   string
-	shellContainer  string
-	defaultTimeout  time.Duration
-	maxOutputBytes  int
-	readyTimeout    time.Duration
-	readyPollDelay  time.Duration
-	defaultTTL      time.Duration
-	cleanupInterval time.Duration
-	leaderElection  LeaderElectionConfig
-	stopCh          chan struct{}
-	stopOnce        sync.Once
-	mu              sync.Mutex
-	sessions        map[string]*Session
-	storageClient   StorageClient // Optional storage client for snapshot restore
+	platform             platform.Platform
+	defaultImage         string
+	defaultCommand       []string
+	mainContainer        string
+	shellContainer       string
+	defaultTimeout       time.Duration
+	maxOutputBytes       int
+	readyTimeout         time.Duration
+	readyPollDelay       time.Duration
+	defaultTTL           time.Duration
+	cleanupInterval      time.Duration
+	leaderElection       LeaderElectionConfig
+	stopCh               chan struct{}
+	stopOnce             sync.Once
+	mu                   sync.Mutex
+	sessions             map[string]*Session
+	storageClient        StorageClient // Optional storage client for snapshot restore
+	stateCleanupClient   StateCleanupClient
+	stateCache           *storage.SandboxStateCache
+	stateCleanupTTL      time.Duration
+	stateCleanupInterval time.Duration
+
+	// Capacity tracking
+	capacityTracker         *capacity.Tracker
+	capacityRefreshInterval time.Duration
+	evictionEnabled         bool
+	evictionInterval        time.Duration
 }
 
 type ExecInput struct {
@@ -210,11 +264,13 @@ type ExecInput struct {
 	Timeout    time.Duration
 	Image      string
 	UserID     string
+	Features   map[string]string
 }
 
 type Session struct {
 	SessionID string
-	UserID    string // Optional user ID for /mydrive mount
+	UserID    string            // Optional user ID for /mydrive mount
+	Features  map[string]string // Optional feature flags passed to sandbox-agent
 	Shell     *ProcessState
 	REPLs     map[string]*ProcessState
 	Jobs      map[string]*JobState
@@ -272,25 +328,31 @@ type OutputChunk struct {
 	Error    string
 }
 
-func New(p platform.Platform, defaultImage string, defaultCommand []string, mainContainer string, shellContainer string, defaultTimeout time.Duration, maxOutputBytes int, defaultTTL time.Duration, cleanupInterval time.Duration, leaderElection LeaderElectionConfig) *Service {
+func New(p platform.Platform, defaultImage string, defaultCommand []string, mainContainer string, shellContainer string, defaultTimeout time.Duration, maxOutputBytes int, defaultTTL time.Duration, cleanupInterval time.Duration, leaderElection LeaderElectionConfig, stateCleanupTTL time.Duration, stateCleanupInterval time.Duration) *Service {
 	if strings.TrimSpace(mainContainer) == "" {
 		mainContainer = "sandbox"
 	}
 	svc := &Service{
-		platform:        p,
-		defaultImage:    defaultImage,
-		defaultCommand:  append([]string{}, defaultCommand...),
-		mainContainer:   mainContainer,
-		shellContainer:  strings.TrimSpace(shellContainer),
-		defaultTimeout:  defaultTimeout,
-		maxOutputBytes:  maxOutputBytes,
-		readyTimeout:    defaultReadyTimeout,
-		readyPollDelay:  readyPollInterval,
-		defaultTTL:      defaultTTL,
-		cleanupInterval: cleanupInterval,
-		leaderElection:  leaderElection,
-		stopCh:          make(chan struct{}),
-		sessions:        make(map[string]*Session),
+		platform:             p,
+		defaultImage:         defaultImage,
+		defaultCommand:       append([]string{}, defaultCommand...),
+		mainContainer:        mainContainer,
+		shellContainer:       strings.TrimSpace(shellContainer),
+		defaultTimeout:       defaultTimeout,
+		maxOutputBytes:       maxOutputBytes,
+		readyTimeout:         defaultReadyTimeout,
+		readyPollDelay:       readyPollInterval,
+		defaultTTL:           defaultTTL,
+		cleanupInterval:      cleanupInterval,
+		leaderElection:       leaderElection,
+		stopCh:               make(chan struct{}),
+		sessions:             make(map[string]*Session),
+		stateCleanupTTL:      stateCleanupTTL,
+		stateCleanupInterval: stateCleanupInterval,
+	}
+	// Initialize state cache if state cleanup is enabled
+	if stateCleanupTTL > 0 {
+		svc.stateCache = storage.NewSandboxStateCache()
 	}
 	if defaultTTL > 0 && cleanupInterval > 0 {
 		if leaderElection.Enabled {
@@ -307,11 +369,16 @@ func (s *Service) SetStorageClient(client StorageClient) {
 	s.storageClient = client
 }
 
-func (s *Service) getSession(sessionID string) *Session {
-	return s.getSessionWithUserID(sessionID, "")
+// SetStateCleanupClient sets the S3 client for state cleanup operations.
+func (s *Service) SetStateCleanupClient(client StateCleanupClient) {
+	s.stateCleanupClient = client
 }
 
-func (s *Service) getSessionWithUserID(sessionID, userID string) *Session {
+func (s *Service) getSession(sessionID string) *Session {
+	return s.getSessionWithUserID(sessionID, "", nil)
+}
+
+func (s *Service) getSessionWithUserID(sessionID, userID string, features map[string]string) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[sessionID]
@@ -319,13 +386,25 @@ func (s *Service) getSessionWithUserID(sessionID, userID string) *Session {
 		session = &Session{
 			SessionID: sessionID,
 			UserID:    userID,
+			Features:  features,
 			REPLs:     make(map[string]*ProcessState),
 			Jobs:      make(map[string]*JobState),
 		}
 		s.sessions[sessionID] = session
-	} else if userID != "" && session.UserID == "" {
+	} else {
 		// Update userID if provided and not already set
-		session.UserID = userID
+		if userID != "" && session.UserID == "" {
+			session.UserID = userID
+		}
+		// Merge features if provided (new features override existing)
+		if len(features) > 0 {
+			if session.Features == nil {
+				session.Features = make(map[string]string)
+			}
+			for k, v := range features {
+				session.Features[k] = v
+			}
+		}
 	}
 	return session
 }
@@ -348,11 +427,11 @@ func (s *Service) Exec(ctx context.Context, sessionID string, input ExecInput) (
 		input.Timeout = s.defaultTimeout
 	}
 
-	// Store userID in session for future operations
+	// Store userID and features in session for future operations
 	slog.Info("Exec called", "session_id", sessionID, "user_id", input.UserID)
-	session := s.getSessionWithUserID(sessionID, input.UserID)
+	session := s.getSessionWithUserID(sessionID, input.UserID, input.Features)
 
-	if err := s.ensureReady(ctx, sessionID, input.Image, session.UserID); err != nil {
+	if err := s.ensureReady(ctx, sessionID, input.Image, session.UserID, session.Features); err != nil {
 		return nil, err
 	}
 
@@ -383,8 +462,8 @@ func (s *Service) DownloadFile(ctx context.Context, sessionID, path, userID stri
 		return nil, errors.New("path is required")
 	}
 
-	session := s.getSessionWithUserID(sessionID, userID)
-	if err := s.ensureReady(ctx, sessionID, "", session.UserID); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID, nil)
+	if err := s.ensureReady(ctx, sessionID, "", session.UserID, session.Features); err != nil {
 		return nil, err
 	}
 
@@ -426,8 +505,8 @@ func (s *Service) UploadFile(ctx context.Context, sessionID, path string, data [
 		return errors.New("path is required")
 	}
 
-	session := s.getSessionWithUserID(sessionID, userID)
-	if err := s.ensureReady(ctx, sessionID, "", session.UserID); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID, nil)
+	if err := s.ensureReady(ctx, sessionID, "", session.UserID, session.Features); err != nil {
 		return err
 	}
 
@@ -473,7 +552,7 @@ func (s *Service) UploadFile(ctx context.Context, sessionID, path string, data [
 	return nil
 }
 
-func (s *Service) ExecShell(ctx context.Context, sessionID, command string, timeout time.Duration, userID string) (*ShellResult, error) {
+func (s *Service) ExecShell(ctx context.Context, sessionID, command string, timeout time.Duration, userID string, features map[string]string) (*ShellResult, error) {
 	slog.Info("ExecShell called", "session_id", sessionID, "user_id", userID)
 	if sessionID == "" {
 		return nil, errors.New("session_id is required")
@@ -488,8 +567,8 @@ func (s *Service) ExecShell(ctx context.Context, sessionID, command string, time
 	readyCtx, readyCancel := context.WithTimeout(ctx, s.readyTimeout)
 	defer readyCancel()
 
-	session := s.getSessionWithUserID(sessionID, userID)
-	if err := s.ensureReady(readyCtx, sessionID, "", session.UserID); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID, features)
+	if err := s.ensureReady(readyCtx, sessionID, "", session.UserID, session.Features); err != nil {
 		return nil, err
 	}
 
@@ -531,7 +610,7 @@ func (s *Service) ExecShell(ctx context.Context, sessionID, command string, time
 // StreamExecShell executes a shell command and streams output via the onChunk callback.
 // The callback is called with each chunk of stdout/stderr data as it becomes available.
 // The final call will have Done=true and include the exit code.
-func (s *Service) StreamExecShell(ctx context.Context, sessionID, command string, timeout time.Duration, userID string, onChunk func(OutputChunk)) error {
+func (s *Service) StreamExecShell(ctx context.Context, sessionID, command string, timeout time.Duration, userID string, features map[string]string, onChunk func(OutputChunk)) error {
 	if sessionID == "" {
 		return errors.New("session_id is required")
 	}
@@ -545,8 +624,8 @@ func (s *Service) StreamExecShell(ctx context.Context, sessionID, command string
 	readyCtx, readyCancel := context.WithTimeout(ctx, s.readyTimeout)
 	defer readyCancel()
 
-	session := s.getSessionWithUserID(sessionID, userID)
-	if err := s.ensureReady(readyCtx, sessionID, "", session.UserID); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID, features)
+	if err := s.ensureReady(readyCtx, sessionID, "", session.UserID, session.Features); err != nil {
 		return err
 	}
 
@@ -796,7 +875,8 @@ func (s *Service) ResizeShell(ctx context.Context, sessionID string, columns, ro
 	return s.platform.ResizeProcess(ctx, sessionID, execID, rows, columns)
 }
 
-func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeout time.Duration, userID string) (*REPLResult, error) {
+func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeout time.Duration, userID string, features map[string]string) (*REPLResult, error) {
+	slog.Info("ExecPython called", "session_id", sessionID, "user_id", userID)
 	if sessionID == "" {
 		return nil, errors.New("session_id is required")
 	}
@@ -810,13 +890,17 @@ func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeou
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	session := s.getSessionWithUserID(sessionID, userID)
-	if err := s.ensureReady(ctx, sessionID, "", session.UserID); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID, features)
+	slog.Info("ExecPython ensureReady", "session_id", sessionID)
+	if err := s.ensureReady(ctx, sessionID, "", session.UserID, session.Features); err != nil {
+		slog.Error("ExecPython ensureReady failed", "session_id", sessionID, "error", err)
 		return nil, err
 	}
 
+	slog.Info("ExecPython ensurePythonREPL", "session_id", sessionID)
 	proc, err := s.ensurePythonREPL(ctx, sessionID)
 	if err != nil {
+		slog.Error("ExecPython ensurePythonREPL failed", "session_id", sessionID, "error", err)
 		return nil, err
 	}
 
@@ -840,7 +924,7 @@ func (s *Service) ExecPython(ctx context.Context, sessionID, code string, timeou
 // StreamExecPython executes Python code and streams output via the onChunk callback.
 // The callback is called with each chunk of stdout/stderr data as it becomes available.
 // The final call will have Done=true.
-func (s *Service) StreamExecPython(ctx context.Context, sessionID, code string, timeout time.Duration, userID string, onChunk func(OutputChunk)) error {
+func (s *Service) StreamExecPython(ctx context.Context, sessionID, code string, timeout time.Duration, userID string, features map[string]string, onChunk func(OutputChunk)) error {
 	if sessionID == "" {
 		return errors.New("session_id is required")
 	}
@@ -854,8 +938,8 @@ func (s *Service) StreamExecPython(ctx context.Context, sessionID, code string, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	session := s.getSessionWithUserID(sessionID, userID)
-	if err := s.ensureReady(ctx, sessionID, "", session.UserID); err != nil {
+	session := s.getSessionWithUserID(sessionID, userID, features)
+	if err := s.ensureReady(ctx, sessionID, "", session.UserID, session.Features); err != nil {
 		return err
 	}
 
@@ -923,11 +1007,27 @@ func (s *Service) streamUntilDone(ctx context.Context, sessionID, execID string,
 			content := pendingStdout.String()
 
 			if idx := strings.Index(content, doneMarker); idx >= 0 {
-				// Found marker - send remaining output and complete
+				// Found marker - send remaining stdout
 				output := content[:idx]
 				if len(output) > 0 {
 					onChunk(OutputChunk{Stdout: []byte(output)})
 				}
+				// Quick non-blocking drain of any pending stderr
+				// (stderr is flushed before marker, so it should already be buffered)
+				for {
+					select {
+					case chunk, ok := <-stderrCh:
+						if !ok || chunk.EOF {
+							goto done
+						}
+						if chunk.Err == nil && len(chunk.Data) > 0 {
+							onChunk(OutputChunk{Stderr: chunk.Data})
+						}
+					default:
+						goto done
+					}
+				}
+			done:
 				onChunk(OutputChunk{Done: true, ExitCode: 0})
 				return nil
 			}
@@ -1155,16 +1255,29 @@ func (s *Service) cleanupLoopWithLeaderElection() {
 }
 
 func (s *Service) runCleanupAsLeader(ctx context.Context) {
-	ticker := time.NewTicker(s.cleanupInterval)
-	defer ticker.Stop()
+	sandboxTicker := time.NewTicker(s.cleanupInterval)
+	defer sandboxTicker.Stop()
 
-	// Run immediately on becoming leader
+	// Run sandbox cleanup immediately on becoming leader
 	s.cleanupExpired(ctx)
+
+	// Set up state cleanup ticker if enabled
+	var stateTicker *time.Ticker
+	var stateTickerC <-chan time.Time
+	if s.stateCleanupTTL > 0 && s.stateCleanupInterval > 0 && s.stateCleanupClient != nil {
+		stateTicker = time.NewTicker(s.stateCleanupInterval)
+		stateTickerC = stateTicker.C
+		defer stateTicker.Stop()
+		// Run state cleanup immediately on becoming leader
+		s.cleanupExpiredState(ctx)
+	}
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-sandboxTicker.C:
 			s.cleanupExpired(ctx)
+		case <-stateTickerC:
+			s.cleanupExpiredState(ctx)
 		case <-ctx.Done():
 			return
 		}
@@ -1190,12 +1303,120 @@ func (s *Service) cleanupExpired(ctx context.Context) {
 		if idleFor <= s.defaultTTL {
 			continue
 		}
+
+		// ListSandboxes may return stale LastUsedAt for sandboxes on other nodes
+		// because activity is tracked in node-local SQLite databases.
+		// Call GetSandbox to get the accurate LastUsedAt from the correct node
+		// before deciding to delete.
+		freshSandbox, err := s.platform.GetSandbox(ctx, sb.SessionID)
+		if err != nil {
+			if errors.Is(err, platform.ErrNotFound) {
+				// Already deleted, skip
+				continue
+			}
+			slog.Warn("cleanup: failed to get fresh sandbox info", "session_id", sb.SessionID, "error", err)
+			// Fall through to use the potentially stale LastUsedAt
+		} else {
+			// Use the fresh LastUsedAt from the correct node
+			lastUsed = freshSandbox.LastUsedAt
+			if lastUsed.IsZero() {
+				lastUsed = freshSandbox.CreatedAt
+			}
+			idleFor = now.Sub(lastUsed)
+			if idleFor <= s.defaultTTL {
+				slog.Debug("cleanup: sandbox has recent activity, skipping",
+					"session_id", sb.SessionID,
+					"last_used_at", lastUsed.Format(time.RFC3339),
+					"idle_for", idleFor.Round(time.Second))
+				continue
+			}
+		}
+
 		if err := s.platform.DeleteSandbox(ctx, sb.SessionID); err != nil && !errors.Is(err, platform.ErrNotFound) {
 			slog.Error("cleanup delete sandbox failed", "session_id", sb.SessionID, "error", err)
 			continue
 		}
 		s.clearSession(sb.SessionID)
 		slog.Info("deleted expired sandbox", "session_id", sb.SessionID, "idle_for", idleFor.Round(time.Second))
+	}
+}
+
+// cleanupExpiredState removes abandoned S3 state for sandbox sessions based on TTL.
+// This is separate from sandbox cleanup since S3 state persists across pod lifecycles.
+func (s *Service) cleanupExpiredState(ctx context.Context) {
+	if s.stateCleanupTTL <= 0 || s.stateCleanupClient == nil || s.stateCache == nil {
+		return
+	}
+
+	// Step 1: Discover all sandbox prefixes in S3
+	discovered, err := s.stateCleanupClient.ListSandboxPrefixes(ctx)
+	if err != nil {
+		slog.Error("state cleanup: failed to list sandbox prefixes", "error", err)
+		return
+	}
+	slog.Debug("state cleanup: discovered prefixes", "count", len(discovered))
+
+	// Step 2: Sync cache with discovered prefixes (add new, remove missing)
+	added, removed := s.stateCache.Sync(discovered)
+	if len(added) > 0 {
+		slog.Debug("state cleanup: new sessions discovered", "count", len(added))
+	}
+	if len(removed) > 0 {
+		slog.Debug("state cleanup: sessions removed from cache (no longer in S3)", "count", len(removed))
+	}
+
+	// Step 3: Refresh stale LastModified times
+	// Refresh if not yet fetched or if cache entry is older than cleanup interval
+	needsRefresh := s.stateCache.NeedsRefresh(s.stateCleanupInterval)
+	for _, sessionID := range needsRefresh {
+		lastModified, err := s.stateCleanupClient.GetSandboxStateLastModified(ctx, sessionID)
+		if err != nil {
+			slog.Warn("state cleanup: failed to get last modified", "session_id", sessionID, "error", err)
+			continue
+		}
+		s.stateCache.Set(sessionID, lastModified)
+	}
+	if len(needsRefresh) > 0 {
+		slog.Debug("state cleanup: refreshed LastModified times", "count", len(needsRefresh))
+	}
+
+	// Step 4: Find and delete expired sessions
+	expired := s.stateCache.ExpiredSessions(s.stateCleanupTTL)
+	deletedCount := 0
+	for _, sessionID := range expired {
+		// Get cache entry before deletion for logging
+		entry := s.stateCache.Get(sessionID)
+		var age time.Duration
+		if entry != nil && !entry.LastModified.IsZero() {
+			age = time.Since(entry.LastModified)
+		}
+
+		// Safety check: don't delete if sandbox is still active
+		sandbox, err := s.platform.GetSandbox(ctx, sessionID)
+		if err == nil && sandbox != nil && sandbox.Status == platform.StatusRunning {
+			slog.Debug("state cleanup: skipping active sandbox", "session_id", sessionID)
+			continue
+		}
+
+		// Delete the S3 state
+		objectsDeleted, err := s.stateCleanupClient.DeleteSandboxState(ctx, sessionID)
+		if err != nil {
+			slog.Error("state cleanup: failed to delete state", "session_id", sessionID, "error", err)
+			continue
+		}
+
+		// Remove from cache
+		s.stateCache.Delete(sessionID)
+		deletedCount++
+
+		slog.Info("state cleanup: deleted expired sandbox state",
+			"session_id", sessionID,
+			"objects_deleted", objectsDeleted,
+			"age", age.Round(time.Hour))
+	}
+
+	if deletedCount > 0 {
+		slog.Info("state cleanup: completed", "sessions_deleted", deletedCount)
 	}
 }
 
@@ -1236,7 +1457,7 @@ func (s *Service) ensureShell(ctx context.Context, sessionID string) (*ProcessSt
 		ContainerName: s.shellContainer,
 		ExecID:        fmt.Sprintf("%s-shell", sessionID),
 		Command:       []string{wrapperPath},
-		// Only set shell-specific env vars here. PYTHONUSERBASE, PIP_USER, and PATH
+		// Only set shell-specific env vars here. VIRTUAL_ENV and PATH
 		// are set at container level by sandbox-agent and inherited automatically.
 		Env:      []string{"PS1=", "PROMPT_COMMAND=", "TERM=xterm-256color"},
 		Terminal: true,
@@ -1268,21 +1489,26 @@ func (s *Service) ensureShell(ctx context.Context, sessionID string) (*ProcessSt
 }
 
 func (s *Service) ensurePythonREPL(ctx context.Context, sessionID string) (*ProcessState, error) {
+	slog.Info("ensurePythonREPL called", "session_id", sessionID)
 	session := s.getSession(sessionID)
 
 	s.mu.Lock()
 	repl := session.REPLs["python"]
 	s.mu.Unlock()
 	if repl != nil {
+		slog.Info("ensurePythonREPL checking existing REPL", "session_id", sessionID, "exec_id", repl.ExecID)
 		alive, err := s.platform.IsProcessAlive(ctx, sessionID, repl.ExecID)
 		if err == nil && alive {
+			slog.Info("ensurePythonREPL existing REPL alive", "session_id", sessionID)
 			return repl, nil
 		}
+		slog.Info("ensurePythonREPL existing REPL dead", "session_id", sessionID)
 		s.mu.Lock()
 		delete(session.REPLs, "python")
 		s.mu.Unlock()
 	}
 
+	slog.Info("ensurePythonREPL injecting wrapper", "session_id", sessionID)
 	wrapperPath := "/tmp/repl-wrapper.py"
 	_, err := s.platform.Exec(ctx, platform.ExecRequest{
 		SessionID:     sessionID,
@@ -1290,22 +1516,26 @@ func (s *Service) ensurePythonREPL(ctx context.Context, sessionID string) (*Proc
 		Command:       []string{"/bin/sh", "-c", fmt.Sprintf("cat > %s << 'WRAPPER_EOF'\n%s\nWRAPPER_EOF", wrapperPath, pythonREPLWrapper)},
 	})
 	if err != nil {
+		slog.Error("ensurePythonREPL inject wrapper failed", "session_id", sessionID, "error", err)
 		return nil, fmt.Errorf("failed to inject REPL wrapper: %w", err)
 	}
 
+	slog.Info("ensurePythonREPL starting process", "session_id", sessionID)
 	proc, err := s.platform.StartProcess(ctx, platform.StartProcessRequest{
 		SessionID:     sessionID,
 		ContainerName: s.mainContainer,
 		ExecID:        fmt.Sprintf("%s-python", sessionID),
-		Command:       []string{"/usr/local/bin/python3", wrapperPath},
-		// PYTHONUSERBASE and PIP_USER are set at container level by sandbox-agent
+		Command:       []string{"/usr/bin/python3", wrapperPath},
+		// VIRTUAL_ENV and PATH are set at container level by sandbox-agent
 		Env:      nil,
 		Terminal: false,
 		UserID:   session.UserID,
 	})
 	if err != nil {
+		slog.Error("ensurePythonREPL StartProcess failed", "session_id", sessionID, "error", err)
 		return nil, err
 	}
+	slog.Info("ensurePythonREPL process started", "session_id", sessionID, "exec_id", proc.ExecID)
 
 	state := &ProcessState{
 		ExecID:     proc.ExecID,
@@ -1343,83 +1573,99 @@ func (s *Service) updateProcessLastUsed(sessionID, process string) {
 }
 
 func (s *Service) readUntilMarker(ctx context.Context, sessionID, execID, marker string) (string, int, error) {
-	var stdoutBuf bytes.Buffer
-	var stderrBuf bytes.Buffer
 	pattern := regexp.MustCompile(`<<<EXIT:(\d+):` + regexp.QuoteMeta(marker) + `>>>\r?\n?`)
 
-	// Read stdout and stderr separately with early exit when marker is found.
-	// The marker appears in stdout, so we prioritize reading stdout.
-	// Stderr is read opportunistically without blocking.
+	// Create a cancellable context so we can clean up the stream when done.
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	outputCh, err := s.platform.StreamOutput(streamCtx, platform.StreamReadRequest{
+		SessionID: sessionID,
+		ExecID:    execID,
+	})
+	if err != nil {
+		return "", -1, fmt.Errorf("start output stream: %w", err)
+	}
+
+	var outputBuf bytes.Buffer
 	for {
-		if ctx.Err() != nil {
-			return stdoutBuf.String() + stderrBuf.String(), -1, ctx.Err()
-		}
+		select {
+		case <-ctx.Done():
+			return outputBuf.String(), -1, ctx.Err()
 
-		// Read stdout (this is where the marker will be)
-		stdout, err := s.platform.ReadStdout(ctx, sessionID, execID)
-		if err != nil {
-			return stdoutBuf.String() + stderrBuf.String(), -1, err
-		}
-		if len(stdout) > 0 {
-			stdoutBuf.Write(stdout)
-		}
-
-		// Check for marker in stdout - if found, return immediately
-		content := stdoutBuf.String()
-		if matches := pattern.FindStringSubmatch(content); matches != nil {
-			exitCode, _ := strconv.Atoi(matches[1])
-			output := pattern.ReplaceAllString(content, "")
-			// Include any stderr we've collected
-			if stderrBuf.Len() > 0 {
-				output = output + stderrBuf.String()
+		case chunk, ok := <-outputCh:
+			if !ok {
+				return outputBuf.String(), -1, errors.New("stream closed before marker found")
 			}
-			return output, exitCode, nil
+			if chunk.Err != nil {
+				return outputBuf.String(), -1, chunk.Err
+			}
+			if chunk.EOF {
+				return outputBuf.String(), -1, errors.New("EOF before marker found")
+			}
+			if len(chunk.Data) > 0 {
+				outputBuf.Write(chunk.Data)
+				// Check for marker in combined output (TTY merges stdout/stderr)
+				content := outputBuf.String()
+				if matches := pattern.FindStringSubmatch(content); matches != nil {
+					exitCode, _ := strconv.Atoi(matches[1])
+					output := pattern.ReplaceAllString(content, "")
+					return output, exitCode, nil
+				}
+			}
 		}
-
-		// Read stderr opportunistically (non-blocking due to short timeout)
-		stderr, _ := s.platform.ReadStderr(ctx, sessionID, execID)
-		if len(stderr) > 0 {
-			stderrBuf.Write(stderr)
-		}
-
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func (s *Service) readUntilDone(ctx context.Context, sessionID, execID string) (*platform.ProcessOutput, error) {
+	// Create a cancellable context so we can clean up the stream when done.
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	outputCh, err := s.platform.StreamOutput(streamCtx, platform.StreamReadRequest{
+		SessionID: sessionID,
+		ExecID:    execID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("start output stream: %w", err)
+	}
+
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
+	const doneMarker = "<<<DONE>>>"
 
 	for {
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return &platform.ProcessOutput{Stdout: stdoutBuf.Bytes(), Stderr: stderrBuf.Bytes()}, ctx.Err()
-		}
 
-		// Read stdout (this is where the DONE marker will be)
-		stdout, err := s.platform.ReadStdout(ctx, sessionID, execID)
-		if err != nil {
-			return &platform.ProcessOutput{Stdout: stdoutBuf.Bytes(), Stderr: stderrBuf.Bytes()}, err
+		case chunk, ok := <-outputCh:
+			if !ok {
+				return &platform.ProcessOutput{Stdout: stdoutBuf.Bytes(), Stderr: stderrBuf.Bytes()}, errors.New("stream closed before done marker")
+			}
+			if chunk.Err != nil {
+				return &platform.ProcessOutput{Stdout: stdoutBuf.Bytes(), Stderr: stderrBuf.Bytes()}, chunk.Err
+			}
+			if chunk.EOF {
+				return &platform.ProcessOutput{Stdout: stdoutBuf.Bytes(), Stderr: stderrBuf.Bytes()}, errors.New("EOF before done marker")
+			}
+			if len(chunk.Data) > 0 {
+				// Route to appropriate buffer based on stream type
+				if chunk.Stream == platform.StreamStderr {
+					stderrBuf.Write(chunk.Data)
+				} else {
+					stdoutBuf.Write(chunk.Data)
+					// Check for done marker in stdout
+					if bytes.Contains(stdoutBuf.Bytes(), []byte(doneMarker)) {
+						result := bytes.Replace(stdoutBuf.Bytes(), []byte(doneMarker+"\n"), []byte(""), 1)
+						return &platform.ProcessOutput{
+							Stdout: result,
+							Stderr: stderrBuf.Bytes(),
+						}, nil
+					}
+				}
+			}
 		}
-		if len(stdout) > 0 {
-			stdoutBuf.Write(stdout)
-		}
-
-		// Check for marker in stdout - if found, return immediately
-		if bytes.Contains(stdoutBuf.Bytes(), []byte("<<<DONE>>>")) {
-			result := bytes.Replace(stdoutBuf.Bytes(), []byte("<<<DONE>>>\n"), []byte(""), 1)
-			return &platform.ProcessOutput{
-				Stdout: result,
-				Stderr: stderrBuf.Bytes(),
-			}, nil
-		}
-
-		// Read stderr opportunistically
-		stderr, _ := s.platform.ReadStderr(ctx, sessionID, execID)
-		if len(stderr) > 0 {
-			stderrBuf.Write(stderr)
-		}
-
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1446,27 +1692,57 @@ func (s *Service) drainProcessOutput(ctx context.Context, sessionID, execID stri
 }
 
 func (s *Service) readUntilToken(ctx context.Context, sessionID, execID, token string) (string, error) {
+	slog.Info("readUntilToken: starting stream", "session_id", sessionID, "exec_id", execID)
+
+	// Create a cancellable context so we can clean up the stream when done.
+	// This is important because the CRI backend's DataReady channel can only
+	// be read by one consumer - if we leave an orphaned stream running, it
+	// will steal signals from subsequent streams.
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	outputCh, err := s.platform.StreamOutput(streamCtx, platform.StreamReadRequest{
+		SessionID: sessionID,
+		ExecID:    execID,
+	})
+	if err != nil {
+		slog.Error("readUntilToken: failed to start stream", "error", err)
+		return "", fmt.Errorf("start output stream: %w", err)
+	}
+	slog.Info("readUntilToken: stream started, waiting for data")
+
 	var stdoutBuf bytes.Buffer
+	chunkCount := 0
 	for {
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
+			slog.Warn("readUntilToken: context cancelled", "chunks_received", chunkCount, "buffer_len", stdoutBuf.Len())
 			return stdoutBuf.String(), ctx.Err()
+		case chunk, ok := <-outputCh:
+			if !ok {
+				slog.Warn("readUntilToken: stream closed", "chunks_received", chunkCount)
+				return stdoutBuf.String(), errors.New("stream closed before token found")
+			}
+			chunkCount++
+			if chunk.Err != nil {
+				slog.Error("readUntilToken: chunk error", "error", chunk.Err, "chunks_received", chunkCount)
+				return stdoutBuf.String(), chunk.Err
+			}
+			if chunk.EOF {
+				slog.Warn("readUntilToken: EOF received", "chunks_received", chunkCount)
+				return stdoutBuf.String(), errors.New("EOF before token found")
+			}
+			if len(chunk.Data) > 0 {
+				slog.Debug("readUntilToken: received data", "bytes", len(chunk.Data), "chunk_num", chunkCount)
+				stdoutBuf.Write(chunk.Data)
+				content := stdoutBuf.String()
+				if strings.Contains(content, token) {
+					slog.Info("readUntilToken: token found", "chunks_received", chunkCount, "buffer_len", stdoutBuf.Len())
+					content = strings.Replace(content, token, "", 1)
+					return content, nil
+				}
+			}
 		}
-
-		// Read stdout (this is where the token will be for shell)
-		stdout, err := s.platform.ReadStdout(ctx, sessionID, execID)
-		if err != nil {
-			return stdoutBuf.String(), err
-		}
-		if len(stdout) > 0 {
-			stdoutBuf.Write(stdout)
-		}
-
-		content := stdoutBuf.String()
-		if strings.Contains(content, token) {
-			content = strings.Replace(content, token, "", 1)
-			return content, nil
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1523,12 +1799,18 @@ func normalizeShellOutput(value string) string {
 	return value
 }
 
-func (s *Service) ensureReady(ctx context.Context, sessionID, image, userID string) error {
+func (s *Service) ensureReady(ctx context.Context, sessionID, image, userID string, features map[string]string) error {
 	sandbox, err := s.platform.GetSandbox(ctx, sessionID)
 	if err != nil {
 		if !errors.Is(err, platform.ErrNotFound) {
 			return err
 		}
+
+		// Check capacity before creating a new sandbox
+		if !s.CanCreateSandbox() {
+			return platform.ErrCapacityExceeded
+		}
+
 		if image == "" {
 			image = s.defaultImage
 		}
@@ -1559,6 +1841,7 @@ func (s *Service) ensureReady(ctx context.Context, sessionID, image, userID stri
 			Command:     append([]string{}, s.defaultCommand...),
 			DownloadURL: downloadURL,
 			UserID:      userID,
+			Features:    features,
 		})
 		if err != nil && !errors.Is(err, platform.ErrAlreadyExists) {
 			return err
@@ -1647,7 +1930,7 @@ func (s *Service) StartJob(ctx context.Context, sessionID, command, name, userID
 		return nil, fmt.Errorf("failed to ensure shell: %w", err)
 	}
 
-	session := s.getSessionWithUserID(sessionID, userID)
+	session := s.getSessionWithUserID(sessionID, userID, nil)
 	jobID := randomString(12)
 	now := time.Now().UTC()
 
@@ -1663,7 +1946,7 @@ func (s *Service) StartJob(ctx context.Context, sessionID, command, name, userID
 		jobID,
 	)
 
-	result, err := s.ExecShell(ctx, sessionID, spawnCmd, 10*time.Second, session.UserID)
+	result, err := s.ExecShell(ctx, sessionID, spawnCmd, 10*time.Second, session.UserID, session.Features)
 	if err != nil {
 		return nil, fmt.Errorf("failed to spawn job: %w", err)
 	}
@@ -1956,4 +2239,193 @@ func (s *Service) cleanupOldJobs(ctx context.Context, session *Session) {
 			})
 		}()
 	}
+}
+
+// SetCapacityTracker sets the capacity tracker for limit enforcement.
+func (s *Service) SetCapacityTracker(tracker *capacity.Tracker) {
+	s.capacityTracker = tracker
+}
+
+// SetCapacityConfig sets capacity-related configuration.
+func (s *Service) SetCapacityConfig(refreshInterval, evictionInterval time.Duration, evictionEnabled bool) {
+	s.capacityRefreshInterval = refreshInterval
+	s.evictionInterval = evictionInterval
+	s.evictionEnabled = evictionEnabled
+}
+
+// StartCapacityLoops starts the background capacity refresh and eviction loops.
+func (s *Service) StartCapacityLoops() {
+	if s.capacityTracker == nil {
+		return
+	}
+
+	// Start capacity refresh loop
+	if s.capacityRefreshInterval > 0 {
+		go s.capacityRefreshLoop()
+	}
+
+	// Start eviction loop if enabled
+	if s.evictionEnabled && s.evictionInterval > 0 {
+		go s.evictionLoop()
+	}
+}
+
+// capacityRefreshLoop periodically polls agents to update capacity information.
+func (s *Service) capacityRefreshLoop() {
+	ticker := time.NewTicker(s.capacityRefreshInterval)
+	defer ticker.Stop()
+
+	// Do initial refresh
+	s.refreshCapacity(context.Background())
+
+	for {
+		select {
+		case <-ticker.C:
+			s.refreshCapacity(context.Background())
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// refreshCapacity polls the platform for health/capacity info and updates the tracker.
+func (s *Service) refreshCapacity(ctx context.Context) {
+	if s.capacityTracker == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	health, err := s.platform.GetHealth(ctx)
+	if err != nil {
+		slog.Warn("failed to refresh capacity from agent", "error", err)
+		return
+	}
+
+	// Use cluster capacity if available (preferred - includes all nodes)
+	if health.Cluster != nil && len(health.Cluster.Nodes) > 0 {
+		cluster := &capacity.ClusterCapacity{
+			TotalMaxSandboxes:     health.Cluster.TotalMaxSandboxes,
+			TotalCurrentSandboxes: health.Cluster.TotalCurrentSandboxes,
+			AvailableNodes:        health.Cluster.AvailableNodes,
+			CalculatedAt:          health.Cluster.CalculatedAt,
+		}
+		for _, node := range health.Cluster.Nodes {
+			cluster.Nodes = append(cluster.Nodes, capacity.NodeCapacityInfo{
+				NodeName:         node.NodeName,
+				MaxSandboxes:     node.MaxSandboxes,
+				CurrentSandboxes: node.CurrentSandboxes,
+				CalculatedAt:     node.CalculatedAt,
+			})
+		}
+		s.capacityTracker.UpdateFromCluster(cluster)
+		slog.Debug("cluster capacity refreshed",
+			"total_max", health.Cluster.TotalMaxSandboxes,
+			"total_current", health.Cluster.TotalCurrentSandboxes,
+			"nodes", len(health.Cluster.Nodes))
+		return
+	}
+
+	// Fallback to single node capacity (existing behavior)
+	if health.Capacity != nil {
+		cap := health.Capacity
+		s.capacityTracker.UpdateNode(cap.NodeName, cap.MaxSandboxes, cap.CurrentSandboxes)
+		slog.Debug("capacity refreshed", "node", cap.NodeName, "max", cap.MaxSandboxes, "current", cap.CurrentSandboxes)
+	}
+}
+
+// evictionLoop periodically checks for excess sandboxes and evicts the oldest ones.
+func (s *Service) evictionLoop() {
+	ticker := time.NewTicker(s.evictionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.evictExcessSandboxes(context.Background())
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// evictExcessSandboxes deletes the oldest sandboxes when over capacity.
+func (s *Service) evictExcessSandboxes(ctx context.Context) {
+	if s.capacityTracker == nil {
+		return
+	}
+
+	excess := s.capacityTracker.GetExcessSandboxes()
+	if excess <= 0 {
+		return
+	}
+
+	slog.Info("capacity exceeded, starting eviction", "excess", excess)
+
+	sandboxes, err := s.platform.ListSandboxes(ctx)
+	if err != nil {
+		slog.Error("failed to list sandboxes for eviction", "error", err)
+		return
+	}
+
+	// Sort by last used time (oldest first)
+	sort.Slice(sandboxes, func(i, j int) bool {
+		iTime := sandboxes[i].LastUsedAt
+		if iTime.IsZero() {
+			iTime = sandboxes[i].CreatedAt
+		}
+		jTime := sandboxes[j].LastUsedAt
+		if jTime.IsZero() {
+			jTime = sandboxes[j].CreatedAt
+		}
+		return iTime.Before(jTime)
+	})
+
+	// Evict oldest sandboxes up to the excess count
+	evicted := 0
+	for _, sb := range sandboxes {
+		if int32(evicted) >= excess {
+			break
+		}
+
+		if err := s.platform.DeleteSandbox(ctx, sb.SessionID); err != nil {
+			if !errors.Is(err, platform.ErrNotFound) {
+				slog.Error("failed to evict sandbox", "session_id", sb.SessionID, "error", err)
+				continue
+			}
+		}
+
+		s.clearSession(sb.SessionID)
+		evicted++
+		slog.Info("evicted sandbox due to capacity", "session_id", sb.SessionID)
+	}
+
+	if evicted > 0 {
+		slog.Info("eviction completed", "evicted", evicted, "target", excess)
+	}
+}
+
+// CanCreateSandbox checks if sandbox creation is allowed based on capacity.
+func (s *Service) CanCreateSandbox() bool {
+	if s.capacityTracker == nil {
+		return true // No capacity tracking, allow all
+	}
+	return s.capacityTracker.CanCreateSandbox()
+}
+
+// GetCapacitySummary returns aggregate capacity information.
+func (s *Service) GetCapacitySummary() (totalMax, totalCurrent, availableNodes int32) {
+	if s.capacityTracker == nil {
+		return 0, 0, 0
+	}
+	return s.capacityTracker.GetCapacitySummary()
+}
+
+// GetCapacityNodes returns detailed capacity information for all nodes.
+func (s *Service) GetCapacityNodes() []capacity.NodeInfo {
+	if s.capacityTracker == nil {
+		return nil
+	}
+	return s.capacityTracker.GetNodes()
 }

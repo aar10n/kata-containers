@@ -97,6 +97,24 @@ type SandboxConfig struct {
 	NodeSelector     map[string]string `mapstructure:"node_selector"`
 	Tolerations      []Toleration      `mapstructure:"tolerations"`
 	ImagePullSecrets []ImagePullSecret `mapstructure:"image_pull_secrets"`
+	// Resources specifies the default resource requests and limits for sandbox containers.
+	// Values should be in Kubernetes resource quantity format (e.g., "100m", "256Mi", "1Gi").
+	Resources ResourcesConfig `mapstructure:"resources"`
+	// DefaultImage is the default container image used for sandboxes.
+	// If set and PrefetchImages is enabled, this image will be pre-pulled on startup.
+	DefaultImage string `mapstructure:"default_image"`
+	// PrefetchImages controls whether to pre-pull the default image on startup.
+	// Requires DefaultImage to be set.
+	PrefetchImages bool `mapstructure:"prefetch_images"`
+	// CapacityRefreshInterval is how often to recalculate node capacity.
+	// Default: 30s
+	CapacityRefreshInterval time.Duration `mapstructure:"capacity_refresh_interval"`
+	// ClusterCapacityRefreshInterval is how often to poll peer agents for cluster capacity.
+	// Default: 15s
+	ClusterCapacityRefreshInterval time.Duration `mapstructure:"cluster_capacity_refresh_interval"`
+	// PeerPollTimeout is the timeout for polling a single peer agent.
+	// Default: 3s
+	PeerPollTimeout time.Duration `mapstructure:"peer_poll_timeout"`
 }
 
 // ImagePullSecret represents a Kubernetes image pull secret reference.
@@ -111,6 +129,19 @@ type Toleration struct {
 	Value             string `mapstructure:"value"`
 	Effect            string `mapstructure:"effect"` // "NoSchedule", "PreferNoSchedule", or "NoExecute"
 	TolerationSeconds *int64 `mapstructure:"toleration_seconds"`
+}
+
+// ResourcesConfig holds Kubernetes-style resource requirements for sandbox containers.
+// Values should be in Kubernetes resource quantity format (e.g., "100m", "256Mi", "1Gi").
+type ResourcesConfig struct {
+	Requests ResourceList `mapstructure:"requests"`
+	Limits   ResourceList `mapstructure:"limits"`
+}
+
+// ResourceList holds CPU and memory resource quantities.
+type ResourceList struct {
+	CPU    string `mapstructure:"cpu"`
+	Memory string `mapstructure:"memory"`
 }
 
 // StorageConfig holds configuration for the storage service client.
@@ -183,6 +214,15 @@ type FuseStorageConfig struct {
 	SecretAccessKeySecretName string `mapstructure:"secret_access_key_secret_name"`
 	// SecretAccessKeySecretKey is the key within the secret. Defaults to "secretAccessKey".
 	SecretAccessKeySecretKey string `mapstructure:"secret_access_key_secret_key"`
+	// UID is the user ID for the sandbox user that owns the FUSE mounts.
+	// Default: 1001
+	UID int `mapstructure:"uid"`
+	// GID is the group ID for the sandbox user that owns the FUSE mounts.
+	// Default: 1001
+	GID int `mapstructure:"gid"`
+	// SidecarResources specifies resource requests/limits for the FUSE sidecar container.
+	// These are also used by the capacity manager to calculate accurate node capacity.
+	SidecarResources ResourcesConfig `mapstructure:"sidecar_resources"`
 }
 
 // Flags defines command-line flags that can override config values.
@@ -227,8 +267,11 @@ func DefaultConfig() Config {
 			Timeout: 30 * time.Second,
 		},
 		Sandbox: SandboxConfig{
-			Namespace:        "default",
-			RuntimeClassName: "",
+			Namespace:                      "default",
+			RuntimeClassName:               "",
+			CapacityRefreshInterval:        30 * time.Second,
+			ClusterCapacityRefreshInterval: 15 * time.Second,
+			PeerPollTimeout:                3 * time.Second,
 		},
 		Storage: StorageConfig{
 			Enabled:   false,
@@ -245,6 +288,11 @@ func DefaultConfig() Config {
 			Enabled: false,
 			Image:   "amazon/aws-mountpoint-s3:latest",
 			Region:  "us-east-1",
+			UID:     1001,
+			GID:     1001,
+			SidecarResources: ResourcesConfig{
+				Requests: ResourceList{CPU: "200m", Memory: "128Mi"},
+			},
 		},
 		ActivityDB: ActivityDBConfig{
 			Enabled:  true, // Enable by default since this solves the rate limiting issue
@@ -294,6 +342,11 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("exec::timeout", defaults.Exec.Timeout)
 	v.SetDefault("sandbox::namespace", defaults.Sandbox.Namespace)
 	v.SetDefault("sandbox::runtime_class", defaults.Sandbox.RuntimeClassName)
+	v.SetDefault("sandbox::default_image", defaults.Sandbox.DefaultImage)
+	v.SetDefault("sandbox::prefetch_images", defaults.Sandbox.PrefetchImages)
+	v.SetDefault("sandbox::capacity_refresh_interval", defaults.Sandbox.CapacityRefreshInterval)
+	v.SetDefault("sandbox::cluster_capacity_refresh_interval", defaults.Sandbox.ClusterCapacityRefreshInterval)
+	v.SetDefault("sandbox::peer_poll_timeout", defaults.Sandbox.PeerPollTimeout)
 	v.SetDefault("storage::enabled", defaults.Storage.Enabled)
 	v.SetDefault("storage::addr", defaults.Storage.Addr)
 	v.SetDefault("storage::timeout", defaults.Storage.Timeout)
@@ -308,6 +361,12 @@ func Load(flags *Flags) (Config, error) {
 	v.SetDefault("fuse_storage::assets_bucket", defaults.FuseStorage.AssetsBucket)
 	v.SetDefault("fuse_storage::access_key_id", defaults.FuseStorage.AccessKeyID)
 	v.SetDefault("fuse_storage::secret_access_key", defaults.FuseStorage.SecretAccessKey)
+	v.SetDefault("fuse_storage::uid", defaults.FuseStorage.UID)
+	v.SetDefault("fuse_storage::gid", defaults.FuseStorage.GID)
+	v.SetDefault("fuse_storage::sidecar_resources::requests::cpu", defaults.FuseStorage.SidecarResources.Requests.CPU)
+	v.SetDefault("fuse_storage::sidecar_resources::requests::memory", defaults.FuseStorage.SidecarResources.Requests.Memory)
+	v.SetDefault("fuse_storage::sidecar_resources::limits::cpu", defaults.FuseStorage.SidecarResources.Limits.CPU)
+	v.SetDefault("fuse_storage::sidecar_resources::limits::memory", defaults.FuseStorage.SidecarResources.Limits.Memory)
 	v.SetDefault("activity_db::enabled", defaults.ActivityDB.Enabled)
 	v.SetDefault("activity_db::path", defaults.ActivityDB.Path)
 	v.SetDefault("activity_db::filename", defaults.ActivityDB.Filename)

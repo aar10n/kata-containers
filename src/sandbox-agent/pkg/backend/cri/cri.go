@@ -3,6 +3,7 @@ package cri
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -274,16 +275,22 @@ func (b *Backend) StreamOutput(ctx context.Context, containerID, processID strin
 		return nil, backend.ErrNotSupported
 	}
 
+	slog.Info("CRI StreamOutput: starting", "process_id", processID)
 	ch := make(chan backend.OutputChunk)
 	go func() {
 		defer close(ch)
+		startTime := time.Now()
+		iterations := 0
 
 		for {
+			iterations++
 			select {
 			case <-ctx.Done():
+				slog.Info("CRI StreamOutput: context done", "process_id", processID, "iterations", iterations, "elapsed", time.Since(startTime))
 				return
 			case <-state.conn.Done():
 				// Connection closed, send any remaining data
+				slog.Info("CRI StreamOutput: connection done", "process_id", processID, "iterations", iterations, "elapsed", time.Since(startTime))
 				if data := state.conn.ReadStdout(0); len(data) > 0 {
 					ch <- backend.OutputChunk{Stream: backend.StreamStdout, Data: data}
 				}
@@ -294,11 +301,15 @@ func (b *Backend) StreamOutput(ctx context.Context, containerID, processID strin
 				return
 			case <-state.conn.DataReady():
 				// New data available, read both buffers
-				if data := state.conn.ReadStdout(0); len(data) > 0 {
-					ch <- backend.OutputChunk{Stream: backend.StreamStdout, Data: data}
+				elapsed := time.Since(startTime)
+				stdoutData := state.conn.ReadStdout(0)
+				stderrData := state.conn.ReadStderr(0)
+				slog.Info("CRI StreamOutput: data ready", "process_id", processID, "iterations", iterations, "elapsed", elapsed, "stdout_bytes", len(stdoutData), "stderr_bytes", len(stderrData))
+				if len(stdoutData) > 0 {
+					ch <- backend.OutputChunk{Stream: backend.StreamStdout, Data: stdoutData}
 				}
-				if data := state.conn.ReadStderr(0); len(data) > 0 {
-					ch <- backend.OutputChunk{Stream: backend.StreamStderr, Data: data}
+				if len(stderrData) > 0 {
+					ch <- backend.OutputChunk{Stream: backend.StreamStderr, Data: stderrData}
 				}
 			}
 		}
